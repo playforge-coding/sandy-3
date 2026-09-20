@@ -1,0 +1,17 @@
+[build]
+target = "index.html"
+
+# Deliberately no `cargo_profile` here. Setting one overrides `--release` rather
+# than yielding to it, so pinning the dev-like `web` profile would make
+# `trunk build --release` quietly produce an unoptimised bundle. Pass the
+# profile on the command line instead:
+#
+#   trunk serve --cargo-profile web   # fast rebuilds while working on it
+#   trunk build --release             # the real thing
+#
+# The `web` profile exists because the dev profile builds this crate with
+# cranelift, which has no wasm32 target; see Cargo.toml. Forgetting it gives a
+# loud error rather than a wrong build, which is the way round it should be.
+
+[serve]
+port = 8080

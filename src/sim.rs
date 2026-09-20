@@ -1,0 +1,784 @@
+//! The host side of the simulation: the buffers the world lives in, and the
+//! order the kernels run in.
+//!
+//! There is no copy of the grid in main memory. The world is a storage buffer on
+//! the GPU from the moment it is created, the tick is a handful of compute
+//! dispatches over it, and the renderer reads the same buffer. Nothing is read
+//! back, so nothing here ever has to wait for the GPU.
+//!
+//! Almost everything a pipeline needs is read off the kernel type itself rather
+//! than written out again here: [`Stage`] builds its bind group layout from
+//! `BINDINGS` and works out its dispatch size from `WORKGROUP_SIZE`. Adding a
+//! parameter to a kernel in [`crate::kernels`] means adding a buffer to the list
+//! passed to [`Stage::bind`], and nothing else.
+
+use unipute::{Access, WgslKernel};
+use wgpu::util::DeviceExt;
+
+use crate::kernels::{self, MOVE_PASSES};
+use crate::materials::MaterialId;
+
+/// Simulation resolution, in cells. The renderer stretches this to fill the
+/// window, so these are logical sand grains rather than screen pixels.
+///
+/// This is four times the area a comparable CPU engine runs comfortably, which
+/// is most of the point of moving the tick onto the GPU.
+pub const GRID_W: u32 = 1000;
+pub const GRID_H: u32 = 500;
+
+/// The pair of grid buffers has to end a tick the way it started, or the
+/// renderer would have to be told which one is live. One [`kernels::react`] pass
+/// plus an odd number of movement passes is an even number of swaps, which is
+/// what makes that true.
+const _: () = assert!(
+    MOVE_PASSES % 2 == 1,
+    "MOVE_PASSES must be odd so a tick leaves the live world back in `cells`"
+);
+
+/// Bytes in a uniform buffer. Every uniform here is at most a `vec4`, and a
+/// round sixteen keeps them all the same shape.
+const UNIFORM_SIZE: u64 = 16;
+
+/// One compute kernel, ready to dispatch.
+///
+/// The pipeline and the bind group layout are built from the generated kernel
+/// type, so they cannot drift from the shader.
+struct Stage {
+    pipeline: wgpu::ComputePipeline,
+    layout: wgpu::BindGroupLayout,
+    workgroup: [u32; 3],
+    name: &'static str,
+}
+
+impl Stage {
+    fn new<K: WgslKernel>(device: &wgpu::Device) -> Self {
+        let entries: Vec<_> = K::BINDINGS
+            .iter()
+            .map(|binding| wgpu::BindGroupLayoutEntry {
+                binding: binding.binding,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: match binding.access {
+                        Access::Uniform => wgpu::BufferBindingType::Uniform,
+                        Access::Read => wgpu::BufferBindingType::Storage { read_only: true },
+                        Access::ReadWrite => wgpu::BufferBindingType::Storage { read_only: false },
+                    },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            })
+            .collect();
+
+        let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some(K::NAME),
+            entries: &entries,
+        });
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some(K::NAME),
+            bind_group_layouts: &[Some(&layout)],
+            immediate_size: 0,
+        });
+        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some(K::NAME),
+            source: wgpu::ShaderSource::Wgsl(K::WGSL.into()),
+        });
+        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some(K::NAME),
+            layout: Some(&pipeline_layout),
+            module: &module,
+            entry_point: Some(K::NAME),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+
+        Stage {
+            pipeline,
+            layout,
+            workgroup: K::WORKGROUP_SIZE,
+            name: K::NAME,
+        }
+    }
+
+    /// Bind buffers to this stage, in the order the kernel declares them.
+    fn bind(&self, device: &wgpu::Device, buffers: &[&wgpu::Buffer]) -> wgpu::BindGroup {
+        let entries: Vec<_> = buffers
+            .iter()
+            .enumerate()
+            .map(|(i, buffer)| wgpu::BindGroupEntry {
+                binding: i as u32,
+                resource: buffer.as_entire_binding(),
+            })
+            .collect();
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some(self.name),
+            layout: &self.layout,
+            entries: &entries,
+        })
+    }
+
+    /// Run the stage over `items` work items per axis, rounding up to whole
+    /// workgroups. The kernels all bounds-check, which is what makes the
+    /// rounding safe.
+    fn dispatch(&self, pass: &mut wgpu::ComputePass, group: &wgpu::BindGroup, items: [u32; 3]) {
+        pass.set_pipeline(&self.pipeline);
+        pass.set_bind_group(0, group, &[]);
+        pass.dispatch_workgroups(
+            items[0].div_ceil(self.workgroup[0]),
+            items[1].div_ceil(self.workgroup[1]),
+            items[2].div_ceil(self.workgroup[2]),
+        );
+    }
+}
+
+pub struct Simulation {
+    device: wgpu::Device,
+    queue: wgpu::Queue,
+
+    pub width: u32,
+    pub height: u32,
+
+    /// The world. This is the buffer the renderer reads, and it holds the live
+    /// grid at every point outside [`Simulation::step`].
+    cells: wgpu::Buffer,
+    /// The other half of the pair the passes bounce through. A kernel never
+    /// reads and writes the same buffer, which is what lets the whole grid be
+    /// stepped at once without the result depending on scheduling order.
+    scratch: wgpu::Buffer,
+    /// What each material is, as [`crate::kernels::props_table`] lays it out.
+    /// Also read by the renderer, for the colours.
+    props: wgpu::Buffer,
+    /// The gust field: every cell's sideways push, then every cell's vertical
+    /// one. Painted by the wind tool and fading on its own every tick.
+    wind: wgpu::Buffer,
+
+    react_world: wgpu::Buffer,
+    move_world: Vec<wgpu::Buffer>,
+    breeze: wgpu::Buffer,
+    paint_world: wgpu::Buffer,
+    paint_brush: wgpu::Buffer,
+    gust_brush: wgpu::Buffer,
+    gust_push: wgpu::Buffer,
+
+    react: Stage,
+    movement: Stage,
+    paint: Stage,
+    gust: Stage,
+    calm: Stage,
+
+    react_bind: wgpu::BindGroup,
+    move_bind: Vec<wgpu::BindGroup>,
+    paint_bind: wgpu::BindGroup,
+    gust_bind: wgpu::BindGroup,
+    calm_bind: wgpu::BindGroup,
+
+    /// Ticks elapsed. Feeds the kernels' randomness and the prevailing breeze,
+    /// so it has to change every tick but never has to mean anything else.
+    frame: u32,
+    /// Host-side randomness, used only to give each brush stroke a fresh grain.
+    seed: u32,
+}
+
+impl Simulation {
+    pub fn new(device: &wgpu::Device, queue: &wgpu::Queue) -> Self {
+        let width = GRID_W;
+        let height = GRID_H;
+        let cell_count = (width * height) as u64;
+
+        // COPY_SRC is there so the tests can read the world back; nothing in a
+        // normal run ever copies out of these.
+        let storage = wgpu::BufferUsages::STORAGE
+            | wgpu::BufferUsages::COPY_DST
+            | wgpu::BufferUsages::COPY_SRC;
+        let grid = |label| {
+            device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(label),
+                size: cell_count * 4,
+                usage: storage,
+                mapped_at_creation: false,
+            })
+        };
+        // A zeroed grid is a world full of material zero, which is air, so a
+        // fresh world needs nothing written into it.
+        let cells = grid("cells");
+        let scratch = grid("scratch");
+        // Two components per cell, laid end to end.
+        let wind = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("wind"),
+            size: cell_count * 2 * 4,
+            usage: storage,
+            mapped_at_creation: false,
+        });
+
+        let table = |label, words: &[u32]| {
+            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some(label),
+                contents: bytemuck::cast_slice(words),
+                usage: storage,
+            })
+        };
+        let props = table("material props", &kernels::props_table());
+        // What reacts with what, as `kernels::rules_table` lays it out. Neither
+        // this nor the tools' copy of the world's shape is ever touched again
+        // once bound, and a bind group keeps its buffers alive, so they are not
+        // kept as fields.
+        let rules = table("reaction rules", &kernels::rules_table());
+
+        let uniform = |label| {
+            device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(label),
+                size: UNIFORM_SIZE,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            })
+        };
+        let react_world = uniform("react world");
+        // One per movement pass. They differ in which pass they are, and all of
+        // them are written before the tick is submitted, so they cannot share a
+        // buffer the way a single-dispatch kernel's uniforms can.
+        let move_world: Vec<_> = (0..MOVE_PASSES)
+            .map(|_| uniform("movement world"))
+            .collect();
+        let breeze = uniform("breeze");
+        let paint_world = uniform("paint world");
+        let paint_brush = uniform("paint brush");
+        let gust_world = uniform("gust world");
+        let gust_brush = uniform("gust brush");
+        let gust_push = uniform("gust push");
+
+        // The world's shape never changes, so the tools' copy of it is written
+        // once here rather than before every stroke.
+        queue.write_buffer(&gust_world, 0, bytemuck::cast_slice(&[width, height, 0, 0]));
+
+        let react = Stage::new::<kernels::react>(device);
+        let movement = Stage::new::<kernels::movement>(device);
+        let paint = Stage::new::<kernels::paint>(device);
+        let gust = Stage::new::<kernels::gust>(device);
+        let calm = Stage::new::<kernels::calm>(device);
+
+        let react_bind = react.bind(device, &[&cells, &scratch, &rules, &react_world]);
+        // Pass zero picks up what `react` left in `scratch` and puts it back in
+        // `cells`; from there they alternate. With an odd number of passes the
+        // last one lands in `cells` again.
+        let move_bind: Vec<_> = (0..MOVE_PASSES)
+            .map(|i| {
+                let (src, dst) = if i % 2 == 0 {
+                    (&scratch, &cells)
+                } else {
+                    (&cells, &scratch)
+                };
+                movement.bind(device, &[src, dst, &props, &wind, &move_world[i], &breeze])
+            })
+            .collect();
+        let paint_bind = paint.bind(device, &[&cells, &paint_world, &paint_brush]);
+        let gust_bind = gust.bind(device, &[&wind, &gust_world, &gust_brush, &gust_push]);
+        let calm_bind = calm.bind(device, &[&wind]);
+
+        Simulation {
+            device: device.clone(),
+            queue: queue.clone(),
+            width,
+            height,
+            cells,
+            scratch,
+            props,
+            wind,
+            react_world,
+            move_world,
+            breeze,
+            paint_world,
+            paint_brush,
+            gust_brush,
+            gust_push,
+            react,
+            movement,
+            paint,
+            gust,
+            calm,
+            react_bind,
+            move_bind,
+            paint_bind,
+            gust_bind,
+            calm_bind,
+            frame: 0,
+            seed: 0x9e37_79b9,
+        }
+    }
+
+    /// The world buffer, for the renderer to read.
+    pub fn cells(&self) -> &wgpu::Buffer {
+        &self.cells
+    }
+
+    /// The material table, for the renderer to look colours up in.
+    pub fn props(&self) -> &wgpu::Buffer {
+        &self.props
+    }
+
+    /// Advance the world by one tick.
+    ///
+    /// One tick is submitted on its own rather than batched with the frame's
+    /// other work. The uniforms carry the tick counter, and a write to a buffer
+    /// lands before the next submission rather than in the middle of one, so two
+    /// ticks in a frame need two submissions to keep their counters apart.
+    pub fn step(&mut self) {
+        self.frame = self.frame.wrapping_add(1);
+
+        // The prevailing breeze eases through a slow sine, swelling, dropping
+        // and gently reversing, rather than snapping direction on a timer.
+        let breeze =
+            (kernels::AMBIENT_MAX * (self.frame as f32 * kernels::AMBIENT_RATE).sin()) as i32;
+        self.queue
+            .write_buffer(&self.breeze, 0, bytemuck::bytes_of(&breeze));
+        self.queue.write_buffer(
+            &self.react_world,
+            0,
+            bytemuck::cast_slice(&[self.width, self.height, self.frame, 0]),
+        );
+        for (i, buffer) in self.move_world.iter().enumerate() {
+            self.queue.write_buffer(
+                buffer,
+                0,
+                bytemuck::cast_slice(&[self.width, self.height, self.frame, i as u32]),
+            );
+        }
+
+        let cell_count = self.width * self.height;
+        // A block covers two cells each way, and the shifted pass needs one more
+        // of them along each axis to reach the far edge.
+        let blocks = [self.width / 2 + 1, self.height / 2 + 1, 1];
+
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("tick"),
+            });
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("tick"),
+                timestamp_writes: None,
+            });
+            self.calm
+                .dispatch(&mut pass, &self.calm_bind, [cell_count * 2, 1, 1]);
+            self.react
+                .dispatch(&mut pass, &self.react_bind, [self.width, self.height, 1]);
+            for group in &self.move_bind {
+                self.movement.dispatch(&mut pass, group, blocks);
+            }
+        }
+        self.queue.submit([encoder.finish()]);
+    }
+
+    /// Stamp a filled circle of `material` into the world. Painting
+    /// [`crate::materials::EMPTY`] erases.
+    pub fn paint_disk(&mut self, cx: i32, cy: i32, radius: i32, material: MaterialId) {
+        let radius = radius.max(0);
+        // A fresh grain for every stroke, so painting twice over the same spot
+        // does not come out with the same speckle.
+        self.seed = self
+            .seed
+            .wrapping_mul(1_664_525)
+            .wrapping_add(1_013_904_223);
+        self.queue.write_buffer(
+            &self.paint_world,
+            0,
+            bytemuck::cast_slice(&[self.width, self.height, self.seed, 0]),
+        );
+        self.queue.write_buffer(
+            &self.paint_brush,
+            0,
+            bytemuck::cast_slice(&[cx, cy, radius, material as i32]),
+        );
+        self.run_tool("paint", &self.paint, &self.paint_bind, radius);
+    }
+
+    /// Blow a gust into a filled circle of the wind field: one sweep of the wind
+    /// tool. `dvx`/`dvy` are in the wind sub-units [`kernels::movement`] reads,
+    /// the same ones [`kernels::AMBIENT_MAX`] is measured in.
+    pub fn add_wind_disk(&mut self, cx: i32, cy: i32, radius: i32, dvx: i32, dvy: i32) {
+        if dvx == 0 && dvy == 0 {
+            return;
+        }
+        let radius = radius.max(0);
+        self.queue.write_buffer(
+            &self.gust_brush,
+            0,
+            bytemuck::cast_slice(&[cx, cy, radius, 0]),
+        );
+        self.queue
+            .write_buffer(&self.gust_push, 0, bytemuck::cast_slice(&[dvx, dvy, 0, 0]));
+        self.run_tool("gust", &self.gust, &self.gust_bind, radius);
+    }
+
+    /// Dispatch a brush kernel over the square the brush covers.
+    fn run_tool(&self, label: &str, stage: &Stage, group: &wgpu::BindGroup, radius: i32) {
+        let side = radius as u32 * 2 + 1;
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some(label) });
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some(label),
+                timestamp_writes: None,
+            });
+            stage.dispatch(&mut pass, group, [side, side, 1]);
+        }
+        self.queue.submit([encoder.finish()]);
+    }
+
+    /// Empty the world and still the weather.
+    pub fn clear(&mut self) {
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("clear"),
+            });
+        // Zero is air, and zero is calm, so clearing really is just zeroing.
+        encoder.clear_buffer(&self.cells, 0, None);
+        encoder.clear_buffer(&self.scratch, 0, None);
+        encoder.clear_buffer(&self.wind, 0, None);
+        self.queue.submit([encoder.finish()]);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::materials::{EMPTY, LAVA, SAND, SOIL, STONE, WATER};
+
+    /// A GPU device with no window attached. The tests run the very kernels the
+    /// game runs, on real hardware, because that is the only place the physics
+    /// actually happens. A machine with no usable adapter cannot run them.
+    fn headless() -> (wgpu::Device, wgpu::Queue) {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let adapter = pollster::block_on(instance.request_adapter(&Default::default()))
+            .expect("no GPU adapter to run the kernels on");
+        pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+            label: Some("test device"),
+            ..Default::default()
+        }))
+        .expect("request device")
+    }
+
+    /// The world, read back so a test can look at it. Blocks until the GPU has
+    /// caught up, which is the one thing the game itself never does.
+    fn snapshot(sim: &Simulation) -> World {
+        let size = (sim.width * sim.height) as u64 * 4;
+        let staging = sim.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("readback"),
+            size,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut encoder = sim
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("readback"),
+            });
+        encoder.copy_buffer_to_buffer(&sim.cells, 0, &staging, 0, size);
+        sim.queue.submit([encoder.finish()]);
+
+        let slice = staging.slice(..);
+        slice.map_async(wgpu::MapMode::Read, |result| result.expect("map readback"));
+        sim.device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .expect("wait for the GPU");
+        let view = slice.get_mapped_range();
+        let cells: Vec<u32> = bytemuck::cast_slice(&view).to_vec();
+        drop(view);
+        staging.unmap();
+
+        World {
+            width: sim.width,
+            height: sim.height,
+            cells,
+        }
+    }
+
+    struct World {
+        width: u32,
+        height: u32,
+        cells: Vec<u32>,
+    }
+
+    impl World {
+        fn at(&self, x: u32, y: u32) -> MaterialId {
+            (self.cells[(y * self.width + x) as usize] & 0xff) as MaterialId
+        }
+
+        fn count(&self, material: MaterialId) -> usize {
+            self.cells
+                .iter()
+                .filter(|cell| (*cell & 0xff) as MaterialId == material)
+                .count()
+        }
+
+        /// Where the middle of all the `material` in the world sits, left to
+        /// right. Panics if there is none, since a test asking this of an empty
+        /// world has already gone wrong.
+        fn mean_x(&self, material: MaterialId) -> f64 {
+            let places: Vec<u32> = (0..self.height)
+                .flat_map(|y| (0..self.width).map(move |x| (x, y)))
+                .filter(|&(x, y)| self.at(x, y) == material)
+                .map(|(x, _)| x)
+                .collect();
+            assert!(!places.is_empty(), "no {material} left to measure");
+            places.iter().map(|&x| x as f64).sum::<f64>() / places.len() as f64
+        }
+
+        /// The topmost row holding `material`, or `None` if there is none.
+        fn highest(&self, material: MaterialId) -> Option<u32> {
+            (0..self.height).find(|&y| (0..self.width).any(|x| self.at(x, y) == material))
+        }
+
+        /// The bottommost row holding `material`.
+        fn lowest(&self, material: MaterialId) -> Option<u32> {
+            (0..self.height)
+                .rev()
+                .find(|&y| (0..self.width).any(|x| self.at(x, y) == material))
+        }
+    }
+
+    /// Lay a solid floor one row above the bottom, so a test can tell material
+    /// settling on the ground from material piling up against the world's edge.
+    fn floor(sim: &mut Simulation, material: MaterialId) {
+        let y = (GRID_H - 4) as i32;
+        for x in (0..GRID_W as i32).step_by(8) {
+            sim.paint_disk(x, y, 5, material);
+        }
+    }
+
+    fn run(sim: &mut Simulation, ticks: usize) {
+        for _ in 0..ticks {
+            sim.step();
+        }
+    }
+
+    #[test]
+    fn sand_falls_onto_the_ground_and_stays_there() {
+        let (device, queue) = headless();
+        let mut sim = Simulation::new(&device, &queue);
+        floor(&mut sim, STONE);
+        sim.paint_disk(500, 60, 14, SAND);
+        let painted = snapshot(&sim).count(SAND);
+        assert!(painted > 0, "the brush should have put some sand down");
+
+        run(&mut sim, 400);
+
+        let world = snapshot(&sim);
+        assert_eq!(
+            world.count(SAND),
+            painted,
+            "sand should neither be created nor destroyed on the way down"
+        );
+        let top = world.highest(SAND).expect("the sand is still somewhere");
+        assert!(
+            top > 400,
+            "the sand should have fallen to the floor, but its highest grain is at row {top}"
+        );
+    }
+
+    #[test]
+    fn a_pile_of_sand_is_far_wider_than_the_column_that_made_it() {
+        // A grain that cannot go straight down rolls off to the side instead,
+        // which is what stops a pile from stacking into a tower. Poured through
+        // a seven-cell-wide spout, the heap should end up many times that
+        // across; anything near the width of the spout means the tumble is not
+        // firing and the sand is piling straight up.
+        let (device, queue) = headless();
+        let mut sim = Simulation::new(&device, &queue);
+        floor(&mut sim, STONE);
+        for y in (20..200).step_by(6) {
+            sim.paint_disk(500, y, 3, SAND);
+        }
+        run(&mut sim, 500);
+
+        let world = snapshot(&sim);
+        let settled = (0..GRID_H)
+            .flat_map(|y| (0..GRID_W).map(move |x| (x, y)))
+            .filter(|&(x, y)| world.at(x, y) == SAND)
+            .map(|(x, _)| x);
+        let (left, right) = settled.fold((GRID_W, 0), |(lo, hi), x| (lo.min(x), hi.max(x)));
+        assert!(
+            right - left > 40,
+            "the sand should have spread into a heap, but it is only {} cells wide",
+            right - left
+        );
+    }
+
+    #[test]
+    fn water_finds_its_own_level() {
+        // Water poured into one spot of a basin should end up spread far wider
+        // than it was painted. Sand in the same place would not.
+        let (device, queue) = headless();
+        let mut sim = Simulation::new(&device, &queue);
+        floor(&mut sim, STONE);
+        sim.paint_disk(500, 200, 20, WATER);
+        run(&mut sim, 500);
+
+        let world = snapshot(&sim);
+        let wet = |x: u32| (0..GRID_H).any(|y| world.at(x, y) == WATER);
+        let spread = (0..GRID_W).filter(|&x| wet(x)).count();
+        assert!(
+            spread > 120,
+            "water should have levelled off across the floor, but it only covers {spread} columns"
+        );
+    }
+
+    #[test]
+    fn sand_sinks_through_water() {
+        // Sand is denser than water, so a grain dropped into a pool ends up
+        // under it rather than floating.
+        let (device, queue) = headless();
+        let mut sim = Simulation::new(&device, &queue);
+        floor(&mut sim, STONE);
+        sim.paint_disk(500, 420, 30, WATER);
+        run(&mut sim, 200);
+        sim.paint_disk(500, 330, 8, SAND);
+        run(&mut sim, 400);
+
+        let world = snapshot(&sim);
+        let sand_top = world.highest(SAND).expect("the sand is still somewhere");
+        let water_bottom = world.lowest(WATER).expect("the water is still somewhere");
+        assert!(
+            sand_top > world.highest(WATER).unwrap(),
+            "the sand should have sunk below the water's surface"
+        );
+        assert!(
+            water_bottom > sand_top,
+            "some water should have been pushed up above the sand"
+        );
+    }
+
+    #[test]
+    fn water_meeting_lava_leaves_stone_behind() {
+        // Both halves of the reaction are rules in the material files, and each
+        // cell decides for itself, so this checks that both fired: the lava is
+        // quenched and the water that quenched it is spent as well.
+        //
+        // Not all of the lava goes. The stone the first contact makes is solid,
+        // so it seals the two apart and whatever is under the crust survives,
+        // which is what a lava flow hit by rain actually does.
+        let (device, queue) = headless();
+        let mut sim = Simulation::new(&device, &queue);
+        floor(&mut sim, STONE);
+        let stone_before = snapshot(&sim).count(STONE);
+        sim.paint_disk(500, 430, 20, LAVA);
+        run(&mut sim, 120);
+        let lava_before = snapshot(&sim).count(LAVA);
+        sim.paint_disk(500, 380, 20, WATER);
+        let water_before = snapshot(&sim).count(WATER);
+        run(&mut sim, 200);
+
+        let world = snapshot(&sim);
+        assert!(
+            world.count(STONE) > stone_before,
+            "water meeting lava should have left new stone behind"
+        );
+        assert!(
+            world.count(LAVA) < lava_before,
+            "some of the lava should have been quenched"
+        );
+        assert!(
+            world.count(WATER) < water_before,
+            "the water that quenched it should have turned to stone too"
+        );
+    }
+
+    #[test]
+    fn a_hillside_of_soil_holds_its_shape() {
+        // Soil is a solid, so unlike sand it does not slump. This is the test
+        // that would fail if the movement kernel started treating every
+        // material as mobile.
+        let (device, queue) = headless();
+        let mut sim = Simulation::new(&device, &queue);
+        sim.paint_disk(500, 100, 25, SOIL);
+        let before = snapshot(&sim);
+        run(&mut sim, 300);
+        let after = snapshot(&sim);
+
+        assert_eq!(before.count(SOIL), after.count(SOIL));
+        assert_eq!(
+            before.highest(SOIL),
+            after.highest(SOIL),
+            "a solid should not have moved at all"
+        );
+    }
+
+    #[test]
+    fn nothing_falls_out_of_the_world() {
+        // The movement kernel shifts its block grid by a cell on alternate
+        // passes, which leaves half a block hanging off each edge. Getting that
+        // wrong loses cells at the borders, so fill the edges and count.
+        let (device, queue) = headless();
+        let mut sim = Simulation::new(&device, &queue);
+        for y in (0..GRID_H as i32).step_by(10) {
+            sim.paint_disk(2, y, 4, SAND);
+            sim.paint_disk(GRID_W as i32 - 3, y, 4, SAND);
+        }
+        for x in (0..GRID_W as i32).step_by(10) {
+            sim.paint_disk(x, 2, 4, SAND);
+        }
+        let painted = snapshot(&sim).count(SAND);
+        run(&mut sim, 300);
+
+        let world = snapshot(&sim);
+        assert_eq!(
+            world.count(SAND),
+            painted,
+            "sand should pile up against the edges of the world, not vanish through them"
+        );
+    }
+
+    #[test]
+    fn a_gust_carries_falling_sand_downwind() {
+        // Loose material in mid air rides the wind. Two identical worlds, one
+        // with the wind tool swept through it and one left to the weather, so
+        // what is being measured is the gust rather than gravity.
+        let (device, queue) = headless();
+
+        let mut still = Simulation::new(&device, &queue);
+        floor(&mut still, STONE);
+        still.paint_disk(300, 40, 10, SAND);
+        run(&mut still, 400);
+
+        let mut blown = Simulation::new(&device, &queue);
+        floor(&mut blown, STONE);
+        blown.paint_disk(300, 40, 10, SAND);
+        for _ in 0..400 {
+            blown.add_wind_disk(500, 200, 400, 120, 0);
+            blown.step();
+        }
+
+        let settled = snapshot(&still).mean_x(SAND);
+        let carried = snapshot(&blown).mean_x(SAND);
+        assert!(
+            carried > settled + 30.0,
+            "the gust should have carried the sand well to the right, \
+             but it landed at {carried:.0} against {settled:.0} with no wind"
+        );
+    }
+
+    #[test]
+    fn the_eraser_clears_what_the_brush_painted() {
+        let (device, queue) = headless();
+        let mut sim = Simulation::new(&device, &queue);
+        sim.paint_disk(500, 250, 20, STONE);
+        assert!(snapshot(&sim).count(STONE) > 0);
+        sim.paint_disk(500, 250, 25, EMPTY);
+        assert_eq!(snapshot(&sim).count(STONE), 0);
+    }
+
+    #[test]
+    fn clearing_empties_the_whole_world() {
+        let (device, queue) = headless();
+        let mut sim = Simulation::new(&device, &queue);
+        floor(&mut sim, SOIL);
+        sim.paint_disk(500, 200, 30, WATER);
+        run(&mut sim, 20);
+        assert!(snapshot(&sim).count(EMPTY) < (GRID_W * GRID_H) as usize);
+
+        sim.clear();
+        assert_eq!(snapshot(&sim).count(EMPTY), (GRID_W * GRID_H) as usize);
+    }
+}

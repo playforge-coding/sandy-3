@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no" />
+    <title>Sandy 3</title>
+    <!-- The crate builds both a library and a desktop binary, so name which of
+         the two the web build wants: the cdylib. -->
+    <link data-trunk rel="rust" data-target-name="sandy_3" data-wasm-opt="z" />
+    <style>
+      html,
+      body {
+        margin: 0;
+        height: 100%;
+        overflow: hidden;
+        background: #7cadde;
+        font-family: system-ui, sans-serif;
+      }
+      /* winit appends the canvas to the body and sets its size itself, to match
+         the browser window, so nothing here should try to size it. This just
+         takes touch gestures off it, so dragging draws rather than scrolling,
+         and gets rid of the focus ring it picks up when clicked. */
+      canvas {
+        display: block;
+        touch-action: none;
+        outline: none;
+        border: 0;
+      }
+      #unsupported {
+        display: none;
+        padding: 2rem;
+        max-width: 34rem;
+        margin: 0 auto;
+        color: #10243a;
+        line-height: 1.5;
+      }
+    </style>
+  </head>
+  <body>
+    <noscript>Sandy needs JavaScript and WebGPU.</noscript>
+    <div id="unsupported">
+      <h1>This browser has no WebGPU</h1>
+      <p>
+        Sandy 3 runs its physics in compute shaders, so there is no fallback to
+        fall back to. Try a recent Chrome, Edge or Safari, and note that WebGPU
+        is only handed out over https or on localhost.
+      </p>
+    </div>
+    <script>
+      // Say so up front rather than letting the wasm module start and fail.
+      if (!navigator.gpu) {
+        document.getElementById("unsupported").style.display = "block";
+      }
+    </script>
+  </body>
+</html>

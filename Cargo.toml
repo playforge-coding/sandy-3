@@ -1,0 +1,110 @@
+cargo-features = ["codegen-backend"]
+
+[package]
+name = "sandy-3"
+version = "0.1.0"
+edition = "2024"
+license = "AGPL-3.0-only"
+description = "A falling-sand simulation whose physics run on the GPU, written with unipute and wgpu."
+
+# An rlib so the desktop binary can link it, and a cdylib so the web build has a
+# single thing for trunk and wasm-bindgen to load.
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[[bin]]
+name = "sandy-3"
+path = "src/main.rs"
+
+[dependencies]
+
+# Reinterpreting our plain `u32`/`i32` arrays as the bytes `Queue::write_buffer`
+# wants, without hand-rolling the casts.
+bytemuck = "1.24"
+
+# The control panel. `egui-wgpu` draws it in a pass over the finished frame and
+# `egui-winit` feeds it the window's input.
+#
+# Held at 0.35 rather than 0.36, which is the current release, because
+# `egui-winit` 0.36 does not compile for wasm32 at all: its `NativeFile` still
+# implements the blocking `DroppedFile::bytes`, which egui 0.36 made native
+# only, and it never implements the `bytes_async` the web expects instead. That
+# pins `wgpu` to 29 as well, since `egui-wgpu` 0.35 asks for that. Worth
+# re-checking whenever egui puts out a release.
+#
+# Both run with default features off. `egui-wgpu` would otherwise turn on
+# `wgpu/webgl`, and there is no WebGL build here to want it: the simulation is
+# compute shaders, which WebGL does not have. `egui-winit` would otherwise pull
+# in native-only clipboard and window-system crates that do not build for wasm.
+egui = "0.35"
+egui-wgpu = { version = "0.35", default-features = false, features = [
+    "fragile-send-sync-non-atomic-wasm",
+] }
+egui-winit = { version = "0.35", default-features = false, features = ["links"] }
+
+log = "0.4"
+# The simulation itself. Kernels are written as Rust functions and turned into
+# WGSL while this crate compiles, so a broken rule is a build error here rather
+# than a shader compile failure at startup. Not on crates.io yet, hence the path.
+unipute = { path = "../unipute" }
+# A `std::time::Instant` that also works in a browser, where `std`'s panics.
+# Drives the fixed-timestep clock, so the world runs at the same speed
+# everywhere.
+web-time = "1.1"
+
+# Window, surface and the render passes. The compute kernels unipute generates
+# are handed to wgpu as ordinary shader modules. The default features include
+# `webgpu` and leave out `webgl`, which is exactly what this wants. The version
+# is the one `egui-wgpu` above asks for.
+wgpu = "29.0"
+winit = "0.30.13"
+
+# ---- Desktop only ----
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+env_logger = "0.11"
+pollster = "0.4" # block_on for wgpu's async device request, which native can do
+
+# The window-system backends egui-winit needs on Linux, where a desktop build
+# has to pick one. Features are additive, so this adds to the entry above.
+[target.'cfg(target_os = "linux")'.dependencies]
+egui-winit = { version = "0.35", default-features = false, features = [
+    "wayland",
+    "x11",
+] }
+
+# ---- Web only ----
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+console_error_panic_hook = "0.1"
+console_log = "1"
+# Pinned to match the wasm-bindgen-cli that trunk downloads.
+wasm-bindgen = "0.2"
+# The browser cannot block, so the GPU device is requested off to one side and
+# handed back through the event loop when it is ready.
+wasm-bindgen-futures = "0.4"
+# Only to ask the browser how big its window is, so the canvas can be told to
+# match it. See `App::fit_canvas_to_window`.
+web-sys = { version = "0.3", features = ["Window"] }
+
+[profile.dev]
+codegen-backend = "cranelift"
+
+# Dependencies keep the usual backend. Cranelift is here to make rebuilds of
+# this crate quick, and dependencies are only built once anyway, so there is
+# nothing to gain by putting them through it. There is something to lose:
+# cranelift has no aarch64 lowering for some of the NEON intrinsics egui's text
+# rasteriser uses, and a debug build with everything on cranelift aborts on the
+# first frame.
+[profile.dev.package."*"]
+codegen-backend = "llvm"
+
+# What trunk builds the web version with (see Trunk.toml). It is the dev
+# profile with the codegen backend put back to LLVM, because cranelift has no
+# wasm32 target at all and a dev build for the web fails outright without this.
+# `trunk build --release` uses the release profile below and needs no such help.
+[profile.web]
+inherits = "dev"
+codegen-backend = "llvm"
+
+[profile.release]
+opt-level = 3
+lto = true

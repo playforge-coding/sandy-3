@@ -1,8 +1,19 @@
+# Caches built artefacts outside `target`, so a `cargo clean` costs seconds
+# rather than a full rebuild. This needs `cargo install sccache`; without it
+# every cargo command stops at "could not execute process sccache rustc -vV".
+# `RUSTC_WRAPPER= cargo build` overrides this for one command, which is also how
+# to time a build: `cargo clean` on its own is no longer a cold start.
 [build]
 rustc-wrapper = "sccache"
 
+# `codegen-backend` is still unstable, which is what pins the toolchain to
+# nightly.
 [unstable]
 codegen-backend = true
 
+# Cargo.toml sets this too, to the same value, so the duplication is harmless.
+# Keep the backend settings there rather than here: Cargo.toml also names the
+# three dependencies that have to stay on LLVM, and having the whole picture in
+# one file is worth more than saving these two lines.
 [profile.dev]
 codegen-backend = "cranelift"

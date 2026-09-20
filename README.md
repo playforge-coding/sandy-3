@@ -192,6 +192,22 @@ This is the elements and the tools, on the GPU, and the rest can follow.
 
 ## Building
 
+[sccache](https://github.com/mozilla/sccache) is needed before any of this will
+run, because `.cargo/config.toml` sets it as the compiler wrapper for everyone
+who checks the repo out:
+
+```sh
+cargo install sccache
+```
+
+Without it every cargo command stops at `could not execute process sccache
+rustc -vV`. Setting the variable to nothing turns the wrapper off for a single
+command, without touching the checked-in config:
+
+```sh
+RUSTC_WRAPPER= cargo build
+```
+
 ```sh
 cargo build           # debug
 cargo test            # runs the real kernels, so it needs a GPU
@@ -216,6 +232,27 @@ instructions sitting in the two vello crates.
 
 On an M-series Mac that takes a clean debug build from 23s to 18s, and the
 `target` directory it leaves behind from 944MB to 719MB.
+
+### sccache
+
+`.cargo/config.toml` also points `rustc-wrapper` at sccache, which keeps built
+artefacts in a cache outside `target`. The two settings solve different halves
+of the same problem: cranelift makes a fresh compile quicker, and sccache means
+a compile that has been done before does not happen again at all. A `cargo
+clean` followed by a rebuild costs 7s rather than the 18s above, because every
+crate comes back out of the cache.
+
+The cache key covers the codegen backend, so the split above survives it: the
+three LLVM crates never get handed an object that was built with cranelift. It
+is worth knowing anyway when a build behaves oddly, and `sccache --show-stats`
+is the first place to look. Clearing it is `sccache --zero-stats` for the
+counters and `rm -rf ~/.cache/sccache` (`~/Library/Caches/Mozilla.sccache` on
+macOS) for the artefacts.
+
+The one thing it does spoil is timing a build. `cargo clean` no longer means a
+cold build, so any measurement of compile time wants the `RUSTC_WRAPPER=` above
+to switch the wrapper off for that run. The 23s and 18s figures were taken that
+way.
 
 The tests drive real compute kernels on a real adapter, so a machine with no
 usable GPU cannot run them.

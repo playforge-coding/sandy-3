@@ -205,10 +205,17 @@ cargo fmt && cargo clippy
 is faster than LLVM at producing unoptimised binaries. That is the only reason
 for nightly; nothing in the code needs it.
 
-Dependencies stay on LLVM, which `Cargo.toml` says explicitly. They are only
-built once, so cranelift buys nothing there, and it costs something: it has no
-aarch64 lowering for some of the NEON intrinsics egui's text rasteriser uses,
-and a debug build with everything on cranelift aborts on the first frame.
+Dependencies go through cranelift too, bar three. egui rasterises glyphs with
+`vello_cpu`, which reaches for NEON through `fearless_simd`, and cranelift has
+no aarch64 lowering for some of those intrinsics, so a debug build of those
+crates aborts the moment the first glyph is drawn. `Cargo.toml` names
+`fearless_simd`, `vello_common` and `vello_cpu` and keeps them on LLVM. All
+three are needed: `fearless_simd` is generic, so its code lands in whichever
+crate instantiates it, and naming only `fearless_simd` leaves the trapping
+instructions sitting in the two vello crates.
+
+On an M-series Mac that takes a clean debug build from 23s to 18s, and the
+`target` directory it leaves behind from 944MB to 719MB.
 
 The tests drive real compute kernels on a real adapter, so a machine with no
 usable GPU cannot run them.

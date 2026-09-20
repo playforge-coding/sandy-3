@@ -1,5 +1,3 @@
-cargo-features = ["codegen-backend"]
-
 [package]
 name = "sandy-3"
 version = "0.1.0"
@@ -44,16 +42,28 @@ unipute = { path = "../unipute" }
 wgpu = "30.0"
 winit = "0.30.13"
 
+# Debug builds go through cranelift, which produces unoptimised code a good deal
+# faster than LLVM does. The first block covers this crate, the second every
+# dependency, since `package."*"` does not reach the crate being built.
 [profile.dev]
 codegen-backend = "cranelift"
 
-# Dependencies keep the usual backend. Cranelift is here to make rebuilds of
-# this crate quick, and dependencies are only built once anyway, so there is
-# nothing to gain by putting them through it. There is something to lose:
-# cranelift has no aarch64 lowering for some of the NEON intrinsics egui's text
-# rasteriser uses, and a debug build with everything on cranelift aborts on the
-# first frame.
 [profile.dev.package."*"]
+codegen-backend = "cranelift"
+
+# The exceptions. egui rasterises glyphs with `vello_cpu`, which reaches for
+# NEON through `fearless_simd`, and cranelift has no aarch64 lowering for some
+# of those intrinsics. A cranelift build of these aborts the moment the first
+# glyph is drawn, so they stay on LLVM. The two vello crates are named because
+# `fearless_simd` is generic and monomorphises into its callers; putting only
+# `fearless_simd` on LLVM leaves the trapping code in the vello crates.
+[profile.dev.package.fearless_simd]
+codegen-backend = "llvm"
+
+[profile.dev.package.vello_common]
+codegen-backend = "llvm"
+
+[profile.dev.package.vello_cpu]
 codegen-backend = "llvm"
 
 [profile.release]

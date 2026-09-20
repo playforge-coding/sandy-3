@@ -1,5 +1,4 @@
-//! The desktop entry point. Everything is in the library, so the web build and
-//! this one run the very same code.
+//! The entry point. Everything else is in the library.
 
 fn main() {
     sandy_3::run();

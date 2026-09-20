@@ -1,4 +1,1 @@
 /target
-# Trunk's output, and the scratch directory playwright leaves behind.
-/dist
-.playwright-cli

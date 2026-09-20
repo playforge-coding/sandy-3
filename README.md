@@ -2,8 +2,7 @@
 
 A **falling-sand** world written in Rust, where the physics runs on the GPU.
 
-It runs natively on Windows, macOS and Linux, and in the browser on WebGPU, from
-the same code.
+It runs natively on Windows, macOS and Linux.
 
 It is a companion to [Sandy 2](https://github.com/playforge-coding/sandy-2),
 which does the same job with a cellular automaton on the CPU. The difference is
@@ -52,36 +51,13 @@ a falling stream of sand without disturbing anything that has settled.
 
 The panel drives the same state as the shortcuts, so the two stay in step.
 
-## Run it on the desktop
+## Run it
 
 ```sh
 cargo run --release
 ```
 
 It needs a GPU with compute shaders, so Vulkan, Metal or D3D12.
-
-## Run it in a browser
-
-The web build uses [Trunk](https://trunk-rs.github.io/trunk/):
-
-```sh
-rustup target add wasm32-unknown-unknown
-cargo install trunk
-
-trunk serve --cargo-profile web   # then open http://localhost:8080
-trunk build --release             # a static site in dist/, to host anywhere
-```
-
-`--cargo-profile web` is the dev profile with the codegen backend put back to
-LLVM, because the one this crate normally uses for dev builds has no wasm32
-target. `--release` needs no such help. Trunk.toml says more about why the
-profile is passed on the command line rather than pinned in the config.
-
-**WebGPU only.** There is no WebGL fallback and there cannot be one: WebGL has
-no compute shaders at all, and this simulation is nothing but compute shaders.
-So it wants a recent Chrome, Edge, Firefox or Safari, served over https or from
-localhost, which is the only way a browser hands WebGPU out. A browser without
-it gets a short page saying so rather than a blank canvas.
 
 ## How it works
 
@@ -100,14 +76,9 @@ src/
 ├── bloom.wgsl      Gives the emissive materials their halo
 ├── ui.rs           The egui control panel
 ├── app.rs          winit window, input and the event loop
-├── lib.rs          Module wiring, and the browser entry point
-└── main.rs         The desktop entry point
+├── lib.rs          Module wiring
+└── main.rs         The entry point
 ```
-
-The desktop and the web run the same code. The only thing that differs is how
-the GPU device is asked for: the desktop blocks until it arrives, and a browser
-cannot, so there it is requested off to one side and handed back through the
-event loop.
 
 ### A material is data, not code
 
@@ -239,18 +210,5 @@ built once, so cranelift buys nothing there, and it costs something: it has no
 aarch64 lowering for some of the NEON intrinsics egui's text rasteriser uses,
 and a debug build with everything on cranelift aborts on the first frame.
 
-Cranelift has no wasm32 target at all either, which is what the `web` profile in
-`Cargo.toml` is for. Cargo profiles cannot be scoped to a target, so the web
-build has to name a different one.
-
 The tests drive real compute kernels on a real adapter, so a machine with no
 usable GPU cannot run them.
-
-### Versions
-
-egui is held at 0.35 rather than 0.36, the current release, because `egui-winit`
-0.36 does not compile for wasm32: its `NativeFile` still implements the blocking
-`DroppedFile::bytes`, which egui 0.36 made native only, and it never implements
-the `bytes_async` the web wants instead. That holds wgpu at 29 as well, since
-`egui-wgpu` 0.35 asks for that version. Both are worth re-checking whenever egui
-puts out a release.

@@ -483,7 +483,7 @@ mod tests {
         sim.device
             .poll(wgpu::PollType::wait_indefinitely())
             .expect("wait for the GPU");
-        let view = slice.get_mapped_range();
+        let view = slice.get_mapped_range().expect("map readback range");
         let cells: Vec<u32> = bytemuck::cast_slice(&view).to_vec();
         drop(view);
         staging.unmap();

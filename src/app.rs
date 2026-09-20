@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, MouseButton, TouchPhase, WindowEvent};
-use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
+use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Window, WindowId};
 
@@ -21,17 +21,6 @@ use crate::ui;
 /// The window size the app opens at, in logical pixels. Twice as wide as it is
 /// tall, matching the grid, so nothing is stretched out of shape at the start.
 const WINDOW_SIZE: (f64, f64) = (1100.0, 620.0);
-
-/// Delivered once the GPU device has finished being set up.
-///
-/// A browser cannot block waiting for one, so there the whole of [`State::new`]
-/// runs off to one side and the result comes back through the event loop. The
-/// desktop just blocks, and never sends this, which is why it is dead code
-/// there rather than absent: the event loop is typed on it either way.
-#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
-pub enum Ready {
-    State(Box<State>),
-}
 
 /// Wind sub-units added per grid cell the cursor sweeps. A brisk flick
 /// saturates the gust field for a strong, short-lived blast; a slow drag nudges.
@@ -64,11 +53,8 @@ impl Default for Input {
     }
 }
 
+#[derive(Default)]
 struct App {
-    /// Used only by the web build, to hand the finished GPU state back into the
-    /// event loop.
-    #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
-    proxy: EventLoopProxy<Ready>,
     state: Option<State>,
     input: Input,
     /// egui's context: fonts, memory and layout. Cheap to clone, since it is an
@@ -76,59 +62,12 @@ struct App {
     egui_ctx: egui::Context,
     /// Per-window input translation for egui, built once the window exists.
     egui_state: Option<egui_winit::State>,
-    /// The browser window size the canvas was last told to match, so it is only
-    /// re-told when the tab actually changes size.
-    #[cfg(target_arch = "wasm32")]
-    canvas_size: Option<(f64, f64)>,
 }
 
 impl App {
-    fn new(proxy: EventLoopProxy<Ready>) -> Self {
-        Self {
-            proxy,
-            state: None,
-            input: Input::default(),
-            egui_ctx: egui::Context::default(),
-            egui_state: None,
-            #[cfg(target_arch = "wasm32")]
-            canvas_size: None,
-        }
-    }
-
-    /// Keep the canvas the size of the browser window.
-    ///
-    /// winit writes the canvas size into the element's own style attribute,
-    /// which beats anything the page's stylesheet says, so CSS alone cannot make
-    /// it fill the tab. Asking winit for the size is what does, and it has to be
-    /// asked again whenever the tab changes size.
-    #[cfg(target_arch = "wasm32")]
-    fn fit_canvas_to_window(&mut self) {
-        use winit::dpi::LogicalSize;
-
-        let Some(state) = &self.state else {
-            return;
-        };
-        let Some(browser) = web_sys::window() else {
-            return;
-        };
-        let (Ok(width), Ok(height)) = (browser.inner_width(), browser.inner_height()) else {
-            return;
-        };
-        let (Some(width), Some(height)) = (width.as_f64(), height.as_f64()) else {
-            return;
-        };
-        if self.canvas_size == Some((width, height)) {
-            return;
-        }
-        self.canvas_size = Some((width, height));
-        let _ = state
-            .window()
-            .request_inner_size(LogicalSize::new(width, height));
-    }
-
     /// Build the bridge between egui and winit, once the GPU state and so the
     /// window exist. Doing nothing if it is already built, or if it cannot be
-    /// built yet, is what lets both entry paths call it.
+    /// built yet, keeps this safe to call more than once.
     fn ensure_egui(&mut self) {
         if self.egui_state.is_some() {
             return;
@@ -147,7 +86,7 @@ impl App {
     }
 }
 
-impl ApplicationHandler<Ready> for App {
+impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         // `resumed` can fire more than once on some platforms.
         if self.state.is_some() {
@@ -157,46 +96,10 @@ impl ApplicationHandler<Ready> for App {
         let attrs = Window::default_attributes()
             .with_title("Sandy 3")
             .with_inner_size(winit::dpi::LogicalSize::new(WINDOW_SIZE.0, WINDOW_SIZE.1));
-        // On the web the window is a <canvas>, which has to be put in the page.
-        #[cfg(target_arch = "wasm32")]
-        let attrs = {
-            use winit::platform::web::WindowAttributesExtWebSys;
-            attrs.with_append(true)
-        };
         let window = Arc::new(event_loop.create_window(attrs).expect("create window"));
 
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            self.state = Some(pollster::block_on(State::new(window)));
-            self.ensure_egui();
-        }
-        #[cfg(target_arch = "wasm32")]
-        {
-            // A browser has no way to block on this, so build it off to one side
-            // and post it back when it is done.
-            let proxy = self.proxy.clone();
-            wasm_bindgen_futures::spawn_local(async move {
-                let state = State::new(window).await;
-                let _ = proxy.send_event(Ready::State(Box::new(state)));
-            });
-        }
-    }
-
-    fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: Ready) {
-        let Ready::State(state) = event;
-        self.state = Some(*state);
+        self.state = Some(pollster::block_on(State::new(window)));
         self.ensure_egui();
-        if let Some(state) = &mut self.state {
-            // The canvas only gets its real size once the page has laid out,
-            // which happens while the GPU device is still being set up. That
-            // first `Resized` arrives before there is a state to hand it to and
-            // is dropped, leaving the surface at the size it was first
-            // configured with, and the WebGPU backend makes the canvas match
-            // that. So re-apply the size now that there is somewhere to put it.
-            let size = state.window().inner_size();
-            state.resize(size.width, size.height);
-            state.window().request_redraw();
-        }
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
@@ -267,11 +170,6 @@ impl ApplicationHandler<Ready> for App {
     }
 
     fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
-        // The tab may have been resized since the last frame, and the browser
-        // does not tell winit about that on its own.
-        #[cfg(target_arch = "wasm32")]
-        self.fit_canvas_to_window();
-
         // Keep the world moving: ask for the next frame straight away.
         if let Some(state) = &self.state {
             state.window().request_redraw();
@@ -375,40 +273,17 @@ impl App {
     }
 }
 
-/// Open the window and run until it closes. Shared by the desktop binary and
-/// the web build.
+/// Open the window and run until it closes.
 pub fn run() {
-    // Logging goes to the terminal on the desktop and to the browser console on
-    // the web, where a panic would otherwise be an unreadable `unreachable`.
-    #[cfg(not(target_arch = "wasm32"))]
     env_logger::init();
-    #[cfg(target_arch = "wasm32")]
-    {
-        console_error_panic_hook::set_once();
-        let _ = console_log::init_with_level(log::Level::Info);
-    }
 
     log::info!(
         "Controls: use the panel, or press 1=Sand 2=Stone 3=Water 4=Lava 5=Soil  0/Backspace=Erase  \
          W=wind tool (sweep to blow a gust)  [ ]=brush size  C=clear  (hold left mouse to draw)"
     );
 
-    let event_loop = EventLoop::<Ready>::with_user_event()
-        .build()
-        .expect("build event loop");
+    let event_loop = EventLoop::new().expect("build event loop");
     event_loop.set_control_flow(ControlFlow::Poll);
-    let app = App::new(event_loop.create_proxy());
-
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        let mut app = app;
-        event_loop.run_app(&mut app).expect("run event loop");
-    }
-    // The browser owns the loop, so this hands the app over and returns rather
-    // than blocking.
-    #[cfg(target_arch = "wasm32")]
-    {
-        use winit::platform::web::EventLoopExtWebSys;
-        event_loop.spawn_app(app);
-    }
+    let mut app = App::default();
+    event_loop.run_app(&mut app).expect("run event loop");
 }

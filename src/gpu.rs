@@ -10,6 +10,7 @@
 //! soft anyway, so only the surface is reconfigured when the window changes size.
 
 use std::sync::Arc;
+use std::time::Instant;
 
 use winit::window::Window;
 
@@ -64,10 +65,7 @@ pub struct State {
     /// When [`State::update`] last ran, and the leftover real time it could not
     /// spend on a whole tick. Between them they decouple the world's speed from
     /// the frame rate.
-    ///
-    /// `web_time::Instant` rather than the one in `std`, whose `now` panics in a
-    /// browser. On the desktop it is the same type.
-    last_update: web_time::Instant,
+    last_update: Instant,
     tick_accumulator: f64,
 
     pub sim: Simulation,
@@ -88,18 +86,8 @@ impl State {
         let width = size.width.max(1);
         let height = size.height.max(1);
 
-        // In a browser, WebGPU and nothing else. There is no WebGL fallback and
-        // there cannot be one: the whole simulation is compute shaders, and
-        // WebGL has none. Asking only for WebGPU means a browser without it
-        // fails here, with a message saying so, rather than getting a surface it
-        // cannot run anything on.
-        #[cfg(target_arch = "wasm32")]
-        let backends = wgpu::Backends::BROWSER_WEBGPU;
-        #[cfg(not(target_arch = "wasm32"))]
-        let backends = wgpu::Backends::all();
-
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
-            backends,
+            backends: wgpu::Backends::all(),
             ..wgpu::InstanceDescriptor::new_without_display_handle()
         });
 
@@ -116,8 +104,8 @@ impl State {
             })
             .await
             .expect(
-                "no suitable GPU adapter found. In a browser this means WebGPU is not available; \
-                 try a recent Chrome, Edge or Safari, over https or localhost",
+                "no suitable GPU adapter found. This needs a GPU with compute shaders, so Vulkan, \
+                 Metal or D3D12",
             );
 
         let (device, queue) = adapter
@@ -147,6 +135,9 @@ impl State {
         let config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format,
+            // Plain sRGB, standard dynamic range: the space the composite pass
+            // already writes into. `Auto` picks exactly that for these formats.
+            color_space: wgpu::SurfaceColorSpace::Auto,
             width,
             height,
             present_mode: wgpu::PresentMode::Fifo, // vsync, supported everywhere
@@ -481,7 +472,7 @@ impl State {
             glow_a_view,
             glow_b_view,
             egui_renderer,
-            last_update: web_time::Instant::now(),
+            last_update: Instant::now(),
             tick_accumulator: 0.0,
             sim,
         }
@@ -526,7 +517,7 @@ impl State {
     /// always runs [`TICKS_PER_SECOND`] ticks per second of wall clock whatever
     /// the display is doing, with the catch-up bounded by [`MAX_FRAME_TIME`].
     pub fn update(&mut self) {
-        let now = web_time::Instant::now();
+        let now = Instant::now();
         let frame_time = (now - self.last_update).as_secs_f64().min(MAX_FRAME_TIME);
         self.last_update = now;
         self.tick_accumulator += frame_time;
@@ -551,9 +542,13 @@ impl State {
         // could bail out. A delta is sent once and never again, so a frame that
         // gave up here without applying it would lose the font atlas for good
         // and every later frame would draw no text.
-        for (id, delta) in &textures_delta.set {
-            self.egui_renderer
-                .update_texture(&self.device, &self.queue, *id, delta);
+        // One texture can have several deltas queued for it in a frame, so each
+        // entry is a list; they have to go on in the order egui recorded them.
+        for (id, deltas) in &textures_delta.set {
+            for delta in deltas {
+                self.egui_renderer
+                    .update_texture(&self.device, &self.queue, *id, delta);
+            }
         }
         textures_delta.set.clear();
 
@@ -694,7 +689,7 @@ impl State {
                 .into_iter()
                 .chain(std::iter::once(encoder.finish())),
         );
-        frame.present();
+        self.queue.present(frame);
 
         // Free whatever egui retired this frame, after the submit so nothing is
         // dropped while commands still in flight refer to it.

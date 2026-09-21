@@ -2,7 +2,8 @@
 //!
 //! egui draws as its own pass over the finished scene (see
 //! [`crate::gpu::State::render`]), so nothing here touches the world. The panel
-//! is a material picker, a brush picker, the tools, and a size. The keyboard
+//! is a material picker, a brush picker, the tools, a size, and the clock:
+//! pause, a single step and a speed. The keyboard
 //! shortcuts in [`crate::app`] drive the very same [`Controls`], which is what
 //! keeps the two in step.
 //!
@@ -13,6 +14,16 @@
 use egui::{Color32, RichText, Stroke};
 
 use crate::materials::{EMPTY, MaterialId, Registry, SAND};
+
+/// The slowest the world can be run, as a multiple of real time. Below a
+/// quarter speed sand falls so slowly it looks stuck, and pausing does that job
+/// better.
+pub const MIN_SPEED: f64 = 0.25;
+
+/// The fastest, as a multiple of real time. Four times is 240 ticks a second,
+/// which a laptop GPU still keeps up with; past that the frame rate drops and
+/// the world runs no faster anyway.
+pub const MAX_SPEED: f64 = 4.0;
 
 /// What a drag does. Most of the time it paints the chosen material with the
 /// chosen brush; the wind tool instead blows a gust the way the cursor is
@@ -45,6 +56,12 @@ pub struct Controls {
     /// The size, in grid cells: the brush radius, or the wind tool's gust
     /// radius, or whatever a plugin makes of it.
     pub radius: i32,
+    /// Whether the world is frozen. Painting and the wind tool still work on a
+    /// paused world; only the ticks stop.
+    pub paused: bool,
+    /// How fast the world runs, as a multiple of real time, between
+    /// [`MIN_SPEED`] and [`MAX_SPEED`]. One is the usual sixty ticks a second.
+    pub speed: f64,
 }
 
 impl Default for Controls {
@@ -54,7 +71,27 @@ impl Default for Controls {
             material: SAND,
             brush: 0,
             radius: 8,
+            paused: false,
+            speed: 1.0,
         }
+    }
+}
+
+impl Controls {
+    /// The rate the world should advance at this frame, as a multiple of real
+    /// time: the chosen speed, or nothing at all while paused.
+    pub fn rate(&self) -> f64 {
+        if self.paused { 0.0 } else { self.speed }
+    }
+
+    /// Halve the speed, down to [`MIN_SPEED`].
+    pub fn slower(&mut self) {
+        self.speed = (self.speed / 2.0).max(MIN_SPEED);
+    }
+
+    /// Double the speed, up to [`MAX_SPEED`].
+    pub fn faster(&mut self) {
+        self.speed = (self.speed * 2.0).min(MAX_SPEED);
     }
 }
 
@@ -63,6 +100,9 @@ impl Default for Controls {
 #[derive(Default)]
 pub struct Actions {
     pub clear: bool,
+    /// Advance the world by exactly one tick, pausing it first if it was
+    /// running.
+    pub step: bool,
 }
 
 /// Build the panel for this frame and report which buttons were hit.
@@ -153,6 +193,27 @@ pub fn draw(
             };
             ui.add(egui::Slider::new(&mut c.radius, 1..=60).text(label));
 
+            // Time. The speed slider is logarithmic so that half speed and
+            // double speed sit the same distance either side of one.
+            ui.separator();
+            ui.label("Time");
+            let label = if c.paused { "Resume" } else { "Pause" };
+            if ui
+                .add(egui::Button::new(label).min_size(button_size))
+                .clicked()
+            {
+                c.paused = !c.paused;
+            }
+            actions.step |= ui
+                .add(egui::Button::new("Step one tick").min_size(button_size))
+                .clicked();
+            ui.add(
+                egui::Slider::new(&mut c.speed, MIN_SPEED..=MAX_SPEED)
+                    .logarithmic(true)
+                    .suffix("x")
+                    .text("Speed"),
+            );
+
             ui.separator();
             actions.clear |= ui
                 .add(egui::Button::new("Clear").min_size(button_size))
@@ -160,9 +221,12 @@ pub fn draw(
 
             ui.separator();
             ui.label(
-                RichText::new("Hold left mouse to draw. Pick Wind and sweep to blow a gust.")
-                    .small()
-                    .weak(),
+                RichText::new(
+                    "Hold left mouse to draw. Pick Wind and sweep to blow a gust. \
+                     Space pauses, . steps a tick, - and = change the speed.",
+                )
+                .small()
+                .weak(),
             );
             ui.label(RichText::new(status).small().weak());
         });
@@ -182,5 +246,36 @@ fn contrast(c: Color32) -> Color32 {
         Color32::BLACK
     } else {
         Color32::WHITE
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn speed_halves_and_doubles_within_bounds() {
+        let mut c = Controls::default();
+        assert_eq!(c.rate(), 1.0);
+        c.faster();
+        assert_eq!(c.speed, 2.0);
+        for _ in 0..10 {
+            c.faster();
+        }
+        assert_eq!(c.speed, MAX_SPEED);
+        for _ in 0..10 {
+            c.slower();
+        }
+        assert_eq!(c.speed, MIN_SPEED);
+    }
+
+    #[test]
+    fn pausing_stops_the_clock_and_keeps_the_speed() {
+        let mut c = Controls::default();
+        c.faster();
+        c.paused = true;
+        assert_eq!(c.rate(), 0.0);
+        c.paused = false;
+        assert_eq!(c.rate(), 2.0);
     }
 }

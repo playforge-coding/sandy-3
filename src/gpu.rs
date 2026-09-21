@@ -523,17 +523,22 @@ impl State {
         (gx, gy)
     }
 
-    /// Advance the world by however much real time has gone by.
+    /// Advance the world by however much real time has gone by, scaled by
+    /// `rate`.
     ///
     /// This runs once per displayed frame, but the world moves on a fixed step:
-    /// elapsed time is banked and spent a whole [`TICK_DT`] at a time. So it
-    /// always runs [`TICKS_PER_SECOND`] ticks per second of wall clock whatever
-    /// the display is doing, with the catch-up bounded by [`MAX_FRAME_TIME`].
-    pub fn update(&mut self) {
+    /// elapsed time is banked and spent a whole [`TICK_DT`] at a time. So at a
+    /// rate of one it always runs [`TICKS_PER_SECOND`] ticks per second of wall
+    /// clock whatever the display is doing, with the catch-up bounded by
+    /// [`MAX_FRAME_TIME`]. A rate of two banks time twice as fast and so runs
+    /// twice as many ticks; a rate of zero banks nothing, which is a pause. The
+    /// clock is read either way, so unpausing does not spend the time spent
+    /// paused as a burst of catch-up.
+    pub fn update(&mut self, rate: f64) {
         let now = Instant::now();
         let frame_time = (now - self.last_update).as_secs_f64().min(MAX_FRAME_TIME);
         self.last_update = now;
-        self.tick_accumulator += frame_time;
+        self.tick_accumulator += frame_time * rate;
 
         while self.tick_accumulator >= TICK_DT {
             self.sim.step();

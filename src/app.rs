@@ -61,6 +61,9 @@ struct Input {
     /// drag yields a direction for the wind tool and for plugin tools. `None`
     /// at the start of a stroke, so the first frame only notes where it began.
     last_cell: Option<(i32, i32)>,
+    /// The step key was pressed since the last frame: advance one tick, as the
+    /// panel's Step button does. Cleared once it has been spent.
+    step: bool,
     controls: ui::Controls,
 }
 
@@ -70,6 +73,7 @@ impl Default for Input {
             cursor: (0.0, 0.0),
             drawing: false,
             last_cell: None,
+            step: false,
             controls: ui::Controls::default(),
         }
     }
@@ -321,7 +325,13 @@ impl App {
             if actions.clear {
                 state.sim.clear();
             }
-            state.update();
+            // A step is one tick and then stillness, so the world is paused
+            // first if it was running; `update` then adds nothing on top.
+            if actions.step || std::mem::take(&mut self.input.step) {
+                self.input.controls.paused = true;
+                state.sim.step();
+            }
+            state.update(self.input.controls.rate());
             state.render(
                 paint_jobs,
                 full_output.textures_delta,
@@ -344,6 +354,12 @@ impl App {
             KeyCode::KeyW => c.tool = ui::Tool::Wind,
             KeyCode::BracketLeft => c.radius = (c.radius - 1).max(1),
             KeyCode::BracketRight => c.radius = (c.radius + 1).min(60),
+            // Time: freeze the world, nudge it one tick, or run it slower or
+            // faster.
+            KeyCode::Space => c.paused = !c.paused,
+            KeyCode::Period => self.input.step = true,
+            KeyCode::Minus => c.slower(),
+            KeyCode::Equal => c.faster(),
             KeyCode::KeyC => {
                 if let Some(state) = &mut self.state {
                     state.sim.clear();
@@ -449,7 +465,9 @@ pub fn run() {
 
     log::info!(
         "Controls: use the panel, or press 1=Sand 2=Stone 3=Water 4=Lava 5=Soil  0/Backspace=Erase  \
-         W=wind tool (sweep to blow a gust)  [ ]=brush size  C=clear  (hold left mouse to draw). \
+         W=wind tool (sweep to blow a gust)  [ ]=brush size  Space=pause  .=step one tick  \
+         - ==slower/faster  \
+         C=clear  (hold left mouse to draw). \
          Drop a .lua file on the window to load a plugin."
     );
 

@@ -67,9 +67,21 @@ a falling stream of sand without disturbing anything that has settled.
 | **0** / **Backspace** | eraser |
 | **W** | wind tool |
 | **[** / **]** | shrink / grow the brush |
+| **Space** | pause / resume |
+| **.** | step one tick |
+| **-** / **=** | halve / double the speed |
 | **C** | clear the world |
 
 The panel drives the same state as the shortcuts, so the two stay in step.
+
+The world runs at a quarter speed up to four times real time, on the panel's
+slider or by halving and doubling with the keys. Pausing stops the ticks and
+nothing else: the brushes and the wind tool still work on a frozen world, so a
+scene can be set up and then let go. Unpausing carries on from where it stopped
+rather than catching up on the time it spent paused. Stepping runs exactly one
+tick, a reaction pass and three movement passes, and leaves the world paused,
+so a grain can be watched fall a cell at a time; pressing it while the world is
+running pauses it first.
 
 ## Plugins
 

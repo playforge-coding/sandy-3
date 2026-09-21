@@ -15,7 +15,7 @@
 use unipute::{Access, WgslKernel};
 use wgpu::util::DeviceExt;
 
-use crate::kernels::{self, MOVE_PASSES};
+use crate::kernels::{self, MOVE_PASSES, PRESSURE_ITERATIONS};
 use crate::materials::MaterialId;
 
 /// Simulation resolution, in cells. The renderer stretches this to fill the
@@ -33,6 +33,14 @@ pub const GRID_H: u32 = 500;
 const _: () = assert!(
     MOVE_PASSES % 2 == 1,
     "MOVE_PASSES must be odd so a tick leaves the live world back in `cells`"
+);
+
+/// The pressure solve bounces between two buffers the same way, and the
+/// projection reads the first of them, so it has to take an even number of
+/// steps to land back there.
+const _: () = assert!(
+    PRESSURE_ITERATIONS.is_multiple_of(2),
+    "PRESSURE_ITERATIONS must be even so the solve ends in `pressure`"
 );
 
 /// Bytes in a uniform buffer. Every uniform here is at most a `vec4`, and a
@@ -148,9 +156,18 @@ pub struct Simulation {
     /// What each material is, as [`crate::kernels::props_table`] lays it out.
     /// Also read by the renderer, for the colours.
     props: wgpu::Buffer,
-    /// The gust field: every cell's sideways push, then every cell's vertical
-    /// one. Painted by the wind tool and fading on its own every tick.
+    /// The wind: one velocity per cell, in cells per tick. The wind tool stamps
+    /// into it, the fluid kernels move it along each tick, and it is the live
+    /// field at every point outside [`Simulation::step`], the way `cells` is
+    /// the live grid.
     wind: wgpu::Buffer,
+    /// The wind's other half, for the same reason `scratch` exists.
+    wind_scratch: wgpu::Buffer,
+    /// The pressure the solve is relaxing towards, kept between ticks so each
+    /// tick starts from the last one's answer.
+    pressure: wgpu::Buffer,
+    /// The other half of the pressure pair.
+    pressure_scratch: wgpu::Buffer,
 
     react_world: wgpu::Buffer,
     move_world: Vec<wgpu::Buffer>,
@@ -160,17 +177,29 @@ pub struct Simulation {
     gust_brush: wgpu::Buffer,
     gust_push: wgpu::Buffer,
 
+    curl: Stage,
+    swirl: Stage,
+    flow: Stage,
+    divergence: Stage,
+    pressure_step: Stage,
+    project: Stage,
     react: Stage,
     movement: Stage,
     paint: Stage,
     gust: Stage,
-    calm: Stage,
 
+    curl_bind: wgpu::BindGroup,
+    swirl_bind: wgpu::BindGroup,
+    flow_bind: wgpu::BindGroup,
+    divergence_bind: wgpu::BindGroup,
+    /// The first step of a tick, then one for each direction the pressure pair
+    /// is bounced in after that.
+    pressure_bind: [wgpu::BindGroup; 3],
+    project_bind: wgpu::BindGroup,
     react_bind: wgpu::BindGroup,
     move_bind: Vec<wgpu::BindGroup>,
     paint_bind: wgpu::BindGroup,
     gust_bind: wgpu::BindGroup,
-    calm_bind: wgpu::BindGroup,
 
     /// Ticks elapsed. Feeds the kernels' randomness and the prevailing breeze,
     /// so it has to change every tick but never has to mean anything else.
@@ -202,13 +231,24 @@ impl Simulation {
         // fresh world needs nothing written into it.
         let cells = grid("cells");
         let scratch = grid("scratch");
-        // Two components per cell, laid end to end.
-        let wind = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("wind"),
-            size: cell_count * 2 * 4,
-            usage: storage,
-            mapped_at_creation: false,
-        });
+        // A `vec2<f32>` per cell. Zero is still air, so a fresh field is calm.
+        let field = |label| {
+            device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(label),
+                size: cell_count * 8,
+                usage: storage,
+                mapped_at_creation: false,
+            })
+        };
+        let wind = field("wind");
+        let wind_scratch = field("wind scratch");
+        // One `f32` per cell.
+        let pressure = grid("pressure");
+        let pressure_scratch = grid("pressure scratch");
+        // Recomputed from scratch every tick, so like the rules table they are
+        // only ever held by a bind group.
+        let divergence_field = grid("divergence");
+        let curl_field = grid("curl");
 
         let table = |label, words: &[u32]| {
             device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -242,20 +282,82 @@ impl Simulation {
         let breeze = uniform("breeze");
         let paint_world = uniform("paint world");
         let paint_brush = uniform("paint brush");
-        let gust_world = uniform("gust world");
+        let shape = uniform("shape");
+        let weather = uniform("weather");
+        let carry = uniform("pressure carry");
+        let keep = uniform("pressure keep");
         let gust_brush = uniform("gust brush");
         let gust_push = uniform("gust push");
 
-        // The world's shape never changes, so the tools' copy of it is written
-        // once here rather than before every stroke.
-        queue.write_buffer(&gust_world, 0, bytemuck::cast_slice(&[width, height, 0, 0]));
+        // The world's shape never changes, so the kernels that need nothing
+        // else share one copy of it, written once here. The wind's top speed
+        // and decay are constants too, as is how much of the last tick's
+        // pressure the first solve step of a tick starts from, and the whole
+        // of it that every later step keeps.
+        queue.write_buffer(&shape, 0, bytemuck::cast_slice(&[width, height, 0, 0]));
+        queue.write_buffer(&weather, 0, bytemuck::cast_slice(&kernels::weather()));
+        queue.write_buffer(&carry, 0, bytemuck::bytes_of(&kernels::PRESSURE_CARRY));
+        queue.write_buffer(&keep, 0, bytemuck::bytes_of(&1.0f32));
 
+        let curl = Stage::new::<kernels::curl>(device);
+        let swirl = Stage::new::<kernels::swirl>(device);
+        let flow = Stage::new::<kernels::flow>(device);
+        let divergence = Stage::new::<kernels::divergence>(device);
+        let pressure_step = Stage::new::<kernels::pressure>(device);
+        let project = Stage::new::<kernels::project>(device);
         let react = Stage::new::<kernels::react>(device);
         let movement = Stage::new::<kernels::movement>(device);
         let paint = Stage::new::<kernels::paint>(device);
         let gust = Stage::new::<kernels::gust>(device);
-        let calm = Stage::new::<kernels::calm>(device);
 
+        // The wind goes out through `wind_scratch` and comes back into `wind`,
+        // so the live field is in the same buffer at the end of a tick as at
+        // the start. The pressure pair bounces an even number of times and
+        // ends in `pressure`, which is the one `project` reads. The first
+        // bounce of a tick is the one that lets some of the old answer go.
+        let curl_bind = curl.bind(device, &[&wind, &curl_field, &shape]);
+        let swirl_bind = swirl.bind(device, &[&curl_field, &wind, &shape, &weather]);
+        let flow_bind = flow.bind(
+            device,
+            &[&wind, &wind_scratch, &cells, &props, &shape, &weather],
+        );
+        let divergence_bind = divergence.bind(device, &[&wind_scratch, &divergence_field, &shape]);
+        let pressure_bind = [
+            pressure_step.bind(
+                device,
+                &[
+                    &pressure,
+                    &pressure_scratch,
+                    &divergence_field,
+                    &shape,
+                    &carry,
+                ],
+            ),
+            pressure_step.bind(
+                device,
+                &[
+                    &pressure,
+                    &pressure_scratch,
+                    &divergence_field,
+                    &shape,
+                    &keep,
+                ],
+            ),
+            pressure_step.bind(
+                device,
+                &[
+                    &pressure_scratch,
+                    &pressure,
+                    &divergence_field,
+                    &shape,
+                    &keep,
+                ],
+            ),
+        ];
+        let project_bind = project.bind(
+            device,
+            &[&wind_scratch, &wind, &pressure, &cells, &props, &shape],
+        );
         let react_bind = react.bind(device, &[&cells, &scratch, &rules, &react_world]);
         // Pass zero picks up what `react` left in `scratch` and puts it back in
         // `cells`; from there they alternate. With an odd number of passes the
@@ -271,8 +373,7 @@ impl Simulation {
             })
             .collect();
         let paint_bind = paint.bind(device, &[&cells, &paint_world, &paint_brush]);
-        let gust_bind = gust.bind(device, &[&wind, &gust_world, &gust_brush, &gust_push]);
-        let calm_bind = calm.bind(device, &[&wind]);
+        let gust_bind = gust.bind(device, &[&wind, &shape, &gust_brush, &gust_push, &weather]);
 
         Simulation {
             device: device.clone(),
@@ -283,6 +384,9 @@ impl Simulation {
             scratch,
             props,
             wind,
+            wind_scratch,
+            pressure,
+            pressure_scratch,
             react_world,
             move_world,
             breeze,
@@ -290,16 +394,26 @@ impl Simulation {
             paint_brush,
             gust_brush,
             gust_push,
+            curl,
+            swirl,
+            flow,
+            divergence,
+            pressure_step,
+            project,
             react,
             movement,
             paint,
             gust,
-            calm,
+            curl_bind,
+            swirl_bind,
+            flow_bind,
+            divergence_bind,
+            pressure_bind,
+            project_bind,
             react_bind,
             move_bind,
             paint_bind,
             gust_bind,
-            calm_bind,
             frame: 0,
             seed: 0x9e37_79b9,
         }
@@ -315,6 +429,11 @@ impl Simulation {
         &self.props
     }
 
+    /// The wind, for the renderer to show where the air is moving.
+    pub fn wind(&self) -> &wgpu::Buffer {
+        &self.wind
+    }
+
     /// Advance the world by one tick.
     ///
     /// One tick is submitted on its own rather than batched with the frame's
@@ -326,8 +445,7 @@ impl Simulation {
 
         // The prevailing breeze eases through a slow sine, swelling, dropping
         // and gently reversing, rather than snapping direction on a timer.
-        let breeze =
-            (kernels::AMBIENT_MAX * (self.frame as f32 * kernels::AMBIENT_RATE).sin()) as i32;
+        let breeze = kernels::AMBIENT_MAX * (self.frame as f32 * kernels::AMBIENT_RATE).sin();
         self.queue
             .write_buffer(&self.breeze, 0, bytemuck::bytes_of(&breeze));
         self.queue.write_buffer(
@@ -343,7 +461,7 @@ impl Simulation {
             );
         }
 
-        let cell_count = self.width * self.height;
+        let whole = [self.width, self.height, 1];
         // A block covers two cells each way, and the shifted pass needs one more
         // of them along each axis to reach the far edge.
         let blocks = [self.width / 2 + 1, self.height / 2 + 1, 1];
@@ -358,10 +476,20 @@ impl Simulation {
                 label: Some("tick"),
                 timestamp_writes: None,
             });
-            self.calm
-                .dispatch(&mut pass, &self.calm_bind, [cell_count * 2, 1, 1]);
-            self.react
-                .dispatch(&mut pass, &self.react_bind, [self.width, self.height, 1]);
+            // The wind first, so the grid moves in this tick's air.
+            self.curl.dispatch(&mut pass, &self.curl_bind, whole);
+            self.swirl.dispatch(&mut pass, &self.swirl_bind, whole);
+            self.flow.dispatch(&mut pass, &self.flow_bind, whole);
+            self.divergence
+                .dispatch(&mut pass, &self.divergence_bind, whole);
+            for i in 0..PRESSURE_ITERATIONS {
+                let group = if i == 0 { 0 } else { 1 + i % 2 };
+                self.pressure_step
+                    .dispatch(&mut pass, &self.pressure_bind[group], whole);
+            }
+            self.project.dispatch(&mut pass, &self.project_bind, whole);
+
+            self.react.dispatch(&mut pass, &self.react_bind, whole);
             for group in &self.move_bind {
                 self.movement.dispatch(&mut pass, group, blocks);
             }
@@ -393,10 +521,11 @@ impl Simulation {
     }
 
     /// Blow a gust into a filled circle of the wind field: one sweep of the wind
-    /// tool. `dvx`/`dvy` are in the wind sub-units [`kernels::movement`] reads,
-    /// the same ones [`kernels::AMBIENT_MAX`] is measured in.
-    pub fn add_wind_disk(&mut self, cx: i32, cy: i32, radius: i32, dvx: i32, dvy: i32) {
-        if dvx == 0 && dvy == 0 {
+    /// tool. `dvx`/`dvy` are the velocity to add at the centre, in cells per
+    /// tick, the same units [`kernels::AMBIENT_MAX`] is measured in; the field
+    /// itself never goes past [`kernels::WIND_MAX`].
+    pub fn add_wind_disk(&mut self, cx: i32, cy: i32, radius: i32, dvx: f32, dvy: f32) {
+        if dvx == 0.0 && dvy == 0.0 {
             return;
         }
         let radius = radius.max(0);
@@ -405,8 +534,11 @@ impl Simulation {
             0,
             bytemuck::cast_slice(&[cx, cy, radius, 0]),
         );
-        self.queue
-            .write_buffer(&self.gust_push, 0, bytemuck::cast_slice(&[dvx, dvy, 0, 0]));
+        self.queue.write_buffer(
+            &self.gust_push,
+            0,
+            bytemuck::cast_slice(&[dvx, dvy, 0.0, 0.0]),
+        );
         self.run_tool("gust", &self.gust, &self.gust_bind, radius);
     }
 
@@ -434,9 +566,14 @@ impl Simulation {
                 label: Some("clear"),
             });
         // Zero is air, and zero is calm, so clearing really is just zeroing.
+        // The pressure goes too, or the next tick would start by pushing the
+        // still air around to suit a wind that is no longer there.
         encoder.clear_buffer(&self.cells, 0, None);
         encoder.clear_buffer(&self.scratch, 0, None);
         encoder.clear_buffer(&self.wind, 0, None);
+        encoder.clear_buffer(&self.wind_scratch, 0, None);
+        encoder.clear_buffer(&self.pressure, 0, None);
+        encoder.clear_buffer(&self.pressure_scratch, 0, None);
         self.queue.submit([encoder.finish()]);
     }
 }
@@ -460,10 +597,11 @@ mod tests {
         .expect("request device")
     }
 
-    /// The world, read back so a test can look at it. Blocks until the GPU has
-    /// caught up, which is the one thing the game itself never does.
-    fn snapshot(sim: &Simulation) -> World {
-        let size = (sim.width * sim.height) as u64 * 4;
+    /// One of the simulation's buffers, read back so a test can look at it.
+    /// Blocks until the GPU has caught up, which is the one thing the game
+    /// itself never does.
+    fn read_back<T: bytemuck::Pod>(sim: &Simulation, buffer: &wgpu::Buffer) -> Vec<T> {
+        let size = buffer.size();
         let staging = sim.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("readback"),
             size,
@@ -475,7 +613,7 @@ mod tests {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("readback"),
             });
-        encoder.copy_buffer_to_buffer(&sim.cells, 0, &staging, 0, size);
+        encoder.copy_buffer_to_buffer(buffer, 0, &staging, 0, size);
         sim.queue.submit([encoder.finish()]);
 
         let slice = staging.slice(..);
@@ -484,15 +622,25 @@ mod tests {
             .poll(wgpu::PollType::wait_indefinitely())
             .expect("wait for the GPU");
         let view = slice.get_mapped_range().expect("map readback range");
-        let cells: Vec<u32> = bytemuck::cast_slice(&view).to_vec();
+        let words = bytemuck::cast_slice(&view).to_vec();
         drop(view);
         staging.unmap();
+        words
+    }
 
+    /// The world, read back.
+    fn snapshot(sim: &Simulation) -> World {
         World {
             width: sim.width,
             height: sim.height,
-            cells,
+            cells: read_back(sim, &sim.cells),
         }
+    }
+
+    /// The wind, read back: one `[x, y]` velocity per cell in cells per tick,
+    /// laid out like the grid.
+    fn wind(sim: &Simulation) -> Vec<[f32; 2]> {
+        read_back(sim, &sim.wind)
     }
 
     struct World {
@@ -746,7 +894,7 @@ mod tests {
         floor(&mut blown, STONE);
         blown.paint_disk(300, 40, 10, SAND);
         for _ in 0..400 {
-            blown.add_wind_disk(500, 200, 400, 120, 0);
+            blown.add_wind_disk(500, 200, 400, 4.0, 0.0);
             blown.step();
         }
 
@@ -756,6 +904,128 @@ mod tests {
             carried > settled + 30.0,
             "the gust should have carried the sand well to the right, \
              but it landed at {carried:.0} against {settled:.0} with no wind"
+        );
+    }
+
+    #[test]
+    fn an_updraft_lifts_settled_sand_off_the_ground() {
+        // Sand that has landed is not only nudged along by a gust: one blowing
+        // straight up holds it against gravity and carries it, which is what
+        // makes the wind tool look like anything. A heap is left to settle,
+        // then a fan is held under it, and the top of the sand should end up
+        // far above where it was resting.
+        let (device, queue) = headless();
+        let mut sim = Simulation::new(&device, &queue);
+        floor(&mut sim, STONE);
+        sim.paint_disk(500, 440, 20, SAND);
+        run(&mut sim, 300);
+        let before = snapshot(&sim);
+        let resting = before.highest(SAND).expect("the sand is still somewhere");
+
+        for _ in 0..40 {
+            sim.add_wind_disk(500, 470, 40, 0.0, -5.0);
+            sim.step();
+        }
+
+        let world = snapshot(&sim);
+        assert_eq!(
+            world.count(SAND),
+            before.count(SAND),
+            "lifting sand should not lose any of it"
+        );
+        let lifted = world.highest(SAND).expect("the sand is still somewhere");
+        assert!(
+            lifted + 30 < resting,
+            "the updraft should have lifted the sand well off the heap, \
+             but its top is at row {lifted} against {resting} at rest"
+        );
+    }
+
+    #[test]
+    fn a_gust_travels_on_after_the_tool_has_stopped() {
+        // The wind is a fluid, so a puff blown at one spot carries on across the
+        // world under its own momentum rather than stopping at the edge of the
+        // tool. A gust is blown to the right for a moment and the world is left
+        // alone; some time later the air well beyond where the tool ever
+        // reached should be moving, and moving to the right.
+        let (device, queue) = headless();
+        let mut sim = Simulation::new(&device, &queue);
+        for _ in 0..20 {
+            sim.add_wind_disk(300, 250, 40, 6.0, 0.0);
+            sim.step();
+        }
+        run(&mut sim, 60);
+
+        // The strongest rightward wind anywhere past the tool's reach, which
+        // ended at column 340, on the row the gust was blown along.
+        let field = wind(&sim);
+        let row = 250 * GRID_W as usize;
+        let downwind = (400..GRID_W as usize)
+            .map(|x| field[row + x][0])
+            .fold(0.0f32, f32::max);
+        assert!(
+            downwind > 1.0,
+            "a second after the gust, the air sixty cells past the tool should still be \
+             blowing on to the right, but the most it is doing is {downwind:.2} cells a tick"
+        );
+    }
+
+    #[test]
+    fn a_settled_heap_is_blown_downwind_by_a_gust_that_never_touches_it() {
+        // The other half of the same claim, seen in the sand: the gust is
+        // blown upwind of a heap that has settled, the tool never reaches the
+        // heap, and the heap should still be shifted the way the wind went.
+        let (device, queue) = headless();
+        let mut sim = Simulation::new(&device, &queue);
+        floor(&mut sim, STONE);
+        sim.paint_disk(520, 470, 12, SAND);
+        run(&mut sim, 200);
+        let before = snapshot(&sim).mean_x(SAND);
+
+        for _ in 0..30 {
+            sim.add_wind_disk(400, 470, 40, 6.0, 0.0);
+            sim.step();
+        }
+        run(&mut sim, 200);
+
+        let after = snapshot(&sim).mean_x(SAND);
+        assert!(
+            after > before + 10.0,
+            "the gust should have blown on to the heap and shifted it downwind, \
+             but it sits at {after:.0} against {before:.0} before"
+        );
+    }
+
+    #[test]
+    fn the_wind_dies_down_on_its_own() {
+        // A gust fades, so a world that was blown about a while ago is as calm
+        // as one that never was. Two worlds at the same tick, so they share the
+        // same prevailing breeze; one had a hard gust in its past. Sand dropped
+        // into each afterwards should land in the same place.
+        let (device, queue) = headless();
+
+        let mut still = Simulation::new(&device, &queue);
+        floor(&mut still, STONE);
+        run(&mut still, 1000);
+        still.paint_disk(500, 60, 10, SAND);
+        run(&mut still, 300);
+
+        let mut blown = Simulation::new(&device, &queue);
+        floor(&mut blown, STONE);
+        for _ in 0..100 {
+            blown.add_wind_disk(500, 250, 200, 6.0, 0.0);
+            blown.step();
+        }
+        run(&mut blown, 900);
+        blown.paint_disk(500, 60, 10, SAND);
+        run(&mut blown, 300);
+
+        let calm = snapshot(&still).mean_x(SAND);
+        let after = snapshot(&blown).mean_x(SAND);
+        assert!(
+            (after - calm).abs() < 6.0,
+            "a gust blown fifteen seconds ago should have died away, but sand still \
+             lands at {after:.0} against {calm:.0} in a world that was never blown"
         );
     }
 

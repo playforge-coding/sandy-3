@@ -21,7 +21,7 @@ Painted from the on-screen picker, or with the number keys:
 
 | Material | Behaves like | Notes |
 |----------|--------------|-------|
-| **Sand** | powder, falls and piles | rides a gust while it is in the air |
+| **Sand** | powder, falls and piles | leans in a breeze; a gust lifts it off the ground and carries it |
 | **Stone** | solid, immovable | |
 | **Water** | liquid, runny | finds its level fast; turns lava to stone |
 | **Lava** | liquid, viscous | pools in blobs, glows, turns to stone where water meets it |
@@ -34,6 +34,13 @@ Painted from the on-screen picker, or with the number keys:
 | **Brush** | hold left mouse to paint the chosen material |
 | **Eraser** | the same brush, painting air |
 | **Wind** | sweep the cursor to blow a gust that way |
+
+The wind is a fluid, much as it is in sandspiel. A gust blows on after the
+sweep that made it, curls into eddies, goes up and over a heap and round a wall,
+and strips loose sand off whatever it blows across and carries it until it dies
+down. Moving air shows as a pale haze against the sky, so a sweep can be seen
+even over empty ground. The gust is three times the brush size, and at least thirty cells across,
+because a small one fades before it has moved anything.
 
 There is also a gentle prevailing breeze that swings on its own, enough to lean
 a falling stream of sand without disturbing anything that has settled.
@@ -101,7 +108,8 @@ would have let it write whatever it liked in its own `update`.
 
 ### A tick
 
-One tick is `react` once, then `movement` three times.
+One tick is the wind's own passes, then `react` once, then `movement` three
+times.
 
 **`react`** is where the material rules fire. Every reaction is written from one
 cell's point of view: a water cell that can see lava next to it becomes stone.
@@ -120,7 +128,11 @@ neighbourhood, the usual way to run a cellular automaton in parallel.
 
 Inside a block, four things can move a cell, tried in order: it falls, it
 tumbles off a pile, a liquid creeps sideways to find its level, and the wind
-shoves it. Gravity is one test shared by all of them: a heavier cell above a
+shoves it. A strong enough wind also stops a cell falling in the first place,
+which is what lets a gust pick sand up rather than only nudge it along; a gust
+blowing across a surface counts as lift too, so it kicks loose grains up off
+the ground and keeps what it has picked up in the air for as long as it blows
+hard. Gravity is one test shared by all of them: a heavier cell above a
 lighter one trades places, if the one that moves is mobile and the one it moves
 into is passable. Sand falling through air, sand sinking through water and water
 floating on lava are all that same test with different numbers.
@@ -133,6 +145,30 @@ Every pass reads one buffer and writes the other, never the same one. That is
 what makes the result independent of the order the GPU happens to schedule the
 invocations in. `react` plus three movement passes is an even number of swaps,
 so the live world is back in the same buffer by the time the frame is drawn.
+
+### The wind
+
+The wind is a second field over the same grid: one velocity per cell, in cells
+per tick. The wind tool stamps a soft blob of velocity into it, and every tick
+the field is run through the usual small fluid solver, the one sandspiel's wind
+also uses. `curl` and `swirl` measure how fast the air is spinning and wind the
+eddies back up, since carrying a field along on a grid smears its spin away
+first. `flow` moves the field along by itself, by asking each cell where its air
+was a tick ago and taking the velocity from there, and lets it fade a little.
+`divergence` measures where air is piling up, `pressure` relaxes towards the
+pressure that would stop that, twenty Jacobi steps a tick starting from most of
+the last tick's answer, and `project` subtracts that pressure's gradient, which
+leaves the air incompressible and is what turns a stamped puff into a travelling
+gust with eddies at its edges. Solid cells hold no wind at all, and sand and
+water drag on it, so a wall deflects a gust and a heap sends it up and over.
+
+`movement` then reads the finished field. A block takes the strongest wind at
+any of its four corners, so a grain on the surface of a heap feels the air
+blowing over it rather than the calm inside the pile.
+
+The renderer reads the same field and draws moving air as a dusty haze over the
+sky, stronger the faster it blows, so a gust can be seen curling about even
+where there is nothing for it to move.
 
 ### Drawing
 
@@ -149,8 +185,9 @@ halo.
 
 The grid is 1000 by 500, four times the area of Sandy 2's, which is most of the
 point. At sixty ticks a second, each one a reaction pass and three movement
-passes, that is about 120 million cell updates a second, and it does not trouble
-a laptop GPU.
+passes, that is about 120 million cell updates a second. The wind adds another
+twenty-odd passes over the same grid, though each is a few reads and a write,
+and between them it still does not trouble a laptop GPU.
 
 ## Adding a material
 
@@ -181,7 +218,8 @@ a laptop GPU.
 `density` is the whole of the sinking rule: a mobile material displaces any
 passable one lighter than it. `spread` is a liquid's runniness, `glow` flags it
 for the bloom pass, and `windborne` decides whether a breeze can carry it while
-it is falling.
+it is falling and how little of a gust it takes to lift it once it has landed.
+Anything else that moves at all still gets its surface ruffled by a stiff gust.
 
 ## Not here yet
 

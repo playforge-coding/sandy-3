@@ -256,7 +256,12 @@ impl State {
 
         let bgl_scene = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("scene bgl"),
-            entries: &[storage_entry(0), storage_entry(1), uniform_entry(2)],
+            entries: &[
+                storage_entry(0),
+                storage_entry(1),
+                uniform_entry(2),
+                storage_entry(3),
+            ],
         });
         let bgl_in = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("blur input bgl"),
@@ -292,6 +297,10 @@ impl State {
                 wgpu::BindGroupEntry {
                     binding: 2,
                     resource: scene_world.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: sim.wind().as_entire_binding(),
                 },
             ],
         });
@@ -704,5 +713,30 @@ impl State {
             self.egui_renderer.free_texture(id);
         }
         textures_delta.clear();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use wgpu::naga;
+
+    /// The drawing shaders are hand-written WGSL that wgpu only compiles at
+    /// launch, so a slip in one would otherwise show up as a crash on opening
+    /// the window. This runs them through the same front end and validator.
+    fn validates(name: &str, source: &str) {
+        let module = naga::front::wgsl::parse_str(source)
+            .unwrap_or_else(|err| panic!("{name} does not parse: {}", err.emit_to_string(source)));
+        naga::valid::Validator::new(
+            naga::valid::ValidationFlags::all(),
+            naga::valid::Capabilities::default(),
+        )
+        .validate(&module)
+        .unwrap_or_else(|err| panic!("{name} is not valid: {err:?}"));
+    }
+
+    #[test]
+    fn the_drawing_shaders_are_valid_wgsl() {
+        validates("scene.wgsl", include_str!("scene.wgsl"));
+        validates("bloom.wgsl", include_str!("bloom.wgsl"));
     }
 }

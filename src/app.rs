@@ -22,13 +22,21 @@ use crate::ui;
 /// tall, matching the grid, so nothing is stretched out of shape at the start.
 const WINDOW_SIZE: (f64, f64) = (1100.0, 620.0);
 
-/// Wind sub-units added per grid cell the cursor sweeps. A brisk flick
-/// saturates the gust field for a strong, short-lived blast; a slow drag nudges.
-const WIND_DRAG_GAIN: i32 = 9;
+/// Wind added, in cells per tick, per grid cell the cursor sweeps in a frame.
+/// One would have the air move exactly with the cursor; a little more than that
+/// makes up for the gust's soft edge, so an ordinary sweep is a proper gust and
+/// a brisk flick saturates the field at [`crate::kernels::WIND_MAX`].
+const WIND_DRAG_GAIN: f32 = 1.5;
+
+/// How much wider the gust is than the brush. A gust is a soft blob of moving
+/// air that fades to nothing at its rim, and the world is a thousand cells
+/// across, so one the size of the paint brush would be a pinprick that dies
+/// before it has moved anything.
+const GUST_SCALE: i32 = 3;
 
 /// The smallest gust the wind tool blows, whatever the brush is set to, so even
 /// a fine brush moves something when it is used as a fan.
-const MIN_GUST_RADIUS: i32 = 10;
+const MIN_GUST_RADIUS: i32 = 30;
 
 /// Where the mouse is and what it is doing, plus the [`ui::Controls`] the panel
 /// and the shortcuts share.
@@ -197,11 +205,10 @@ impl App {
                     // Blow a gust the way the cursor has swept since the last
                     // frame. The first frame of a stroke only notes where it is.
                     if let Some((px, py)) = self.input.last_wind {
-                        let dvx = (gx - px) * WIND_DRAG_GAIN;
-                        let dvy = (gy - py) * WIND_DRAG_GAIN;
-                        state
-                            .sim
-                            .add_wind_disk(gx, gy, brush.max(MIN_GUST_RADIUS), dvx, dvy);
+                        let dvx = (gx - px) as f32 * WIND_DRAG_GAIN;
+                        let dvy = (gy - py) as f32 * WIND_DRAG_GAIN;
+                        let radius = (brush * GUST_SCALE).max(MIN_GUST_RADIUS);
+                        state.sim.add_wind_disk(gx, gy, radius, dvx, dvy);
                     }
                     self.input.last_wind = Some((gx, gy));
                 }

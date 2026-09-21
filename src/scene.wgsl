@@ -23,11 +23,23 @@ struct VsOut {
 @group(0) @binding(1) var<storage, read> props: array<u32>;
 // Width and height, and two spares.
 @group(0) @binding(2) var<uniform> world: vec4<u32>;
+// The wind, one velocity per cell in cells per tick, as the fluid kernels left
+// it. Only read for empty cells, to show where the air is moving.
+@group(0) @binding(3) var<storage, read> wind: array<vec2<f32>>;
 
 // Words per material in the props table.
 const PROPS_STRIDE: u32 = 8u;
 // The flag marking a material as emissive, which is what the bloom pass picks up.
 const FLAG_GLOW: u32 = 16u;
+
+// Moving air is drawn as a dusty haze over the sky, so a gust can be seen even
+// where there is nothing for it to blow about, the way sandspiel shows its
+// wind as faint whorls. This is the colour it tends towards, as sRGB bytes,
+// the speed in cells per tick at which it is fully that colour, and how much
+// of the sky it covers at most.
+const HAZE: vec3<f32> = vec3<f32>(244.0, 238.0, 226.0) / 255.0;
+const HAZE_FULL_SPEED: f32 = 4.0;
+const HAZE_MAX: f32 = 0.45;
 
 @vertex
 fn vs_main(@builtin(vertex_index) vi: u32) -> VsOut {
@@ -82,7 +94,17 @@ fn fs_scene(in: VsOut) -> @location(0) vec4<f32> {
         i32((packed >> 8u) & 255u) + offset,
         i32((packed >> 16u) & 255u) + offset,
     );
-    let color = srgb_to_linear(vec3<f32>(clamp(shade, vec3<i32>(0), vec3<i32>(255))) / 255.0);
+    var color = srgb_to_linear(vec3<f32>(clamp(shade, vec3<i32>(0), vec3<i32>(255))) / 255.0);
+
+    // Haze the sky where the wind blows. The blend is done in sRGB, where the
+    // haze colour was chosen, and brought into linear light after.
+    if material == 0u {
+        let air = wind[gy * width + gx];
+        let speed = length(air);
+        let haze = smoothstep(0.0, HAZE_FULL_SPEED, speed) * HAZE_MAX;
+        let sky = vec3<f32>(clamp(shade, vec3<i32>(0), vec3<i32>(255))) / 255.0;
+        color = srgb_to_linear(mix(sky, HAZE, haze));
+    }
 
     // The alpha channel is not transparency here. Nothing alpha-blends the
     // scene, so the channel is free to carry a flag instead, and the bloom pass

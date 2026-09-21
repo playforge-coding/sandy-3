@@ -30,6 +30,10 @@ PLEASE, PLEASE do not use a package that is old or deprecated. When possible use
 
 Do not use em dashes or other special symbols not normally found in writing. Do not word things in a weird way. Keep it looking human.
 
+## Plugins
+
+Prefer to write new tools, brushes, or materials in Lua as a built-in plugin when possible.
+
 ## README (IMPORTANT!!!)
 
 Always update the README if necessary (again, not if unnecessary) when changing or adding code. If the README already contain outdated information, you don't need to fix it, but do note it.

@@ -17,8 +17,8 @@ pub const INFO: MaterialInfo = MaterialInfo {
     mobile: true,
     passable: true,
     liquid: true,
-    // Runny: it levels off almost as fast as it can move.
-    spread: 230,
+    // As runny as a liquid can be: it levels off as fast as it can move.
+    spread: 255,
     // A pond is not blown about grain by grain. A stiff gust still shoves the
     // surface, because the movement kernel lets wind push any mobile cell; this
     // flag is about the loose, airborne materials that ride a breeze.

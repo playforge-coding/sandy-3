@@ -613,6 +613,31 @@ pub fn movement(
     let roll_bd = (dice >> 24u32) & 255u32;
     let flip = (dice >> 7u32) & 1u32;
 
+    // Which way each row's liquid may creep this pass. Without this a liquid
+    // cell that wins its roll every pass is always the left member of its
+    // pair, since the cut shifts by one cell as the cell moves by one, and a
+    // row of liquid is then conveyed rigidly one way rather than stretched
+    // out to find its level; the runnier it was set, the worse it levelled.
+    // A coin each pass makes the creep an even walk instead, so a higher
+    // spread really is runnier. The wind is not subject to it.
+    let coins = hash(dice);
+    let creep_top = coins & 1u32;
+    let creep_low = (coins >> 1u32) & 1u32;
+    let mut spread_a = 0u32;
+    let mut spread_b = 0u32;
+    if creep_top == 0u32 {
+        spread_a = props[pa + 3u32];
+    } else {
+        spread_b = props[pb + 3u32];
+    }
+    let mut spread_c = 0u32;
+    let mut spread_d = 0u32;
+    if creep_low == 0u32 {
+        spread_c = props[pc + 3u32];
+    } else {
+        spread_d = props[pd + 3u32];
+    }
+
     // The wind at the block: the day's prevailing breeze plus whatever the
     // fluid is doing here. The fluid is stilled inside anything solid and
     // slowed inside sand and water, so the block takes the strongest of its
@@ -736,10 +761,12 @@ pub fn movement(
     // Top row. Only one of the two directions can ever apply, since the test
     // needs the cell that moves to be the heavier of the pair, but they are
     // written as one choice so that a trade cannot be undone by the next line.
+    // The runniness is read here rather than from the table, since the coin
+    // above has already zeroed it for the direction not taken this pass.
     if slides(
         props[pa],
         props[pa + 1u32],
-        props[pa + 3u32],
+        spread_a,
         free_a,
         props[pb],
         props[pb + 1u32],
@@ -759,7 +786,7 @@ pub fn movement(
     } else if slides(
         props[pb],
         props[pb + 1u32],
-        props[pb + 3u32],
+        spread_b,
         free_b,
         props[pa],
         props[pa + 1u32],
@@ -782,7 +809,7 @@ pub fn movement(
     if slides(
         props[pc],
         props[pc + 1u32],
-        props[pc + 3u32],
+        spread_c,
         free_c,
         props[pd],
         props[pd + 1u32],
@@ -802,7 +829,7 @@ pub fn movement(
     } else if slides(
         props[pd],
         props[pd + 1u32],
-        props[pd + 3u32],
+        spread_d,
         free_d,
         props[pc],
         props[pc + 1u32],

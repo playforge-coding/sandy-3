@@ -16,7 +16,7 @@ local acid = sandy.material {
     passable = true,
     liquid = true,
     -- Runny, though not quite as runny as water.
-    spread = 200,
+    spread = 240,
     windborne = false,
     glow = true,
 }

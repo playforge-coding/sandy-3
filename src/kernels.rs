@@ -57,7 +57,8 @@
 //! tables the host uploads from [`crate::materials`]:
 //!
 //! - **props**, [`PROPS_STRIDE`] words per material: density, flags, packed
-//!   colour, spread. [`movement`] reads it to decide what sinks through what.
+//!   colour, spread, draft. [`movement`] reads it to decide what sinks through
+//!   what, and [`flow`] reads the draft to let a hot material push the air up.
 //! - **rules**, [`RULE_STRIDE`] words per rule: actor, trigger, product, look,
 //!   chance. [`react`] walks it.
 //!
@@ -181,6 +182,7 @@ fn props_row(info: &MaterialInfo) -> [u32; PROPS_STRIDE] {
     row[1] = flags;
     row[2] = color;
     row[3] = info.spread as u32;
+    row[4] = info.draft as u32;
     row
 }
 
@@ -451,14 +453,17 @@ pub fn movement(
         roll: u32,
     ) -> u32 {
         // Room to move: it has to move under its own weight at all, and where it
-        // is going has to give way and be lighter than it.
+        // is going has to give way and be lighter than it. Air is the
+        // exception to lighter: it moves under nothing's weight and so holds
+        // no place of its own, which is what lets a gas that is lighter than
+        // the air still drift through it and be blown about in it.
         if (from_flags & 1u32) == 0u32 {
             return 0u32;
         }
         if (into_flags & 2u32) == 0u32 {
             return 0u32;
         }
-        if from_density <= into_density {
+        if from_density <= into_density && (into_flags & 1u32) != 0u32 {
             return 0u32;
         }
 
@@ -1034,6 +1039,11 @@ pub fn gust(
 /// mostly goes over, which is what gives the windward face of a dune its
 /// updraft. The result is also held under the top speed in `weather`, since the
 /// swirl can otherwise wind an eddy up without limit.
+///
+/// A material with a draft in the props table warms the air: every tick, a
+/// cell of it pushes the air in it upwards by that much. Fire and steam do.
+/// The pressure solve then has to make room for that air above, so a plume
+/// stands in a column of updraft that reaches well past the plume itself.
 #[kernel(workgroup_size(16, 16))]
 pub fn flow(
     src: &[Vec2<f32>],
@@ -1094,6 +1104,9 @@ pub fn flow(
     let scale = decay * porosity;
     let mut vx = (top_x + (low_x - top_x) * ty) * scale;
     let mut vy = (top_y + (low_y - top_y) * ty) * scale;
+    // Hot air rises: up is negative, since rows count downwards.
+    let draft = props[material * 8u32 + 4u32] as f32 * 0.01;
+    vy = vy - draft;
     let speed = sqrt(vx * vx + vy * vy);
     if speed > top {
         vx = vx * top / speed;

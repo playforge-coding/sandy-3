@@ -21,6 +21,7 @@ pub const INFO: MaterialInfo = MaterialInfo {
     windborne: false,
     // Molten: flagged for the renderer's bloom pass, which gives it its halo.
     glow: true,
+    draft: 0,
 };
 
 pub const RULES: &[Rule] = &[Rule {

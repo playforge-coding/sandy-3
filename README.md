@@ -24,9 +24,23 @@ Painted from the on-screen picker, or with the number keys:
 |----------|--------------|-------|
 | **Sand** | powder, falls and piles | leans in a breeze; a gust lifts it off the ground and carries it |
 | **Stone** | solid, immovable | |
-| **Water** | liquid, runny | finds its level fast; turns lava to stone |
-| **Lava** | liquid, viscous | pools in blobs, glows, turns to stone where water meets it |
+| **Water** | liquid, runny | finds its level fast; quenches lava to stone, boils to steam on fire or lava |
+| **Lava** | liquid, viscous | pools in blobs, glows, crusts to stone where water meets it |
 | **Soil** | solid, immovable | terrain; a hillside of it holds its shape |
+| **Acid** | liquid, runny | eats through stone and soil |
+| **Fire** | gas, rises | flickers out in about half a second; boils water; heats the air above it |
+| **Steam** | gas, rises | boiled off water by fire or lava; heats the air above it; thins away, or condenses on a ceiling and rains |
+
+The last three come from the built-in plugins (see [Plugins](#plugins)), and
+that is the order the picker lists them in after the five above.
+
+Fire and steam are ordinary tiles that rise instead of fall, being lighter
+than the air. What sets them apart is that they warm it: a cell of either
+pushes the air it sits in upwards every tick, so a plume of steam off a
+boiling pool, or a bonfire, stands in its own updraft, which the haze shows
+and which lifts loose sand it passes over. Nothing burns yet, since there is
+no fuel material, so fire is something to paint rather than something that
+spreads.
 
 ## Brushes and tools
 
@@ -63,7 +77,7 @@ a falling stream of sand without disturbing anything that has settled.
 | Input | Action |
 |-------|--------|
 | Hold **left mouse** | use the current tool |
-| **1**–**5** | Sand, Stone, Water, Lava, Soil |
+| **1**–**9** | a material, in picker order: Sand, Stone, Water, Lava, Soil, then the plugin ones |
 | **0** / **Backspace** | eraser |
 | **W** | wind tool |
 | **[** / **]** | shrink / grow the brush |
@@ -87,10 +101,11 @@ running pauses it first.
 
 A plugin is one Lua file. Drop it on the window and it loads on the spot.
 Leave it in a `plugins` folder in the directory the game is run from and it
-loads at startup. Four are built into the binary and always there, from
+loads at startup. Six are built into the binary and always there, from
 [`src/plugins/`](src/plugins/): `acid.lua` adds a material that eats through
-rock, `disk.lua` is the plain brush, `spray.lua` a brush that sprinkles
-grains, and `fan.lua` a tool that blows an updraft. They are ordinary scripts
+rock, `fire.lua` and `steam.lua` add the two gases, `disk.lua` is the plain
+brush, `spray.lua` a brush that sprinkles grains, and `fan.lua` a tool that
+blows an updraft. They are ordinary scripts
 that go through the same loader as a dropped file, so they double as worked
 examples.
 
@@ -108,6 +123,7 @@ local acid = sandy.material {
     spread = 200,             -- a liquid's runniness, default 0
     windborne = false,        -- default false
     glow = true,              -- default false
+    draft = 0,                -- upward push on the air each tick, default 0
 }
 
 -- Stone next to acid dissolves, one tick in six.
@@ -186,6 +202,8 @@ src/
 ├── plugins.rs      Lua plugins: the `sandy` table and the loader
 ├── plugins/        The built-in plugins, compiled into the binary
 │   ├── acid.lua      a material
+│   ├── fire.lua      a gas, and the rules that put it out
+│   ├── steam.lua     a gas, and the rules that boil water into it
 │   ├── disk.lua      the plain brush
 │   ├── spray.lua     a brush
 │   └── fan.lua       a tool
@@ -273,6 +291,9 @@ the last tick's answer, and `project` subtracts that pressure's gradient, which
 leaves the air incompressible and is what turns a stamped puff into a travelling
 gust with eddies at its edges. Solid cells hold no wind at all, and sand and
 water drag on it, so a wall deflects a gust and a heap sends it up and over.
+Fire and steam feed it: `flow` also adds each material's draft, an upward push
+per cell per tick, so a plume of either is a source of wind, and the pressure
+solve turns that into a column of updraft above it.
 
 `movement` then reads the finished field. A block takes the strongest wind at
 any of its four corners, so a grain on the surface of a heap feels the air
@@ -319,6 +340,7 @@ and between them it still does not trouble a laptop GPU.
        spread: 0,
        windborne: false,
        glow: false,
+       draft: 0,
    };
    ```
 
@@ -332,10 +354,14 @@ passable one lighter than it. `spread` is a liquid's runniness, `glow` flags it
 for the bloom pass, and `windborne` decides whether a breeze can carry it while
 it is falling and how little of a gust it takes to lift it once it has landed.
 Anything else that moves at all still gets its surface ruffled by a stiff gust.
+`draft` is the upward push a cell gives the air it sits in every tick, in
+hundredths of a cell per tick; it is zero for everything but fire and steam.
+A density below air's makes a material rise instead of fall, and one that is
+also a liquid licks sideways as it climbs, which is all a gas is here.
 
 ## Not here yet
 
-Sandy 2 has a good deal more: fire, oil, clouds, rain, seeds that sprout trees,
+Sandy 2 has a good deal more: oil, clouds, rain, seeds that sprout trees,
 creatures that walk over the grid, a seed-based world generator, meteors,
 tsunamis, and screenshot and GIF capture. None of that is here.
 This is the elements and the tools, on the GPU, and the rest can follow.

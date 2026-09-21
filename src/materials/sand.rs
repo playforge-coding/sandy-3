@@ -21,4 +21,5 @@ pub const INFO: MaterialInfo = MaterialInfo {
     // Loose grains: a gust slants a falling stream and drifts the dune it builds.
     windborne: true,
     glow: false,
+    draft: 0,
 };

@@ -24,6 +24,7 @@ pub const INFO: MaterialInfo = MaterialInfo {
     // flag is about the loose, airborne materials that ride a breeze.
     windborne: false,
     glow: false,
+    draft: 0,
 };
 
 pub const RULES: &[Rule] = &[Rule {

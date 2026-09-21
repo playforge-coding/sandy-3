@@ -733,6 +733,105 @@ mod tests {
         }
     }
 
+    /// The built-in tables with the built-in plugins loaded on top, for a test
+    /// that needs a material a script adds.
+    fn with_plugins() -> Registry {
+        let mut plugins = crate::plugins::Plugins::new();
+        plugins.load_builtin();
+        plugins.registry().clone()
+    }
+
+    #[test]
+    fn fire_rises_and_burns_out() {
+        // Fire is lighter than air, so it climbs on the same rule that makes
+        // sand fall, and a flame with air next to it goes out after a moment.
+        let registry = with_plugins();
+        let fire = registry.find("Fire").unwrap();
+        let (device, queue) = headless();
+        let mut sim = Simulation::new(&device, &queue, &registry);
+        sim.paint_disk(500, 400, 10, fire);
+        assert!(snapshot(&sim).count(fire) > 0);
+        run(&mut sim, 15);
+
+        let world = snapshot(&sim);
+        let top = world
+            .highest(fire)
+            .expect("some of the fire is still burning");
+        assert!(
+            top < 380,
+            "fire should have risen well above where it was painted, but its top is at row {top}"
+        );
+
+        run(&mut sim, 400);
+        assert_eq!(snapshot(&sim).count(fire), 0, "fire should have burnt out");
+    }
+
+    #[test]
+    fn water_on_fire_boils_into_steam_that_rises() {
+        // The pair of rules in the plugins: fire touching water is put out,
+        // and the water it touched becomes steam, which then climbs away.
+        let registry = with_plugins();
+        let fire = registry.find("Fire").unwrap();
+        let steam = registry.find("Steam").unwrap();
+        let (device, queue) = headless();
+        let mut sim = Simulation::new(&device, &queue, &registry);
+        floor(&mut sim, STONE);
+        sim.paint_disk(500, 470, 14, WATER);
+        run(&mut sim, 100);
+        let water_before = snapshot(&sim).count(WATER);
+        sim.paint_disk(500, 472, 6, fire);
+        run(&mut sim, 5);
+
+        let world = snapshot(&sim);
+        assert!(
+            world.count(steam) > 0,
+            "fire in a pool should have boiled some of it"
+        );
+        assert!(
+            world.count(WATER) < water_before,
+            "the steam should have come out of the water"
+        );
+
+        run(&mut sim, 150);
+        let world = snapshot(&sim);
+        assert_eq!(
+            world.count(fire),
+            0,
+            "the water should have put the fire out"
+        );
+        let top = world.highest(steam).expect("some steam is still about");
+        assert!(
+            top < 350,
+            "the steam should have risen well above the pool, but its top is at row {top}"
+        );
+    }
+
+    #[test]
+    fn a_plume_of_steam_drives_an_updraft() {
+        // Steam warms the air: every cell of it pushes the wind field upwards
+        // each tick, and the pressure solve carries that on up as a column.
+        // A pool of steam is kept topped up the way a boiling pond would, and
+        // the air well above it should be blowing upwards.
+        let registry = with_plugins();
+        let steam = registry.find("Steam").unwrap();
+        let (device, queue) = headless();
+        let mut sim = Simulation::new(&device, &queue, &registry);
+        for _ in 0..60 {
+            sim.paint_disk(500, 420, 15, steam);
+            sim.step();
+        }
+
+        let field = wind(&sim);
+        let lift = (300..380)
+            .map(|y| -field[y * GRID_W as usize + 500][1])
+            .fold(0.0f32, f32::max);
+        assert!(
+            lift > 0.5,
+            "the air above a plume of steam should be rising, but the most it does \
+             between rows 300 and 380 is {lift:.2} cells a tick"
+        );
+    }
+
     #[test]
     fn sand_falls_onto_the_ground_and_stays_there() {
         let (device, queue) = headless();

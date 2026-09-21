@@ -46,13 +46,16 @@ pub const MAX_MATERIALS: usize = 256;
 
 /// The empty cell (air / nothing). Always id `0`.
 pub const EMPTY: MaterialId = 0;
-/// Named ids for the materials that other materials react with, and that the
-/// keyboard shortcuts in [`crate::app`] select. These must match the positions
-/// in [`table`].
+/// Named ids for the built-in materials. The rules and the picker's default
+/// refer to some of them; the rest are here so the set is complete and the
+/// tests can name them. These must match the positions in [`table`]. The
+/// number keys in [`crate::app`] pick by id directly, so a plugin material
+/// gets a key too.
 pub const SAND: MaterialId = 1;
 pub const STONE: MaterialId = 2;
 pub const WATER: MaterialId = 3;
 pub const LAVA: MaterialId = 4;
+#[allow(dead_code)]
 pub const SOIL: MaterialId = 5;
 
 /// A material's static properties: everything the movement kernel needs to push
@@ -90,6 +93,12 @@ pub struct MaterialInfo {
     /// Whether this material emits light. Glowing cells are picked up by the
     /// renderer's bloom pass, which is what gives lava its halo.
     pub glow: bool,
+    /// The updraft a cell of this material gives the air it sits in, every
+    /// tick, in hundredths of a cell per tick. Zero for nearly everything.
+    /// Fire and steam warm the air, so a plume of either pushes upwards on the
+    /// wind field and stands in its own updraft, which is what lifts loose
+    /// sand it passes over. Read by [`crate::kernels::flow`].
+    pub draft: u8,
 }
 
 /// The density of an empty cell. It is an ordinary value in the same ordering as

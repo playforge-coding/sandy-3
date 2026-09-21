@@ -20,7 +20,7 @@ use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Window, WindowId};
 
 use crate::gpu::State;
-use crate::materials::{EMPTY, LAVA, SAND, SOIL, STONE, WATER};
+use crate::materials::{EMPTY, MaterialId};
 use crate::plugins::{Command, Kind, Plugins, Stroke};
 use crate::ui;
 
@@ -341,15 +341,35 @@ impl App {
     }
 
     fn handle_key(&mut self, code: KeyCode) {
+        // The number keys pick a material by id, which is the order the picker
+        // lists them in: the built-in five, then whatever the plugins added.
+        // Zero is air, the eraser. Choosing a material means painting with it.
+        let digit: Option<MaterialId> = match code {
+            KeyCode::Digit0 | KeyCode::Backspace => Some(EMPTY),
+            KeyCode::Digit1 => Some(1),
+            KeyCode::Digit2 => Some(2),
+            KeyCode::Digit3 => Some(3),
+            KeyCode::Digit4 => Some(4),
+            KeyCode::Digit5 => Some(5),
+            KeyCode::Digit6 => Some(6),
+            KeyCode::Digit7 => Some(7),
+            KeyCode::Digit8 => Some(8),
+            KeyCode::Digit9 => Some(9),
+            _ => None,
+        };
+        if let Some(id) = digit {
+            let registry = self.plugins.registry();
+            if let Some(info) = registry.materials().get(id as usize)
+                && info.pickable()
+            {
+                self.input.controls.material = id;
+                self.input.controls.tool = ui::Tool::Paint;
+            }
+            return;
+        }
+
         let c = &mut self.input.controls;
         match code {
-            // Material selection. These match the order in `materials::table`.
-            KeyCode::Digit1 => c.material = SAND,
-            KeyCode::Digit2 => c.material = STONE,
-            KeyCode::Digit3 => c.material = WATER,
-            KeyCode::Digit4 => c.material = LAVA,
-            KeyCode::Digit5 => c.material = SOIL,
-            KeyCode::Digit0 | KeyCode::Backspace => c.material = EMPTY,
             // The wind tool: sweep the cursor to blow a gust.
             KeyCode::KeyW => c.tool = ui::Tool::Wind,
             KeyCode::BracketLeft => c.radius = (c.radius - 1).max(1),
@@ -366,19 +386,6 @@ impl App {
                 }
             }
             _ => {}
-        }
-        // Choosing a material means painting with it.
-        if matches!(
-            code,
-            KeyCode::Digit1
-                | KeyCode::Digit2
-                | KeyCode::Digit3
-                | KeyCode::Digit4
-                | KeyCode::Digit5
-                | KeyCode::Digit0
-                | KeyCode::Backspace
-        ) {
-            c.tool = ui::Tool::Paint;
         }
     }
 
@@ -464,7 +471,8 @@ pub fn run() {
     env_logger::init();
 
     log::info!(
-        "Controls: use the panel, or press 1=Sand 2=Stone 3=Water 4=Lava 5=Soil  0/Backspace=Erase  \
+        "Controls: use the panel, or press 1-9 to pick a material in picker order \
+         (1=Sand 2=Stone 3=Water 4=Lava 5=Soil, then the plugin materials)  0/Backspace=Erase  \
          W=wind tool (sweep to blow a gust)  [ ]=brush size  Space=pause  .=step one tick  \
          - ==slower/faster  \
          C=clear  (hold left mouse to draw). \

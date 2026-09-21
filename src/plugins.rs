@@ -87,7 +87,10 @@ pub const BUILTIN: &[(&str, &str)] = &[
     ("acid.lua", include_str!("plugins/acid.lua")),
     ("disk.lua", include_str!("plugins/disk.lua")),
     ("fan.lua", include_str!("plugins/fan.lua")),
+    // Steam's rules name fire, so fire has to be registered first.
+    ("fire.lua", include_str!("plugins/fire.lua")),
     ("spray.lua", include_str!("plugins/spray.lua")),
+    ("steam.lua", include_str!("plugins/steam.lua")),
 ];
 
 /// The two kinds of script a stroke can drive. They are registered with
@@ -504,6 +507,7 @@ fn material_from(spec: &Table) -> mlua::Result<MaterialInfo> {
         spread: optional(spec, "spread", 0)?,
         windborne: optional(spec, "windborne", false)?,
         glow: optional(spec, "glow", false)?,
+        draft: optional(spec, "draft", 0)?,
     })
 }
 
@@ -628,6 +632,7 @@ mod tests {
         assert!(info.passable, "passable defaults to true");
         assert!(!info.windborne, "windborne defaults to false");
         assert_eq!(info.jitter, 0);
+        assert_eq!(info.draft, 0, "draft defaults to zero");
 
         let rule = registry
             .rules()

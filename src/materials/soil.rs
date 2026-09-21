@@ -18,4 +18,5 @@ pub const INFO: MaterialInfo = MaterialInfo {
     spread: 0,
     windborne: false,
     glow: false,
+    draft: 0,
 };

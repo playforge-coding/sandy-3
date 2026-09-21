@@ -8,17 +8,20 @@
 
 use egui::{Color32, RichText, Stroke};
 
-use crate::materials::{self, EMPTY, MaterialId};
+use crate::materials::{EMPTY, MaterialId, Registry, SAND};
 
 /// What a drag does. Most of the time it paints the chosen material; the wind
 /// tool instead blows a gust the way the cursor is swept, without putting any
-/// cells down.
+/// cells down, and a plugin tool does whatever its script says.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Tool {
     /// Paint the chosen [`Controls::material`].
     Paint,
     /// Blow wind the way the cursor sweeps.
     Wind,
+    /// A tool a plugin registered, by its position in
+    /// [`crate::plugins::Plugins::tool_names`].
+    Plugin(usize),
 }
 
 /// The state the panel and the keyboard shortcuts share. egui reads and writes
@@ -38,7 +41,7 @@ impl Default for Controls {
     fn default() -> Self {
         Self {
             tool: Tool::Paint,
-            material: materials::SAND,
+            material: SAND,
             brush: 8,
         }
     }
@@ -52,7 +55,17 @@ pub struct Actions {
 }
 
 /// Build the panel for this frame and report which buttons were hit.
-pub fn draw(ctx: &egui::Context, c: &mut Controls) -> Actions {
+///
+/// `registry` is where the material swatches come from, `tools` the names of
+/// the plugin tools in the order [`Tool::Plugin`] counts them, and `status` a
+/// line for the foot of the panel: what the last plugin drop did, or a hint.
+pub fn draw(
+    ctx: &egui::Context,
+    c: &mut Controls,
+    registry: &Registry,
+    tools: &[String],
+    status: &str,
+) -> Actions {
     let mut actions = Actions::default();
     let button_size = egui::vec2(130.0, 18.0);
 
@@ -61,7 +74,7 @@ pub fn draw(ctx: &egui::Context, c: &mut Controls) -> Actions {
         .resizable(false)
         .show(ctx, |ui| {
             ui.label("Material");
-            for (id, info) in materials::table().iter().enumerate() {
+            for (id, info) in registry.materials().iter().enumerate() {
                 if !info.pickable() {
                     continue;
                 }
@@ -92,6 +105,15 @@ pub fn draw(ctx: &egui::Context, c: &mut Controls) -> Actions {
             if ui.add(wind).clicked() {
                 c.tool = Tool::Wind;
             }
+            for (index, name) in tools.iter().enumerate() {
+                let mut button = egui::Button::new(name).min_size(button_size);
+                if c.tool == Tool::Plugin(index) {
+                    button = button.stroke(Stroke::new(2.0, Color32::WHITE));
+                }
+                if ui.add(button).clicked() {
+                    c.tool = Tool::Plugin(index);
+                }
+            }
 
             ui.separator();
             let label = if c.tool == Tool::Wind {
@@ -112,6 +134,7 @@ pub fn draw(ctx: &egui::Context, c: &mut Controls) -> Actions {
                     .small()
                     .weak(),
             );
+            ui.label(RichText::new(status).small().weak());
         });
 
     actions

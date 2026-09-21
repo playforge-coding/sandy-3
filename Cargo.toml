@@ -29,6 +29,12 @@ egui-winit = "0.36"
 
 env_logger = "0.11"
 log = "0.4"
+
+# Plugins. A plugin is a Lua script that registers materials and tools through
+# a small `sandy` table; see `src/plugins.rs`. `vendored` builds the Lua 5.5
+# interpreter from source with `cc`, so nothing has to be installed first.
+mlua = { version = "0.12", features = ["lua55", "vendored"] }
+
 pollster = "1.0" # block_on for wgpu's async device request
 
 # The simulation itself. Kernels are written as Rust functions and turned into

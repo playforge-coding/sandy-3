@@ -2,7 +2,8 @@
 
 A **falling-sand** world written in Rust, where the physics runs on the GPU.
 
-It runs natively on Windows, macOS and Linux.
+It runs natively on Windows, macOS and Linux. Plugins are Lua scripts: drop one
+on the window to add a material or a tool.
 
 It is a companion to [Sandy 2](https://github.com/playforge-coding/sandy-2),
 which does the same job with a cellular automaton on the CPU. The difference is
@@ -34,6 +35,7 @@ Painted from the on-screen picker, or with the number keys:
 | **Brush** | hold left mouse to paint the chosen material |
 | **Eraser** | the same brush, painting air |
 | **Wind** | sweep the cursor to blow a gust that way |
+| **Fan**, **Spray**, … | whatever the loaded plugins added; see [Plugins](#plugins) |
 
 The wind is a fluid, much as it is in sandspiel. A gust blows on after the
 sweep that made it, curls into eddies, goes up and over a heap and round a wall,
@@ -58,6 +60,70 @@ a falling stream of sand without disturbing anything that has settled.
 
 The panel drives the same state as the shortcuts, so the two stay in step.
 
+## Plugins
+
+A plugin is one Lua file. Drop it on the window and it loads on the spot.
+Leave it in a `plugins` folder in the directory the game is run from and it
+loads at startup. Three are built into the binary and always there, from
+[`src/plugins/`](src/plugins/): `acid.lua` adds a material that eats through
+rock, `fan.lua` a tool that blows an updraft, and `spray.lua` a tool that
+sprinkles the chosen material. They are ordinary scripts that go through the
+same loader as a dropped file, so they double as worked examples.
+
+A script has a `sandy` table in scope and registers things through it:
+
+```lua
+local acid = sandy.material {
+    name = "Acid",            -- shown in the picker
+    color = { 120, 230, 60 }, -- r, g, b
+    jitter = 20,              -- per-grain brightness variation, default 0
+    density = 120,            -- see "Adding a material" below
+    mobile = true,            -- default false
+    passable = true,          -- default true
+    liquid = true,            -- default false
+    spread = 200,             -- a liquid's runniness, default 0
+    windborne = false,        -- default false
+    glow = true,              -- default false
+}
+
+-- Stone next to acid dissolves, one tick in six.
+sandy.rule { actor = "Stone", trigger = acid, product = "Empty", look = "around", chance = 6 }
+
+sandy.tool {
+    name = "Fan",
+    on_drag = function(t)
+        sandy.wind(t.x, t.y, 30, 0, -4)
+    end,
+}
+```
+
+A material is referred to by its name, in any case, or by the id that
+`sandy.material` returns. `look` is `ortho` (the default), `around`, `above` or
+`below`, and `chance` is one in how many ticks the rule fires. Registering a
+name that is already taken replaces the old entry and keeps its id, so dropping
+a file on the window a second time reloads it, and a plugin can retune a
+built-in material.
+
+A tool's `on_drag` runs once a frame while the mouse is held with that tool
+picked. `t` carries the cursor cell (`x`, `y`), where it was the frame before
+(`px`, `py`, the same place on the first frame), `first`, the `brush` radius,
+and the `material` chosen in the panel. The two things a tool can do to the
+world are `sandy.paint(x, y, radius, material)` and
+`sandy.wind(x, y, radius, dvx, dvy)`, which are the brush and the wind tool.
+`sandy.find(name)` gives a material's id or nil, and `sandy.width` and
+`sandy.height` are the grid. Whatever a script asks for is queued and applied
+after it returns; a script is never handed the simulation.
+
+A plugin material is data, exactly as the built-in ones are (see "A material
+is data, not code" below). There is no per-cell function to write, because the
+cells are stepped on the GPU, so a plugin material can be anything the
+properties and the rules can express, and nothing they cannot.
+
+A script that fails says so at the foot of the panel and in the log, and
+whatever it registered before failing stays registered. Scripts get Lua's base
+library plus `string`, `table`, `math`, `utf8` and `coroutine`, and no `io`,
+`os` or `require`. `print` goes to the log.
+
 ## Run it
 
 ```sh
@@ -81,6 +147,11 @@ src/
 ├── gpu.rs          wgpu setup and the per-frame draw
 ├── scene.wgsl      Draws the world straight out of the cell buffer
 ├── bloom.wgsl      Gives the emissive materials their halo
+├── plugins.rs      Lua plugins: the `sandy` table and the loader
+├── plugins/        The built-in plugins, compiled into the binary
+│   ├── acid.lua      a material
+│   ├── fan.lua       a wind tool
+│   └── spray.lua     a paint tool
 ├── ui.rs           The egui control panel
 ├── app.rs          winit window, input and the event loop
 ├── lib.rs          Module wiring
@@ -102,7 +173,11 @@ name.
 
 That means adding a material is a new file and one line in `materials::table()`,
 with no kernel change at all, as long as the existing properties describe it.
-The trade is real though: a material that needs genuinely new behaviour needs a
+It is also what makes plugins cheap: a material a script adds is one more row
+in the same tables, which are rewritten on the GPU there and then. The props
+table is sized for every id a cell could hold from the start, so a new material
+is a write into the buffer already bound; the rules table is rebuilt at its new
+length. The trade is real though: a material that needs genuinely new behaviour needs a
 new property and a few lines in a kernel to act on it, where the CPU version
 would have let it write whatever it liked in its own `update`.
 
@@ -225,7 +300,7 @@ Anything else that moves at all still gets its surface ruffled by a stiff gust.
 
 Sandy 2 has a good deal more: fire, oil, clouds, rain, seeds that sprout trees,
 creatures that walk over the grid, a seed-based world generator, meteors,
-tsunamis, Rhai plugins, and screenshot and GIF capture. None of that is here.
+tsunamis, and screenshot and GIF capture. None of that is here.
 This is the elements and the tools, on the GPU, and the rest can follow.
 
 ## Building
@@ -239,8 +314,10 @@ cargo install sccache
 ```
 
 Without it every cargo command stops at `could not execute process sccache
-rustc -vV`. Setting the variable to nothing turns the wrapper off for a single
-command, without touching the checked-in config:
+rustc -vV`. A C compiler is needed as well, because the Lua interpreter the
+plugins run in is built from source (`mlua` with its `vendored` feature), so
+nothing has to be installed for it. Setting the variable to nothing turns the
+wrapper off for a single command, without touching the checked-in config:
 
 ```sh
 RUSTC_WRAPPER= cargo build

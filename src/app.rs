@@ -5,7 +5,12 @@
 //! outside the panel and keys pressed with nothing focused, drives the brush and
 //! the shortcuts. Each redraw runs egui, steps the world, and hands the
 //! tessellated panel to [`State::render`] to layer over the scene.
+//!
+//! A file dropped on the window is taken to be a plugin (see
+//! [`crate::plugins`]) and loaded on the spot. The plugins built into the
+//! binary, and then any in [`PLUGIN_DIR`], are loaded before the window opens.
 
+use std::path::Path;
 use std::sync::Arc;
 
 use winit::application::ApplicationHandler;
@@ -16,11 +21,20 @@ use winit::window::{Window, WindowId};
 
 use crate::gpu::State;
 use crate::materials::{EMPTY, LAVA, SAND, SOIL, STONE, WATER};
+use crate::plugins::{Command, Plugins, Stroke};
 use crate::ui;
 
 /// The window size the app opens at, in logical pixels. Twice as wide as it is
 /// tall, matching the grid, so nothing is stretched out of shape at the start.
 const WINDOW_SIZE: (f64, f64) = (1100.0, 620.0);
+
+/// Where the user's own plugins are looked for at startup, relative to the
+/// working directory. Every `.lua` file in it is loaded, in name order, after
+/// the built-in ones.
+const PLUGIN_DIR: &str = "plugins";
+
+/// What the foot of the panel says when there is nothing more recent to say.
+const DROP_HINT: &str = "Drop a .lua file on the window to load a plugin.";
 
 /// Wind added, in cells per tick, per grid cell the cursor sweeps in a frame.
 /// One would have the air move exactly with the cursor; a little more than that
@@ -43,10 +57,10 @@ const MIN_GUST_RADIUS: i32 = 30;
 struct Input {
     cursor: (f64, f64),
     drawing: bool,
-    /// The cell the wind tool was over on the previous painted frame, so a drag
-    /// yields a direction. `None` at the start of a stroke, so the first frame
-    /// only notes where it began and blows nothing.
-    last_wind: Option<(i32, i32)>,
+    /// The cell the cursor was over on the previous frame of this stroke, so a
+    /// drag yields a direction for the wind tool and for plugin tools. `None`
+    /// at the start of a stroke, so the first frame only notes where it began.
+    last_cell: Option<(i32, i32)>,
     controls: ui::Controls,
 }
 
@@ -55,21 +69,38 @@ impl Default for Input {
         Self {
             cursor: (0.0, 0.0),
             drawing: false,
-            last_wind: None,
+            last_cell: None,
             controls: ui::Controls::default(),
         }
     }
 }
 
-#[derive(Default)]
 struct App {
     state: Option<State>,
     input: Input,
+    /// The Lua side: the materials and tools scripts have added, and the
+    /// interpreter they run in.
+    plugins: Plugins,
+    /// The line at the foot of the panel: what the last plugin drop did.
+    status: String,
     /// egui's context: fonts, memory and layout. Cheap to clone, since it is an
     /// `Arc` inside.
     egui_ctx: egui::Context,
     /// Per-window input translation for egui, built once the window exists.
     egui_state: Option<egui_winit::State>,
+}
+
+impl Default for App {
+    fn default() -> Self {
+        Self {
+            state: None,
+            input: Input::default(),
+            plugins: Plugins::new(),
+            status: DROP_HINT.to_string(),
+            egui_ctx: egui::Context::default(),
+            egui_state: None,
+        }
+    }
 }
 
 impl App {
@@ -106,7 +137,17 @@ impl ApplicationHandler for App {
             .with_inner_size(winit::dpi::LogicalSize::new(WINDOW_SIZE.0, WINDOW_SIZE.1));
         let window = Arc::new(event_loop.create_window(attrs).expect("create window"));
 
-        self.state = Some(pollster::block_on(State::new(window)));
+        // The plugins go first, so the world is built knowing their materials
+        // rather than having the tables swapped out a moment later. The
+        // built-in ones come before the user's, so a user's script can retune
+        // a built-in one by name.
+        self.plugins.load_builtin();
+        self.load_plugin_dir();
+        self.state = Some(pollster::block_on(State::new(
+            window,
+            &self.plugins.registry(),
+        )));
+        self.apply_commands();
         self.ensure_egui();
     }
 
@@ -140,11 +181,17 @@ impl ApplicationHandler for App {
             } => {
                 if button == ElementState::Pressed {
                     self.input.drawing = !consumed;
-                    self.input.last_wind = None; // a fresh stroke has no direction yet
+                    self.input.last_cell = None; // a fresh stroke has no direction yet
                 } else {
                     self.input.drawing = false;
                 }
             }
+
+            // A file dropped on the window is a plugin. While one is being
+            // dragged over, say so, in place of the standing hint.
+            WindowEvent::DroppedFile(path) => self.load_plugin(&path),
+            WindowEvent::HoveredFile(_) => self.status = "Drop it to load the plugin.".to_string(),
+            WindowEvent::HoveredFileCancelled => self.status = DROP_HINT.to_string(),
 
             // A touchscreen draws exactly as the mouse does. The position rides
             // on the event itself rather than arriving separately, so the cursor
@@ -154,7 +201,7 @@ impl ApplicationHandler for App {
                 match touch.phase {
                     TouchPhase::Started => {
                         self.input.drawing = !consumed;
-                        self.input.last_wind = None;
+                        self.input.last_cell = None;
                     }
                     TouchPhase::Moved => {} // keep drawing; the cursor is updated
                     TouchPhase::Ended | TouchPhase::Cancelled => self.input.drawing = false,
@@ -197,20 +244,50 @@ impl App {
             let brush = self.input.controls.brush;
             let tool = self.input.controls.tool;
             let material = self.input.controls.material;
-            let state = self.state.as_mut().unwrap();
-            let (gx, gy) = state.cursor_to_grid(self.input.cursor);
+            let (gx, gy) = self
+                .state
+                .as_ref()
+                .unwrap()
+                .cursor_to_grid(self.input.cursor);
+            let last = self.input.last_cell;
+            self.input.last_cell = Some((gx, gy));
             match tool {
-                ui::Tool::Paint => state.sim.paint_disk(gx, gy, brush, material),
+                ui::Tool::Paint => {
+                    let state = self.state.as_mut().unwrap();
+                    state.sim.paint_disk(gx, gy, brush, material);
+                }
                 ui::Tool::Wind => {
                     // Blow a gust the way the cursor has swept since the last
                     // frame. The first frame of a stroke only notes where it is.
-                    if let Some((px, py)) = self.input.last_wind {
+                    if let Some((px, py)) = last {
                         let dvx = (gx - px) as f32 * WIND_DRAG_GAIN;
                         let dvy = (gy - py) as f32 * WIND_DRAG_GAIN;
                         let radius = (brush * GUST_SCALE).max(MIN_GUST_RADIUS);
+                        let state = self.state.as_mut().unwrap();
                         state.sim.add_wind_disk(gx, gy, radius, dvx, dvy);
                     }
-                    self.input.last_wind = Some((gx, gy));
+                }
+                ui::Tool::Plugin(index) => {
+                    // The script gets the frame and queues what it wants done.
+                    // One that fails is put down, so a mistake in it shows on
+                    // the panel once rather than sixty times a second.
+                    let (px, py) = last.unwrap_or((gx, gy));
+                    let stroke = Stroke {
+                        x: gx,
+                        y: gy,
+                        px,
+                        py,
+                        first: last.is_none(),
+                        brush,
+                        material,
+                    };
+                    if let Err(err) = self.plugins.run_tool(index, stroke) {
+                        log::error!("plugin tool failed: {err}");
+                        self.status = err;
+                        self.input.controls.tool = ui::Tool::Paint;
+                        self.input.drawing = false;
+                    }
+                    self.apply_commands();
                 }
             }
         }
@@ -221,8 +298,15 @@ impl App {
         let raw_input = self.egui_state.as_mut().unwrap().take_egui_input(&window);
         let ctx = self.egui_ctx.clone();
         let mut actions = ui::Actions::default();
+        let tools = self.plugins.tool_names();
         let full_output = ctx.run_ui(raw_input, |ui| {
-            actions = ui::draw(ui.ctx(), &mut self.input.controls);
+            actions = ui::draw(
+                ui.ctx(),
+                &mut self.input.controls,
+                &self.plugins.registry(),
+                &tools,
+                &self.status,
+            );
         });
         self.egui_state
             .as_mut()
@@ -278,6 +362,82 @@ impl App {
             c.tool = ui::Tool::Paint;
         }
     }
+
+    /// Load every `.lua` file in [`PLUGIN_DIR`], in name order. No folder is
+    /// not a problem; a script that fails is logged and the rest still load.
+    fn load_plugin_dir(&mut self) {
+        let Ok(entries) = std::fs::read_dir(PLUGIN_DIR) else {
+            return;
+        };
+        let mut paths: Vec<_> = entries
+            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+            .filter(|path| path.extension().is_some_and(|ext| ext == "lua"))
+            .collect();
+        paths.sort();
+        for path in &paths {
+            self.load_plugin(path);
+        }
+        if !paths.is_empty() {
+            self.status = format!(
+                "Loaded {} from {PLUGIN_DIR}/. {DROP_HINT}",
+                if paths.len() == 1 {
+                    "1 plugin".to_string()
+                } else {
+                    format!("{} plugins", paths.len())
+                }
+            );
+        }
+    }
+
+    /// Run one script, put what it registered into the world, and say on the
+    /// panel how that went.
+    fn load_plugin(&mut self, path: &Path) {
+        let label = path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.display().to_string());
+        match self.plugins.load_file(path) {
+            Ok(report) => {
+                log::info!("loaded plugin {}: {report}", path.display());
+                self.status = format!("Loaded {label}: {report}.");
+            }
+            Err(err) => {
+                log::error!("plugin {} failed: {err}", path.display());
+                self.status = format!("{label}: {err}");
+            }
+        }
+        // Whatever the script managed to register before any failure is in
+        // the registry, so the tables are refreshed either way.
+        if let Some(state) = &mut self.state {
+            state.sim.set_tables(&self.plugins.registry());
+        }
+        self.apply_commands();
+    }
+
+    /// Do what the scripts have queued up. Nothing happens until the world
+    /// exists; the queue simply waits.
+    fn apply_commands(&mut self) {
+        let Some(state) = &mut self.state else {
+            return;
+        };
+        for command in self.plugins.take_commands() {
+            match command {
+                Command::Paint {
+                    x,
+                    y,
+                    radius,
+                    material,
+                } => state.sim.paint_disk(x, y, radius, material),
+                Command::Wind {
+                    x,
+                    y,
+                    radius,
+                    dvx,
+                    dvy,
+                } => state.sim.add_wind_disk(x, y, radius, dvx, dvy),
+            }
+        }
+    }
 }
 
 /// Open the window and run until it closes.
@@ -286,7 +446,8 @@ pub fn run() {
 
     log::info!(
         "Controls: use the panel, or press 1=Sand 2=Stone 3=Water 4=Lava 5=Soil  0/Backspace=Erase  \
-         W=wind tool (sweep to blow a gust)  [ ]=brush size  C=clear  (hold left mouse to draw)"
+         W=wind tool (sweep to blow a gust)  [ ]=brush size  C=clear  (hold left mouse to draw). \
+         Drop a .lua file on the window to load a plugin."
     );
 
     let event_loop = EventLoop::new().expect("build event loop");

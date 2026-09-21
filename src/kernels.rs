@@ -65,7 +65,7 @@
 
 use unipute::kernel;
 
-use crate::materials::{self, MaterialInfo, Rule};
+use crate::materials::{MAX_MATERIALS, MaterialInfo, Registry, Rule};
 
 /// Words per material in the props table. A power of two, so the kernels reach
 /// a material's row with a shift rather than a multiply.
@@ -135,15 +135,21 @@ pub const AMBIENT_RATE: f32 = 0.0026;
 
 /// The props table the kernels index, in material id order.
 ///
+/// The table always has a row for every id a cell could hold, whether or not a
+/// material has claimed it yet, so that a plugin adding one later is a write
+/// into the same buffer rather than a new buffer and new bind groups. An
+/// unclaimed row is all zeros, and nothing in the world ever refers to one.
+///
 /// One extra row is appended at the end: the *wall* a block uses for a corner
 /// that falls outside the world. It is neither mobile nor passable, so nothing
 /// moves into it and nothing moves out, which is how the edge of the world holds
 /// without either kernel checking for it.
-pub fn props_table() -> Vec<u32> {
-    let mut words = Vec::new();
-    for info in materials::table() {
-        words.extend_from_slice(&props_row(&info));
+pub fn props_table(registry: &Registry) -> Vec<u32> {
+    let mut words = Vec::with_capacity((MAX_MATERIALS + 1) * PROPS_STRIDE);
+    for info in registry.materials() {
+        words.extend_from_slice(&props_row(info));
     }
+    words.resize(MAX_MATERIALS * PROPS_STRIDE, 0);
     // The out-of-world wall. Heavy, and with no flags at all.
     let mut wall = [0u32; PROPS_STRIDE];
     wall[0] = 255;
@@ -183,10 +189,10 @@ fn props_row(info: &MaterialInfo) -> [u32; PROPS_STRIDE] {
 /// A world with no reactions in it would leave the buffer empty, which wgpu will
 /// not bind, so an unreachable row is added in that case. It costs one comparison
 /// a tick and saves the kernel a special case.
-pub fn rules_table() -> Vec<u32> {
-    let rules = materials::rules();
+pub fn rules_table(registry: &Registry) -> Vec<u32> {
+    let rules = registry.rules();
     let mut words = Vec::new();
-    for rule in &rules {
+    for rule in rules {
         words.extend_from_slice(&rule_row(rule));
     }
     if rules.is_empty() {

@@ -14,6 +14,7 @@ use std::time::Instant;
 
 use winit::window::Window;
 
+use crate::materials::Registry;
 use crate::sim::{GRID_H, GRID_W, Simulation};
 
 /// How far the glow spreads, in grid cells per blur tap. Larger is a wider halo.
@@ -81,7 +82,10 @@ fn blur_step_bytes(step_x: f32, step_y: f32) -> [u8; 16] {
 }
 
 impl State {
-    pub async fn new(window: Arc<Window>) -> State {
+    /// Bring up the GPU and build a world that knows the materials in
+    /// `registry`. Later changes to the registry go through
+    /// [`Simulation::set_tables`].
+    pub async fn new(window: Arc<Window>, registry: &Registry) -> State {
         let size = window.inner_size();
         let width = size.width.max(1);
         let height = size.height.max(1);
@@ -147,7 +151,7 @@ impl State {
         };
         surface.configure(&device, &config);
 
-        let sim = Simulation::new(&device, &queue);
+        let sim = Simulation::new(&device, &queue, registry);
 
         // ---- Offscreen targets, all at the grid's own resolution ----
         let offscreen = |label: &str| {

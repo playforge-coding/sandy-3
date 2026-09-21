@@ -16,7 +16,7 @@ use unipute::{Access, WgslKernel};
 use wgpu::util::DeviceExt;
 
 use crate::kernels::{self, MOVE_PASSES, PRESSURE_ITERATIONS};
-use crate::materials::MaterialId;
+use crate::materials::{MaterialId, Registry};
 
 /// Simulation resolution, in cells. The renderer stretches this to fill the
 /// window, so these are logical sand grains rather than screen pixels.
@@ -46,6 +46,21 @@ const _: () = assert!(
 /// Bytes in a uniform buffer. Every uniform here is at most a `vec4`, and a
 /// round sixteen keeps them all the same shape.
 const UNIFORM_SIZE: u64 = 16;
+
+/// What every storage buffer here is for. COPY_SRC is there so the tests can
+/// read the world back; nothing in a normal run ever copies out of these.
+const STORAGE: wgpu::BufferUsages = wgpu::BufferUsages::STORAGE
+    .union(wgpu::BufferUsages::COPY_DST)
+    .union(wgpu::BufferUsages::COPY_SRC);
+
+/// A storage buffer holding one of the tables the kernels read.
+fn table(device: &wgpu::Device, label: &str, words: &[u32]) -> wgpu::Buffer {
+    device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some(label),
+        contents: bytemuck::cast_slice(words),
+        usage: STORAGE,
+    })
+}
 
 /// One compute kernel, ready to dispatch.
 ///
@@ -209,21 +224,18 @@ pub struct Simulation {
 }
 
 impl Simulation {
-    pub fn new(device: &wgpu::Device, queue: &wgpu::Queue) -> Self {
+    /// A fresh, empty world whose kernels read the materials and rules in
+    /// `registry`. [`Simulation::set_tables`] swaps those out later.
+    pub fn new(device: &wgpu::Device, queue: &wgpu::Queue, registry: &Registry) -> Self {
         let width = GRID_W;
         let height = GRID_H;
         let cell_count = (width * height) as u64;
 
-        // COPY_SRC is there so the tests can read the world back; nothing in a
-        // normal run ever copies out of these.
-        let storage = wgpu::BufferUsages::STORAGE
-            | wgpu::BufferUsages::COPY_DST
-            | wgpu::BufferUsages::COPY_SRC;
         let grid = |label| {
             device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some(label),
                 size: cell_count * 4,
-                usage: storage,
+                usage: STORAGE,
                 mapped_at_creation: false,
             })
         };
@@ -236,7 +248,7 @@ impl Simulation {
             device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some(label),
                 size: cell_count * 8,
-                usage: storage,
+                usage: STORAGE,
                 mapped_at_creation: false,
             })
         };
@@ -250,19 +262,15 @@ impl Simulation {
         let divergence_field = grid("divergence");
         let curl_field = grid("curl");
 
-        let table = |label, words: &[u32]| {
-            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some(label),
-                contents: bytemuck::cast_slice(words),
-                usage: storage,
-            })
-        };
-        let props = table("material props", &kernels::props_table());
-        // What reacts with what, as `kernels::rules_table` lays it out. Neither
-        // this nor the tools' copy of the world's shape is ever touched again
-        // once bound, and a bind group keeps its buffers alive, so they are not
-        // kept as fields.
-        let rules = table("reaction rules", &kernels::rules_table());
+        // Sized for every material there could ever be, so a plugin adding one
+        // is a write into this buffer rather than a new one.
+        let props = table(device, "material props", &kernels::props_table(registry));
+        // What reacts with what, as `kernels::rules_table` lays it out. Its
+        // length is the number of rules, so a plugin adding one means a new
+        // buffer and a new `react` bind group; that bind group is the only
+        // thing that holds it, which is why it is not a field. The same goes
+        // for the tools' copy of the world's shape below.
+        let rules = table(device, "reaction rules", &kernels::rules_table(registry));
 
         let uniform = |label| {
             device.create_buffer(&wgpu::BufferDescriptor {
@@ -432,6 +440,29 @@ impl Simulation {
     /// The wind, for the renderer to show where the air is moving.
     pub fn wind(&self) -> &wgpu::Buffer {
         &self.wind
+    }
+
+    /// Replace the materials and rules the kernels read with those in
+    /// `registry`. This is how a plugin's material gets into the world: the
+    /// props table is rewritten in place, since it always has a row for every
+    /// possible id, and the rules table is rebuilt at its new length along with
+    /// the one bind group that reads it. Cells already in the world keep their
+    /// ids, so a material that was retuned changes on the spot.
+    pub fn set_tables(&mut self, registry: &Registry) {
+        self.queue.write_buffer(
+            &self.props,
+            0,
+            bytemuck::cast_slice(&kernels::props_table(registry)),
+        );
+        let rules = table(
+            &self.device,
+            "reaction rules",
+            &kernels::rules_table(registry),
+        );
+        self.react_bind = self.react.bind(
+            &self.device,
+            &[&self.cells, &self.scratch, &rules, &self.react_world],
+        );
     }
 
     /// Advance the world by one tick.
@@ -705,7 +736,7 @@ mod tests {
     #[test]
     fn sand_falls_onto_the_ground_and_stays_there() {
         let (device, queue) = headless();
-        let mut sim = Simulation::new(&device, &queue);
+        let mut sim = Simulation::new(&device, &queue, &Registry::builtin());
         floor(&mut sim, STONE);
         sim.paint_disk(500, 60, 14, SAND);
         let painted = snapshot(&sim).count(SAND);
@@ -734,7 +765,7 @@ mod tests {
         // across; anything near the width of the spout means the tumble is not
         // firing and the sand is piling straight up.
         let (device, queue) = headless();
-        let mut sim = Simulation::new(&device, &queue);
+        let mut sim = Simulation::new(&device, &queue, &Registry::builtin());
         floor(&mut sim, STONE);
         for y in (20..200).step_by(6) {
             sim.paint_disk(500, y, 3, SAND);
@@ -759,7 +790,7 @@ mod tests {
         // Water poured into one spot of a basin should end up spread far wider
         // than it was painted. Sand in the same place would not.
         let (device, queue) = headless();
-        let mut sim = Simulation::new(&device, &queue);
+        let mut sim = Simulation::new(&device, &queue, &Registry::builtin());
         floor(&mut sim, STONE);
         sim.paint_disk(500, 200, 20, WATER);
         run(&mut sim, 500);
@@ -778,7 +809,7 @@ mod tests {
         // Sand is denser than water, so a grain dropped into a pool ends up
         // under it rather than floating.
         let (device, queue) = headless();
-        let mut sim = Simulation::new(&device, &queue);
+        let mut sim = Simulation::new(&device, &queue, &Registry::builtin());
         floor(&mut sim, STONE);
         sim.paint_disk(500, 420, 30, WATER);
         run(&mut sim, 200);
@@ -808,7 +839,7 @@ mod tests {
         // so it seals the two apart and whatever is under the crust survives,
         // which is what a lava flow hit by rain actually does.
         let (device, queue) = headless();
-        let mut sim = Simulation::new(&device, &queue);
+        let mut sim = Simulation::new(&device, &queue, &Registry::builtin());
         floor(&mut sim, STONE);
         let stone_before = snapshot(&sim).count(STONE);
         sim.paint_disk(500, 430, 20, LAVA);
@@ -834,12 +865,58 @@ mod tests {
     }
 
     #[test]
+    fn a_material_from_a_script_reaches_the_kernels_through_set_tables() {
+        // A plugin material is registered after the world exists, so it only
+        // gets to the GPU through `set_tables`. Acid from a script should then
+        // fall like the liquid it says it is, which needs the props table
+        // rewritten, and eat the stone floor, which needs the new rules bound.
+        let (device, queue) = headless();
+        let mut sim = Simulation::new(&device, &queue, &Registry::builtin());
+        floor(&mut sim, STONE);
+        let stone_before = snapshot(&sim).count(STONE);
+
+        let mut plugins = crate::plugins::Plugins::new();
+        plugins
+            .load(
+                "acid.lua",
+                r#"
+                local acid = sandy.material {
+                    name = "Acid", color = {120, 230, 60}, density = 120,
+                    mobile = true, liquid = true, spread = 200,
+                }
+                sandy.rule { actor = "Stone", trigger = acid, product = "Empty",
+                             look = "around", chance = 2 }
+                "#,
+            )
+            .unwrap();
+        let acid = plugins.registry().find("Acid").unwrap();
+        sim.set_tables(&plugins.registry());
+
+        // Well above the floor, so it has to fall before anything can react.
+        sim.paint_disk(500, 400, 20, acid);
+        let painted = snapshot(&sim).count(acid);
+        assert!(painted > 0, "the brush should have put some acid down");
+        run(&mut sim, 300);
+
+        let world = snapshot(&sim);
+        assert!(
+            world.count(STONE) < stone_before,
+            "acid should have eaten into the stone floor"
+        );
+        assert_eq!(
+            world.count(acid),
+            painted,
+            "nothing in this rule consumes the acid itself"
+        );
+    }
+
+    #[test]
     fn a_hillside_of_soil_holds_its_shape() {
         // Soil is a solid, so unlike sand it does not slump. This is the test
         // that would fail if the movement kernel started treating every
         // material as mobile.
         let (device, queue) = headless();
-        let mut sim = Simulation::new(&device, &queue);
+        let mut sim = Simulation::new(&device, &queue, &Registry::builtin());
         sim.paint_disk(500, 100, 25, SOIL);
         let before = snapshot(&sim);
         run(&mut sim, 300);
@@ -859,7 +936,7 @@ mod tests {
         // passes, which leaves half a block hanging off each edge. Getting that
         // wrong loses cells at the borders, so fill the edges and count.
         let (device, queue) = headless();
-        let mut sim = Simulation::new(&device, &queue);
+        let mut sim = Simulation::new(&device, &queue, &Registry::builtin());
         for y in (0..GRID_H as i32).step_by(10) {
             sim.paint_disk(2, y, 4, SAND);
             sim.paint_disk(GRID_W as i32 - 3, y, 4, SAND);
@@ -885,12 +962,12 @@ mod tests {
         // what is being measured is the gust rather than gravity.
         let (device, queue) = headless();
 
-        let mut still = Simulation::new(&device, &queue);
+        let mut still = Simulation::new(&device, &queue, &Registry::builtin());
         floor(&mut still, STONE);
         still.paint_disk(300, 40, 10, SAND);
         run(&mut still, 400);
 
-        let mut blown = Simulation::new(&device, &queue);
+        let mut blown = Simulation::new(&device, &queue, &Registry::builtin());
         floor(&mut blown, STONE);
         blown.paint_disk(300, 40, 10, SAND);
         for _ in 0..400 {
@@ -915,7 +992,7 @@ mod tests {
         // then a fan is held under it, and the top of the sand should end up
         // far above where it was resting.
         let (device, queue) = headless();
-        let mut sim = Simulation::new(&device, &queue);
+        let mut sim = Simulation::new(&device, &queue, &Registry::builtin());
         floor(&mut sim, STONE);
         sim.paint_disk(500, 440, 20, SAND);
         run(&mut sim, 300);
@@ -949,7 +1026,7 @@ mod tests {
         // alone; some time later the air well beyond where the tool ever
         // reached should be moving, and moving to the right.
         let (device, queue) = headless();
-        let mut sim = Simulation::new(&device, &queue);
+        let mut sim = Simulation::new(&device, &queue, &Registry::builtin());
         for _ in 0..20 {
             sim.add_wind_disk(300, 250, 40, 6.0, 0.0);
             sim.step();
@@ -976,7 +1053,7 @@ mod tests {
         // blown upwind of a heap that has settled, the tool never reaches the
         // heap, and the heap should still be shifted the way the wind went.
         let (device, queue) = headless();
-        let mut sim = Simulation::new(&device, &queue);
+        let mut sim = Simulation::new(&device, &queue, &Registry::builtin());
         floor(&mut sim, STONE);
         sim.paint_disk(520, 470, 12, SAND);
         run(&mut sim, 200);
@@ -1004,13 +1081,13 @@ mod tests {
         // into each afterwards should land in the same place.
         let (device, queue) = headless();
 
-        let mut still = Simulation::new(&device, &queue);
+        let mut still = Simulation::new(&device, &queue, &Registry::builtin());
         floor(&mut still, STONE);
         run(&mut still, 1000);
         still.paint_disk(500, 60, 10, SAND);
         run(&mut still, 300);
 
-        let mut blown = Simulation::new(&device, &queue);
+        let mut blown = Simulation::new(&device, &queue, &Registry::builtin());
         floor(&mut blown, STONE);
         for _ in 0..100 {
             blown.add_wind_disk(500, 250, 200, 6.0, 0.0);
@@ -1032,7 +1109,7 @@ mod tests {
     #[test]
     fn the_eraser_clears_what_the_brush_painted() {
         let (device, queue) = headless();
-        let mut sim = Simulation::new(&device, &queue);
+        let mut sim = Simulation::new(&device, &queue, &Registry::builtin());
         sim.paint_disk(500, 250, 20, STONE);
         assert!(snapshot(&sim).count(STONE) > 0);
         sim.paint_disk(500, 250, 25, EMPTY);
@@ -1042,7 +1119,7 @@ mod tests {
     #[test]
     fn clearing_empties_the_whole_world() {
         let (device, queue) = headless();
-        let mut sim = Simulation::new(&device, &queue);
+        let mut sim = Simulation::new(&device, &queue, &Registry::builtin());
         floor(&mut sim, SOIL);
         sim.paint_disk(500, 200, 30, WATER);
         run(&mut sim, 20);

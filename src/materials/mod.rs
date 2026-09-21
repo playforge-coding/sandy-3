@@ -19,6 +19,10 @@
 //! with no kernel change at all, as long as the existing properties can describe
 //! it.
 //!
+//! The same goes for a material a plugin adds while the game is running: it is
+//! one more row in a [`Registry`], which starts out as the built-in tables and
+//! is what the host uploads to the GPU. See [`crate::plugins`].
+//!
 //! # Adding a new material
 //!
 //! 1. Create `src/materials/<name>.rs` (copy `sand.rs` or `stone.rs`).
@@ -35,6 +39,10 @@ mod water;
 /// A material identifier. `0` is always [`EMPTY`]; every other value indexes
 /// into the table built by [`table`].
 pub type MaterialId = u8;
+
+/// How many materials there can be, built in and from plugins together. A cell
+/// keeps its material in eight bits, so this is as many as an id can name.
+pub const MAX_MATERIALS: usize = 256;
 
 /// The empty cell (air / nothing). Always id `0`.
 pub const EMPTY: MaterialId = 0;
@@ -114,11 +122,10 @@ pub struct Rule {
 /// Which neighbouring cells a [`Rule`] inspects.
 ///
 /// [`crate::kernels::react`] implements all four, so a new material can reach
-/// for whichever one it needs without touching the kernel. Only [`Look::Ortho`]
-/// has a user so far.
-#[derive(Clone, Copy)]
+/// for whichever one it needs without touching the kernel. The built-in rules
+/// only use [`Look::Ortho`]; plugins pick any of them by name.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u32)]
-#[allow(dead_code)]
 pub enum Look {
     /// The four orthogonal neighbours: up, down, left, right.
     Ortho = 0,
@@ -161,5 +168,157 @@ impl MaterialInfo {
     /// exists because another one produces it would return false here.
     pub fn pickable(&self) -> bool {
         true
+    }
+}
+
+/// Every material and every rule the world currently knows about: the built-in
+/// tables, plus whatever plugins have added since. This is what the host turns
+/// into the GPU tables, so a change here followed by
+/// [`crate::sim::Simulation::set_tables`] is a change in the world.
+///
+/// Materials are only ever added or changed in place, never removed, because a
+/// material's id is its position and the cells already in the world refer to
+/// it by that number.
+#[derive(Clone)]
+pub struct Registry {
+    materials: Vec<MaterialInfo>,
+    rules: Vec<Rule>,
+}
+
+impl Registry {
+    /// The built-in materials and rules, and nothing else.
+    pub fn builtin() -> Self {
+        Registry {
+            materials: table(),
+            rules: rules(),
+        }
+    }
+
+    /// Every material, in id order.
+    pub fn materials(&self) -> &[MaterialInfo] {
+        &self.materials
+    }
+
+    /// Every reaction, in no particular order.
+    pub fn rules(&self) -> &[Rule] {
+        &self.rules
+    }
+
+    /// The material called `name`, ignoring case. Plugins refer to materials
+    /// by name, including the built-in ones.
+    pub fn find(&self, name: &str) -> Option<MaterialId> {
+        self.materials
+            .iter()
+            .position(|info| info.name.eq_ignore_ascii_case(name))
+            .map(|id| id as MaterialId)
+    }
+
+    /// Add a material, or if one with the same name already exists, replace its
+    /// properties and keep its id. Replacing is what makes dropping a plugin on
+    /// the window a second time a reload rather than a duplicate, and it is
+    /// also how a plugin can retune a built-in material.
+    pub fn add_material(&mut self, info: MaterialInfo) -> Result<MaterialId, String> {
+        if let Some(id) = self.find(info.name) {
+            self.materials[id as usize] = info;
+            return Ok(id);
+        }
+        if self.materials.len() >= MAX_MATERIALS {
+            return Err(format!(
+                "no room for '{}': there can only be {MAX_MATERIALS} materials",
+                info.name
+            ));
+        }
+        self.materials.push(info);
+        Ok((self.materials.len() - 1) as MaterialId)
+    }
+
+    /// Add a reaction. A rule for the same actor and trigger replaces the old
+    /// one, so the kernel never has two rules competing for one pair.
+    pub fn add_rule(&mut self, rule: Rule) {
+        match self
+            .rules
+            .iter_mut()
+            .find(|old| old.actor == rule.actor && old.trigger == rule.trigger)
+        {
+            Some(old) => *old = rule,
+            None => self.rules.push(rule),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn powder(name: &'static str) -> MaterialInfo {
+        MaterialInfo { name, ..sand::INFO }
+    }
+
+    #[test]
+    fn the_builtin_ids_match_the_named_constants() {
+        let registry = Registry::builtin();
+        assert_eq!(registry.find("Empty"), Some(EMPTY));
+        assert_eq!(registry.find("sand"), Some(SAND));
+        assert_eq!(registry.find("STONE"), Some(STONE));
+        assert_eq!(registry.find("Water"), Some(WATER));
+        assert_eq!(registry.find("Lava"), Some(LAVA));
+        assert_eq!(registry.find("Soil"), Some(SOIL));
+        assert_eq!(registry.find("Acid"), None);
+    }
+
+    #[test]
+    fn a_new_material_gets_the_next_id_and_the_same_name_keeps_it() {
+        let mut registry = Registry::builtin();
+        let first = registry.materials().len() as MaterialId;
+        let ash = registry.add_material(powder("Ash")).unwrap();
+        assert_eq!(ash, first);
+
+        let recoloured = MaterialInfo {
+            color: [1, 2, 3],
+            ..powder("ash")
+        };
+        assert_eq!(registry.add_material(recoloured).unwrap(), ash);
+        assert_eq!(registry.materials().len() as MaterialId, first + 1);
+        assert_eq!(registry.materials()[ash as usize].color, [1, 2, 3]);
+    }
+
+    #[test]
+    fn the_registry_stops_at_the_last_id_a_cell_can_hold() {
+        let mut registry = Registry::builtin();
+        while registry.materials().len() < MAX_MATERIALS {
+            let name: &'static str = format!("m{}", registry.materials().len()).leak();
+            registry.add_material(powder(name)).unwrap();
+        }
+        assert!(registry.add_material(powder("one too many")).is_err());
+    }
+
+    #[test]
+    fn a_rule_for_the_same_pair_replaces_the_old_one() {
+        let mut registry = Registry::builtin();
+        let before = registry.rules().len();
+        registry.add_rule(Rule {
+            actor: WATER,
+            trigger: LAVA,
+            product: SAND,
+            look: Look::Around,
+            chance: 3,
+        });
+        assert_eq!(registry.rules().len(), before);
+        let rule = registry
+            .rules()
+            .iter()
+            .find(|r| r.actor == WATER && r.trigger == LAVA)
+            .unwrap();
+        assert_eq!(rule.product, SAND);
+        assert_eq!(rule.look, Look::Around);
+
+        registry.add_rule(Rule {
+            actor: SAND,
+            trigger: WATER,
+            product: SOIL,
+            look: Look::Below,
+            chance: 1,
+        });
+        assert_eq!(registry.rules().len(), before + 1);
     }
 }

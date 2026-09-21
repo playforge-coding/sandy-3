@@ -2770,6 +2770,7 @@ checksum = "b4ac048d71ede7ee76d585517add45da530660ef4390e49b098733c6e897f254"
 [[package]]
 name = "unipute"
 version = "0.1.0"
+source = "git+https://github.com/playforge-coding/unipute?rev=8d8f570807c8c8e10e85fba4c0072d381dab4544#8d8f570807c8c8e10e85fba4c0072d381dab4544"
 dependencies = [
  "unipute-ir",
  "unipute-macros",
@@ -2779,10 +2780,12 @@ dependencies = [
 [[package]]
 name = "unipute-ir"
 version = "0.1.0"
+source = "git+https://github.com/playforge-coding/unipute?rev=8d8f570807c8c8e10e85fba4c0072d381dab4544#8d8f570807c8c8e10e85fba4c0072d381dab4544"
 
 [[package]]
 name = "unipute-macros"
 version = "0.1.0"
+source = "git+https://github.com/playforge-coding/unipute?rev=8d8f570807c8c8e10e85fba4c0072d381dab4544#8d8f570807c8c8e10e85fba4c0072d381dab4544"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -2794,6 +2797,7 @@ dependencies = [
 [[package]]
 name = "unipute-naga"
 version = "0.1.0"
+source = "git+https://github.com/playforge-coding/unipute?rev=8d8f570807c8c8e10e85fba4c0072d381dab4544#8d8f570807c8c8e10e85fba4c0072d381dab4544"
 dependencies = [
  "naga",
  "unipute-ir",

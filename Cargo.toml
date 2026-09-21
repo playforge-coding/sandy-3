@@ -39,8 +39,9 @@ pollster = "1.0" # block_on for wgpu's async device request
 
 # The simulation itself. Kernels are written as Rust functions and turned into
 # WGSL while this crate compiles, so a broken rule is a build error here rather
-# than a shader compile failure at startup. Not on crates.io yet, hence the path.
-unipute = { path = "../unipute" }
+# than a shader compile failure at startup. Not on crates.io yet, hence the git
+# dependency, pinned to a commit so builds stay reproducible.
+unipute = { git = "https://github.com/playforge-coding/unipute", rev = "8d8f570807c8c8e10e85fba4c0072d381dab4544" }
 
 # Window, surface and the render passes. The compute kernels unipute generates
 # are handed to wgpu as ordinary shader modules. The version is the one

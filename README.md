@@ -28,14 +28,25 @@ Painted from the on-screen picker, or with the number keys:
 | **Lava** | liquid, viscous | pools in blobs, glows, turns to stone where water meets it |
 | **Soil** | solid, immovable | terrain; a hillside of it holds its shape |
 
-## Tools
+## Brushes and tools
+
+A brush paints the chosen material, and which brush decides how, so a material
+and a brush are picked together. A tool does something else with the cursor
+and is picked instead of them. The wind tool is part of the game itself; every
+brush, the plain one included, and every other tool is a plugin (see
+[Plugins](#plugins)), and these are the ones built in:
+
+| Brush | What it does |
+|-------|--------------|
+| **Disk** | a solid circle, the plain brush |
+| **Spray** | a sprinkle of single grains inside the circle |
 
 | Tool | What it does |
 |------|--------------|
-| **Brush** | hold left mouse to paint the chosen material |
-| **Eraser** | the same brush, painting air |
 | **Wind** | sweep the cursor to blow a gust that way |
-| **Fan**, **Spray**, … | whatever the loaded plugins added; see [Plugins](#plugins) |
+| **Fan** | blow a steady updraft where the cursor is held |
+
+Painting **Eraser** is painting air, with whichever brush is picked.
 
 The wind is a fluid, much as it is in sandspiel. A gust blows on after the
 sweep that made it, curls into eddies, goes up and over a heap and round a wall,
@@ -64,11 +75,12 @@ The panel drives the same state as the shortcuts, so the two stay in step.
 
 A plugin is one Lua file. Drop it on the window and it loads on the spot.
 Leave it in a `plugins` folder in the directory the game is run from and it
-loads at startup. Three are built into the binary and always there, from
+loads at startup. Four are built into the binary and always there, from
 [`src/plugins/`](src/plugins/): `acid.lua` adds a material that eats through
-rock, `fan.lua` a tool that blows an updraft, and `spray.lua` a tool that
-sprinkles the chosen material. They are ordinary scripts that go through the
-same loader as a dropped file, so they double as worked examples.
+rock, `disk.lua` is the plain brush, `spray.lua` a brush that sprinkles
+grains, and `fan.lua` a tool that blows an updraft. They are ordinary scripts
+that go through the same loader as a dropped file, so they double as worked
+examples.
 
 A script has a `sandy` table in scope and registers things through it:
 
@@ -89,6 +101,15 @@ local acid = sandy.material {
 -- Stone next to acid dissolves, one tick in six.
 sandy.rule { actor = "Stone", trigger = acid, product = "Empty", look = "around", chance = 6 }
 
+-- A brush: paints the chosen material, its own way.
+sandy.brush {
+    name = "Dot",
+    on_drag = function(t)
+        sandy.paint(t.x, t.y, 0, t.material)
+    end,
+}
+
+-- A tool: does something else with the cursor.
 sandy.tool {
     name = "Fan",
     on_drag = function(t)
@@ -100,16 +121,19 @@ sandy.tool {
 A material is referred to by its name, in any case, or by the id that
 `sandy.material` returns. `look` is `ortho` (the default), `around`, `above` or
 `below`, and `chance` is one in how many ticks the rule fires. Registering a
-name that is already taken replaces the old entry and keeps its id, so dropping
-a file on the window a second time reloads it, and a plugin can retune a
-built-in material.
+name that is already taken replaces the old entry and keeps its place, so
+dropping a file on the window a second time reloads it, and a plugin can retune
+a built-in material or brush.
 
-A tool's `on_drag` runs once a frame while the mouse is held with that tool
-picked. `t` carries the cursor cell (`x`, `y`), where it was the frame before
-(`px`, `py`, the same place on the first frame), `first`, the `brush` radius,
-and the `material` chosen in the panel. The two things a tool can do to the
-world are `sandy.paint(x, y, radius, material)` and
-`sandy.wind(x, y, radius, dvx, dvy)`, which are the brush and the wind tool.
+A brush and a tool are the same thing to the game: a function, `on_drag`,
+that runs once a frame while the mouse is held with it picked. The difference
+is in the panel, where a brush sits with the materials and is picked alongside
+one, and a tool is picked instead. `t` carries the cursor cell (`x`, `y`),
+where it was the frame before (`px`, `py`, the same place on the first frame),
+`first`, the `radius` set in the panel, and the `material` chosen there. The
+two things a script can do to the world are `sandy.paint(x, y, radius,
+material)`, which is what the plain brush does with exactly those arguments,
+and `sandy.wind(x, y, radius, dvx, dvy)`, which is the wind tool.
 `sandy.find(name)` gives a material's id or nil, and `sandy.width` and
 `sandy.height` are the grid. Whatever a script asks for is queued and applied
 after it returns; a script is never handed the simulation.
@@ -150,8 +174,9 @@ src/
 ├── plugins.rs      Lua plugins: the `sandy` table and the loader
 ├── plugins/        The built-in plugins, compiled into the binary
 │   ├── acid.lua      a material
-│   ├── fan.lua       a wind tool
-│   └── spray.lua     a paint tool
+│   ├── disk.lua      the plain brush
+│   ├── spray.lua     a brush
+│   └── fan.lua       a tool
 ├── ui.rs           The egui control panel
 ├── app.rs          winit window, input and the event loop
 ├── lib.rs          Module wiring

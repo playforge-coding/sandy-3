@@ -1,11 +1,13 @@
-//! Lua plugins: scripts that add materials and tools while the game runs.
+//! Lua plugins: scripts that add materials, brushes and tools while the game
+//! runs.
 //!
 //! A plugin is one `.lua` file. Dropped on the window, left in the `plugins`
 //! folder next to where the game is run from, or compiled in as one of
 //! [`BUILTIN`], it is executed once with a `sandy` table in scope, and whatever
-//! it registers through that table is in the game from then on. A material is a row in the [`Registry`] that
-//! [`crate::sim::Simulation::set_tables`] then uploads, and a tool is a Lua
-//! function the app calls every frame the mouse is held with it selected.
+//! it registers through that table is in the game from then on. A material is
+//! a row in the [`Registry`] that [`crate::sim::Simulation::set_tables`] then
+//! uploads, and a brush or a tool is a Lua function the app calls every frame
+//! the mouse is held with it selected.
 //!
 //! # What a script sees
 //!
@@ -16,6 +18,9 @@
 //! }
 //! sandy.rule { actor = "Stone", trigger = acid, product = "Empty",
 //!              look = "around", chance = 6 }
+//! sandy.brush { name = "Dot", on_drag = function(t)
+//!     sandy.paint(t.x, t.y, 0, t.material)
+//! end }
 //! sandy.tool { name = "Fan", on_drag = function(t)
 //!     sandy.wind(t.x, t.y, 30, 0, -4)
 //! end }
@@ -25,9 +30,18 @@
 //! sandy.width, sandy.height             -- the grid, in cells
 //! ```
 //!
-//! Materials and tools go by name. Registering a name that already exists
-//! replaces the old entry in place, which is what makes dropping a file on the
-//! window a second time a reload, and lets a plugin retune a built-in material.
+//! Materials, brushes and tools go by name. Registering a name that already
+//! exists replaces the old entry in place, which is what makes dropping a file
+//! on the window a second time a reload, and lets a plugin retune a built-in
+//! material or brush.
+//!
+//! A brush and a tool are the same thing to this module, a function called
+//! once a frame while the mouse is held (see [`Kind`]). The difference is what
+//! the panel does with them: a brush paints the material picked in the panel,
+//! in its own way, so a material and a brush are chosen together; a tool does
+//! something else with the cursor. Even the plain brush is a script,
+//! `disk.lua`, so there is one way to paint rather than a built-in way and a
+//! plugin way.
 //!
 //! # Why a script never touches the world itself
 //!
@@ -71,9 +85,30 @@ const MAX_RADIUS: i32 = 512;
 /// worked examples of what a plugin can do.
 pub const BUILTIN: &[(&str, &str)] = &[
     ("acid.lua", include_str!("plugins/acid.lua")),
+    ("disk.lua", include_str!("plugins/disk.lua")),
     ("fan.lua", include_str!("plugins/fan.lua")),
     ("spray.lua", include_str!("plugins/spray.lua")),
 ];
+
+/// The two kinds of script a stroke can drive. They are registered with
+/// `sandy.brush` and `sandy.tool` and kept in separate lists, so the panel can
+/// put the brushes next to the materials and the tools on their own.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Kind {
+    /// Paints the material picked in the panel, in its own way.
+    Brush,
+    /// Does something else with the cursor.
+    Tool,
+}
+
+impl Kind {
+    fn word(self) -> &'static str {
+        match self {
+            Kind::Brush => "brush",
+            Kind::Tool => "tool",
+        }
+    }
+}
 
 /// Something a script asked the world to do, waiting for the app to do it.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -106,9 +141,9 @@ pub struct Stroke {
     pub py: i32,
     /// Whether this is the first frame since the button went down.
     pub first: bool,
-    /// The brush radius set in the panel.
-    pub brush: i32,
-    /// The material chosen in the panel, for a tool that paints.
+    /// The size set in the panel, in cells.
+    pub radius: i32,
+    /// The material chosen in the panel, which is what a brush paints.
     pub material: MaterialId,
 }
 
@@ -117,29 +152,31 @@ pub struct Stroke {
 pub struct Report {
     pub materials: usize,
     pub rules: usize,
+    pub brushes: usize,
     pub tools: usize,
 }
 
 impl fmt::Display for Report {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let plural = |n: usize, word: &str| {
+        let count = |n: usize, one: &str, many: &str| {
             if n == 1 {
-                format!("{n} {word}")
+                format!("{n} {one}")
             } else {
-                format!("{n} {word}s")
+                format!("{n} {many}")
             }
         };
         write!(
             f,
-            "{}, {}, {}",
-            plural(self.materials, "material"),
-            plural(self.rules, "rule"),
-            plural(self.tools, "tool")
+            "{}, {}, {}, {}",
+            count(self.materials, "material", "materials"),
+            count(self.rules, "rule", "rules"),
+            count(self.brushes, "brush", "brushes"),
+            count(self.tools, "tool", "tools")
         )
     }
 }
 
-/// A tool a script registered.
+/// A brush or a tool a script registered.
 struct PluginTool {
     name: String,
     on_drag: Function,
@@ -150,14 +187,56 @@ struct PluginTool {
 /// gets back out.
 struct Shared {
     registry: Registry,
+    brushes: Vec<PluginTool>,
     tools: Vec<PluginTool>,
     commands: Vec<Command>,
     /// What the script currently being loaded has registered so far.
     report: Report,
 }
 
-/// The Lua interpreter, the materials and tools the scripts have registered,
-/// and the commands they have queued.
+impl Shared {
+    fn list(&self, kind: Kind) -> &[PluginTool] {
+        match kind {
+            Kind::Brush => &self.brushes,
+            Kind::Tool => &self.tools,
+        }
+    }
+
+    fn list_mut(&mut self, kind: Kind) -> &mut Vec<PluginTool> {
+        match kind {
+            Kind::Brush => &mut self.brushes,
+            Kind::Tool => &mut self.tools,
+        }
+    }
+}
+
+/// `sandy.brush` and `sandy.tool`: the same registration, into different
+/// lists. A name already in the list is replaced in place, so its position,
+/// which is what the panel's selection refers to, stays put.
+fn register(shared: &Rc<RefCell<Shared>>, kind: Kind, spec: Table) -> mlua::Result<()> {
+    let name: String = required(&spec, "name")?;
+    if name.trim().is_empty() {
+        return Err(runtime(format!("a {} needs a name", kind.word())));
+    }
+    let on_drag: Function = required(&spec, "on_drag")?;
+    let mut shared = shared.borrow_mut();
+    let list = shared.list_mut(kind);
+    match list
+        .iter_mut()
+        .find(|entry| entry.name.eq_ignore_ascii_case(&name))
+    {
+        Some(entry) => entry.on_drag = on_drag,
+        None => list.push(PluginTool { name, on_drag }),
+    }
+    match kind {
+        Kind::Brush => shared.report.brushes += 1,
+        Kind::Tool => shared.report.tools += 1,
+    }
+    Ok(())
+}
+
+/// The Lua interpreter, the materials, brushes and tools the scripts have
+/// registered, and the commands they have queued.
 pub struct Plugins {
     lua: Lua,
     shared: Rc<RefCell<Shared>>,
@@ -183,6 +262,7 @@ impl Plugins {
         )?;
         let shared = Rc::new(RefCell::new(Shared {
             registry: Registry::builtin(),
+            brushes: Vec::new(),
             tools: Vec::new(),
             commands: Vec::new(),
             report: Report::default(),
@@ -244,28 +324,13 @@ impl Plugins {
             })?,
         )?;
 
-        let s = shared.clone();
-        sandy.set(
-            "tool",
-            lua.create_function(move |_, spec: Table| {
-                let name: String = required(&spec, "name")?;
-                if name.trim().is_empty() {
-                    return Err(runtime("a tool needs a name"));
-                }
-                let on_drag: Function = required(&spec, "on_drag")?;
-                let mut shared = s.borrow_mut();
-                match shared
-                    .tools
-                    .iter_mut()
-                    .find(|tool| tool.name.eq_ignore_ascii_case(&name))
-                {
-                    Some(tool) => tool.on_drag = on_drag,
-                    None => shared.tools.push(PluginTool { name, on_drag }),
-                }
-                shared.report.tools += 1;
-                Ok(())
-            })?,
-        )?;
+        for (key, kind) in [("brush", Kind::Brush), ("tool", Kind::Tool)] {
+            let s = shared.clone();
+            sandy.set(
+                key,
+                lua.create_function(move |_, spec: Table| register(&s, kind, spec))?,
+            )?;
+        }
 
         let s = shared.clone();
         sandy.set(
@@ -345,29 +410,30 @@ impl Plugins {
         result.map(|()| report).map_err(|err| describe(&err))
     }
 
-    /// The names of the tools scripts have registered, in the order they were
-    /// added. A [`crate::ui::Tool::Plugin`] is an index into this.
-    pub fn tool_names(&self) -> Vec<String> {
+    /// The names of the brushes or tools scripts have registered, in the order
+    /// they were added. The panel's choice of brush, and a
+    /// [`crate::ui::Tool::Plugin`], are indexes into these.
+    pub fn names(&self, kind: Kind) -> Vec<String> {
         self.shared
             .borrow()
-            .tools
+            .list(kind)
             .iter()
-            .map(|tool| tool.name.clone())
+            .map(|entry| entry.name.clone())
             .collect()
     }
 
-    /// Give a plugin tool one frame of a stroke. Whatever it asks for lands in
-    /// the command queue; see [`Plugins::take_commands`].
-    pub fn run_tool(&mut self, index: usize, stroke: Stroke) -> Result<(), String> {
+    /// Give a brush or a tool one frame of a stroke. Whatever it asks for lands
+    /// in the command queue; see [`Plugins::take_commands`].
+    pub fn run(&mut self, kind: Kind, index: usize, stroke: Stroke) -> Result<(), String> {
         // The function is cloned out so the borrow is released before the
         // call, since the script will want to borrow the queue itself.
         let on_drag = self
             .shared
             .borrow()
-            .tools
+            .list(kind)
             .get(index)
-            .map(|tool| tool.on_drag.clone())
-            .ok_or_else(|| format!("there is no plugin tool number {index}"))?;
+            .map(|entry| entry.on_drag.clone())
+            .ok_or_else(|| format!("there is no {} number {index}", kind.word()))?;
         let frame = (|| {
             let t = self.lua.create_table()?;
             t.set("x", stroke.x)?;
@@ -375,7 +441,7 @@ impl Plugins {
             t.set("px", stroke.px)?;
             t.set("py", stroke.py)?;
             t.set("first", stroke.first)?;
-            t.set("brush", stroke.brush)?;
+            t.set("radius", stroke.radius)?;
             t.set("material", stroke.material)?;
             Ok(t)
         })()
@@ -545,9 +611,11 @@ mod tests {
             Report {
                 materials: 1,
                 rules: 1,
+                brushes: 0,
                 tools: 0
             }
         );
+        assert_eq!(report.to_string(), "1 material, 1 rule, 0 brushes, 0 tools");
 
         let registry = plugins.registry();
         let acid = registry.find("Acid").expect("the material was registered");
@@ -589,7 +657,7 @@ mod tests {
         assert_eq!(registry.materials().len(), count);
         assert_eq!(registry.find("Ash"), Some(id));
         assert_eq!(registry.materials()[id as usize].color, [4, 4, 4]);
-        assert_eq!(plugins.tool_names(), ["Puff"]);
+        assert_eq!(plugins.names(Kind::Tool), ["Puff"]);
     }
 
     #[test]
@@ -600,14 +668,15 @@ mod tests {
                 "fan.lua",
                 r#"
                 sandy.tool { name = "Fan", on_drag = function(t)
-                    sandy.wind(t.x, t.y, t.brush * 3, 0, -4)
+                    sandy.wind(t.x, t.y, t.radius * 3, 0, -4)
                     if t.first then sandy.paint(t.x, t.y, 2.4, t.material) end
                     if t.x ~= t.px then sandy.paint(t.px, t.py, 0, "water") end
                 end }
                 "#,
             )
             .unwrap();
-        assert_eq!(plugins.tool_names(), ["Fan"]);
+        assert_eq!(plugins.names(Kind::Tool), ["Fan"]);
+        assert!(plugins.names(Kind::Brush).is_empty());
         assert!(plugins.take_commands().is_empty());
 
         let stroke = Stroke {
@@ -616,10 +685,10 @@ mod tests {
             px: 10,
             py: 20,
             first: true,
-            brush: 5,
+            radius: 5,
             material: SAND,
         };
-        plugins.run_tool(0, stroke).unwrap();
+        plugins.run(Kind::Tool, 0, stroke).unwrap();
         assert_eq!(
             plugins.take_commands(),
             [
@@ -640,7 +709,8 @@ mod tests {
         );
 
         plugins
-            .run_tool(
+            .run(
+                Kind::Tool,
                 0,
                 Stroke {
                     x: 12,
@@ -730,12 +800,16 @@ mod tests {
             px: 0,
             py: 0,
             first: true,
-            brush: 1,
+            radius: 1,
             material: SAND,
         };
-        let err = plugins.run_tool(0, stroke).unwrap_err();
+        let err = plugins.run(Kind::Tool, 0, stroke).unwrap_err();
         assert!(err.contains("tool.lua:1"), "{err}");
-        assert!(plugins.run_tool(1, stroke).is_err(), "no such tool");
+        assert!(plugins.run(Kind::Tool, 1, stroke).is_err(), "no such tool");
+        assert!(
+            plugins.run(Kind::Brush, 0, stroke).is_err(),
+            "no brushes at all"
+        );
 
         // None of that has hurt the interpreter or the registry.
         let registry_size = plugins.registry().materials().len();
@@ -765,7 +839,51 @@ mod tests {
             "acid.lua adds rules that fire next to acid"
         );
         drop(registry);
-        assert_eq!(plugins.tool_names(), ["Fan", "Spray"]);
+        assert_eq!(plugins.names(Kind::Brush), ["Disk", "Spray"]);
+        assert_eq!(plugins.names(Kind::Tool), ["Fan"]);
+
+        // The plain brush is brush zero, the panel's default, and it paints
+        // the chosen material at the chosen size, which is all it does.
+        let stroke = Stroke {
+            x: 40,
+            y: 50,
+            px: 40,
+            py: 50,
+            first: true,
+            radius: 8,
+            material: WATER,
+        };
+        plugins.run(Kind::Brush, 0, stroke).unwrap();
+        assert_eq!(
+            plugins.take_commands(),
+            [Command::Paint {
+                x: 40,
+                y: 50,
+                radius: 8,
+                material: WATER
+            }]
+        );
+
+        // The spray puts down a scatter of single cells, all within the brush.
+        plugins.run(Kind::Brush, 1, stroke).unwrap();
+        let commands = plugins.take_commands();
+        assert!(commands.len() > 1);
+        for command in commands {
+            let Command::Paint {
+                x,
+                y,
+                radius,
+                material,
+            } = command
+            else {
+                panic!("the spray only paints, but queued {command:?}");
+            };
+            assert_eq!((radius, material), (0, WATER));
+            assert!(
+                (x - 40).pow(2) + (y - 50).pow(2) <= 9 * 9,
+                "({x}, {y}) is outside the brush"
+            );
+        }
     }
 
     #[test]

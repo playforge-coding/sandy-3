@@ -21,7 +21,7 @@ use winit::window::{Window, WindowId};
 
 use crate::gpu::State;
 use crate::materials::{EMPTY, LAVA, SAND, SOIL, STONE, WATER};
-use crate::plugins::{Command, Plugins, Stroke};
+use crate::plugins::{Command, Kind, Plugins, Stroke};
 use crate::ui;
 
 /// The window size the app opens at, in logical pixels. Twice as wide as it is
@@ -241,9 +241,8 @@ impl App {
         }
 
         if self.input.drawing {
-            let brush = self.input.controls.brush;
-            let tool = self.input.controls.tool;
-            let material = self.input.controls.material;
+            let c = &self.input.controls;
+            let (tool, material, brush, radius) = (c.tool, c.material, c.brush, c.radius);
             let (gx, gy) = self
                 .state
                 .as_ref()
@@ -251,44 +250,46 @@ impl App {
                 .cursor_to_grid(self.input.cursor);
             let last = self.input.last_cell;
             self.input.last_cell = Some((gx, gy));
-            match tool {
-                ui::Tool::Paint => {
-                    let state = self.state.as_mut().unwrap();
-                    state.sim.paint_disk(gx, gy, brush, material);
-                }
+
+            // The wind tool is the one thing a stroke does in Rust. Everything
+            // else, the plain brush included, is a script: painting is the
+            // chosen brush, and a plugin tool is itself.
+            let script = match tool {
+                ui::Tool::Paint => Some((Kind::Brush, brush)),
+                ui::Tool::Plugin(index) => Some((Kind::Tool, index)),
                 ui::Tool::Wind => {
                     // Blow a gust the way the cursor has swept since the last
                     // frame. The first frame of a stroke only notes where it is.
                     if let Some((px, py)) = last {
                         let dvx = (gx - px) as f32 * WIND_DRAG_GAIN;
                         let dvy = (gy - py) as f32 * WIND_DRAG_GAIN;
-                        let radius = (brush * GUST_SCALE).max(MIN_GUST_RADIUS);
+                        let gust = (radius * GUST_SCALE).max(MIN_GUST_RADIUS);
                         let state = self.state.as_mut().unwrap();
-                        state.sim.add_wind_disk(gx, gy, radius, dvx, dvy);
+                        state.sim.add_wind_disk(gx, gy, gust, dvx, dvy);
                     }
+                    None
                 }
-                ui::Tool::Plugin(index) => {
-                    // The script gets the frame and queues what it wants done.
-                    // One that fails is put down, so a mistake in it shows on
-                    // the panel once rather than sixty times a second.
-                    let (px, py) = last.unwrap_or((gx, gy));
-                    let stroke = Stroke {
-                        x: gx,
-                        y: gy,
-                        px,
-                        py,
-                        first: last.is_none(),
-                        brush,
-                        material,
-                    };
-                    if let Err(err) = self.plugins.run_tool(index, stroke) {
-                        log::error!("plugin tool failed: {err}");
-                        self.status = err;
-                        self.input.controls.tool = ui::Tool::Paint;
-                        self.input.drawing = false;
-                    }
-                    self.apply_commands();
+            };
+            if let Some((kind, index)) = script {
+                // The script gets the frame and queues what it wants done. One
+                // that fails ends the stroke, so a mistake in it shows on the
+                // panel once rather than sixty times a second.
+                let (px, py) = last.unwrap_or((gx, gy));
+                let stroke = Stroke {
+                    x: gx,
+                    y: gy,
+                    px,
+                    py,
+                    first: last.is_none(),
+                    radius,
+                    material,
+                };
+                if let Err(err) = self.plugins.run(kind, index, stroke) {
+                    log::error!("plugin failed: {err}");
+                    self.status = err;
+                    self.input.drawing = false;
                 }
+                self.apply_commands();
             }
         }
 
@@ -298,12 +299,14 @@ impl App {
         let raw_input = self.egui_state.as_mut().unwrap().take_egui_input(&window);
         let ctx = self.egui_ctx.clone();
         let mut actions = ui::Actions::default();
-        let tools = self.plugins.tool_names();
+        let brushes = self.plugins.names(Kind::Brush);
+        let tools = self.plugins.names(Kind::Tool);
         let full_output = ctx.run_ui(raw_input, |ui| {
             actions = ui::draw(
                 ui.ctx(),
                 &mut self.input.controls,
                 &self.plugins.registry(),
+                &brushes,
                 &tools,
                 &self.status,
             );
@@ -339,8 +342,8 @@ impl App {
             KeyCode::Digit0 | KeyCode::Backspace => c.material = EMPTY,
             // The wind tool: sweep the cursor to blow a gust.
             KeyCode::KeyW => c.tool = ui::Tool::Wind,
-            KeyCode::BracketLeft => c.brush = (c.brush - 1).max(1),
-            KeyCode::BracketRight => c.brush = (c.brush + 1).min(60),
+            KeyCode::BracketLeft => c.radius = (c.radius - 1).max(1),
+            KeyCode::BracketRight => c.radius = (c.radius + 1).min(60),
             KeyCode::KeyC => {
                 if let Some(state) = &mut self.state {
                     state.sim.clear();

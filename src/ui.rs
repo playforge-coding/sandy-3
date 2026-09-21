@@ -2,25 +2,30 @@
 //!
 //! egui draws as its own pass over the finished scene (see
 //! [`crate::gpu::State::render`]), so nothing here touches the world. The panel
-//! is a material picker, the tools, and a brush size. The keyboard shortcuts in
-//! [`crate::app`] drive the very same [`Controls`], which is what keeps the two
-//! in step.
+//! is a material picker, a brush picker, the tools, and a size. The keyboard
+//! shortcuts in [`crate::app`] drive the very same [`Controls`], which is what
+//! keeps the two in step.
+//!
+//! A material and a brush are picked together: the material is what a stroke
+//! puts down and the brush is how. A tool is picked instead of them, and does
+//! something else with the cursor.
 
 use egui::{Color32, RichText, Stroke};
 
 use crate::materials::{EMPTY, MaterialId, Registry, SAND};
 
-/// What a drag does. Most of the time it paints the chosen material; the wind
-/// tool instead blows a gust the way the cursor is swept, without putting any
-/// cells down, and a plugin tool does whatever its script says.
+/// What a drag does. Most of the time it paints the chosen material with the
+/// chosen brush; the wind tool instead blows a gust the way the cursor is
+/// swept, without putting any cells down, and a plugin tool does whatever its
+/// script says.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Tool {
-    /// Paint the chosen [`Controls::material`].
+    /// Paint [`Controls::material`] with [`Controls::brush`].
     Paint,
     /// Blow wind the way the cursor sweeps.
     Wind,
-    /// A tool a plugin registered, by its position in
-    /// [`crate::plugins::Plugins::tool_names`].
+    /// A tool a plugin registered, by its position in the tool list from
+    /// [`crate::plugins::Plugins::names`].
     Plugin(usize),
 }
 
@@ -28,13 +33,18 @@ pub enum Tool {
 /// it in place each frame, and [`crate::app`] pokes the same fields from its key
 /// handler.
 pub struct Controls {
-    /// What a drag does: paint, or blow wind.
+    /// What a drag does: paint, blow wind, or run a plugin tool.
     pub tool: Tool,
-    /// The material the brush paints with, when [`Controls::tool`] is
+    /// The material a stroke paints, when [`Controls::tool`] is
     /// [`Tool::Paint`]. [`EMPTY`] is the eraser.
     pub material: MaterialId,
-    /// Brush radius, in grid cells. Doubles as the wind tool's gust radius.
-    pub brush: i32,
+    /// How a stroke paints, when [`Controls::tool`] is [`Tool::Paint`]: a
+    /// position in the brush list from [`crate::plugins::Plugins::names`].
+    /// Zero is the plain disk brush, since that is the first one built in.
+    pub brush: usize,
+    /// The size, in grid cells: the brush radius, or the wind tool's gust
+    /// radius, or whatever a plugin makes of it.
+    pub radius: i32,
 }
 
 impl Default for Controls {
@@ -42,7 +52,8 @@ impl Default for Controls {
         Self {
             tool: Tool::Paint,
             material: SAND,
-            brush: 8,
+            brush: 0,
+            radius: 8,
         }
     }
 }
@@ -56,18 +67,21 @@ pub struct Actions {
 
 /// Build the panel for this frame and report which buttons were hit.
 ///
-/// `registry` is where the material swatches come from, `tools` the names of
-/// the plugin tools in the order [`Tool::Plugin`] counts them, and `status` a
-/// line for the foot of the panel: what the last plugin drop did, or a hint.
+/// `registry` is where the material swatches come from, `brushes` and `tools`
+/// the names of the plugin brushes and tools in the order [`Controls::brush`]
+/// and [`Tool::Plugin`] count them, and `status` a line for the foot of the
+/// panel: what the last plugin drop did, or a hint.
 pub fn draw(
     ctx: &egui::Context,
     c: &mut Controls,
     registry: &Registry,
+    brushes: &[String],
     tools: &[String],
     status: &str,
 ) -> Actions {
     let mut actions = Actions::default();
     let button_size = egui::vec2(130.0, 18.0);
+    let chosen = Stroke::new(2.0, Color32::WHITE);
 
     egui::Window::new("Sandy")
         .default_pos([8.0, 8.0])
@@ -89,7 +103,7 @@ pub fn draw(
                 // Only highlight the chosen material while painting is what a
                 // drag would actually do.
                 if id == c.material && c.tool == Tool::Paint {
-                    button = button.stroke(Stroke::new(2.0, Color32::WHITE));
+                    button = button.stroke(chosen);
                 }
                 if ui.add(button).clicked() {
                     c.material = id;
@@ -97,10 +111,26 @@ pub fn draw(
                 }
             }
 
+            // The brushes go with the materials: one of each is chosen at a
+            // time, and picking either means painting.
             ui.separator();
+            ui.label("Brush");
+            for (index, name) in brushes.iter().enumerate() {
+                let mut button = egui::Button::new(name).min_size(button_size);
+                if index == c.brush && c.tool == Tool::Paint {
+                    button = button.stroke(chosen);
+                }
+                if ui.add(button).clicked() {
+                    c.brush = index;
+                    c.tool = Tool::Paint;
+                }
+            }
+
+            ui.separator();
+            ui.label("Tool");
             let mut wind = egui::Button::new("Wind").min_size(button_size);
             if c.tool == Tool::Wind {
-                wind = wind.stroke(Stroke::new(2.0, Color32::WHITE));
+                wind = wind.stroke(chosen);
             }
             if ui.add(wind).clicked() {
                 c.tool = Tool::Wind;
@@ -108,7 +138,7 @@ pub fn draw(
             for (index, name) in tools.iter().enumerate() {
                 let mut button = egui::Button::new(name).min_size(button_size);
                 if c.tool == Tool::Plugin(index) {
-                    button = button.stroke(Stroke::new(2.0, Color32::WHITE));
+                    button = button.stroke(chosen);
                 }
                 if ui.add(button).clicked() {
                     c.tool = Tool::Plugin(index);
@@ -116,12 +146,12 @@ pub fn draw(
             }
 
             ui.separator();
-            let label = if c.tool == Tool::Wind {
-                "Gust size"
-            } else {
-                "Brush"
+            let label = match c.tool {
+                Tool::Paint => "Brush size",
+                Tool::Wind => "Gust size",
+                Tool::Plugin(_) => "Size",
             };
-            ui.add(egui::Slider::new(&mut c.brush, 1..=60).text(label));
+            ui.add(egui::Slider::new(&mut c.radius, 1..=60).text(label));
 
             ui.separator();
             actions.clear |= ui

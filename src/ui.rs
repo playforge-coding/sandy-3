@@ -34,6 +34,10 @@ pub fn random_seed() -> u32 {
     fastrand::u32(..SEED_RANGE)
 }
 
+/// The smallest and largest brush the size slider offers, in cells.
+pub const MIN_RADIUS: i32 = 1;
+pub const MAX_RADIUS: i32 = 60;
+
 /// The slowest the world can be run, as a multiple of real time. Below a
 /// quarter speed sand falls so slowly it looks stuck, and pausing does that job
 /// better.
@@ -256,7 +260,7 @@ pub fn draw(
                 Tool::Wind => "Gust size",
                 Tool::Plugin(_) => "Size",
             };
-            ui.add(egui::Slider::new(&mut c.radius, 1..=60).text(label));
+            ui.add(egui::Slider::new(&mut c.radius, MIN_RADIUS..=MAX_RADIUS).text(label));
 
             // Time. The speed slider is logarithmic so that half speed and
             // double speed sit the same distance either side of one.

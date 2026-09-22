@@ -1,5 +1,7 @@
 //! The entry point. Everything else is in the library.
 
-fn main() {
-    sandy_3::run();
+use std::process::ExitCode;
+
+fn main() -> ExitCode {
+    sandy_3::run()
 }

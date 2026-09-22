@@ -157,12 +157,28 @@ impl ImageFormat {
         }
     }
 
-    fn extension(self) -> &'static str {
+    pub fn extension(self) -> &'static str {
         match self {
             ImageFormat::Png => "png",
             ImageFormat::WebP => "webp",
         }
     }
+
+    /// The format a path's extension asks for, in any case, or `None` if it
+    /// is not one a screenshot can be saved as.
+    pub fn from_path(path: &Path) -> Option<Self> {
+        match extension_of(path)?.as_str() {
+            "png" => Some(ImageFormat::Png),
+            "webp" => Some(ImageFormat::WebP),
+            _ => None,
+        }
+    }
+}
+
+/// A path's extension, lowercased.
+fn extension_of(path: &Path) -> Option<String> {
+    path.extension()
+        .map(|ext| ext.to_string_lossy().to_ascii_lowercase())
 }
 
 /// What a recording is saved as. All three are lossless in themselves; the
@@ -192,11 +208,22 @@ impl AnimationFormat {
         }
     }
 
-    fn extension(self) -> &'static str {
+    pub fn extension(self) -> &'static str {
         match self {
             AnimationFormat::Gif => "gif",
             AnimationFormat::Apng => "png",
             AnimationFormat::WebP => "webp",
+        }
+    }
+
+    /// The format a path's extension asks for, in any case, or `None` if it
+    /// is not one a recording can be saved as. A `.png` is an animated PNG.
+    pub fn from_path(path: &Path) -> Option<Self> {
+        match extension_of(path)?.as_str() {
+            "gif" => Some(AnimationFormat::Gif),
+            "png" => Some(AnimationFormat::Apng),
+            "webp" => Some(AnimationFormat::WebP),
+            _ => None,
         }
     }
 }
@@ -216,6 +243,28 @@ fn write_still<W: Write>(w: W, frame: &Frame, format: ImageFormat) -> io::Result
         ImageFormat::Png => png::write_still(w, frame),
         ImageFormat::WebP => webp::write_still(w, frame),
     }
+}
+
+/// Save one frame as a still at `path`, in the format its extension asks
+/// for, making the directory if it is missing. This is the screenshot a
+/// script takes: written here and now, so the file is there when the call
+/// returns, where the panel's goes to a thread.
+pub fn save_still(path: &Path, frame: &Frame) -> io::Result<()> {
+    let format = ImageFormat::from_path(path).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "a screenshot is saved as .png or .webp",
+        )
+    })?;
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut file = BufWriter::new(File::create(path)?);
+    write_still(&mut file, frame, format)?;
+    file.flush()
 }
 
 /// Open an animation writer for `format` on `w`, for frames of `width` by
@@ -306,8 +355,12 @@ pub struct Wanted {
     pub record: Option<Instant>,
 }
 
-/// What the encoder threads say when they are done: a line for the panel.
-pub struct Report(pub String);
+/// What the encoder threads say when they are done: a line for the panel,
+/// and whether the file was written.
+pub struct Report {
+    pub line: String,
+    pub ok: bool,
+}
 
 enum Message {
     Frame(Frame, Instant),
@@ -370,18 +423,65 @@ impl Capture {
             .map(|rec| now.saturating_duration_since(rec.started))
     }
 
+    /// Whether a recording is running, or still being finished.
+    pub fn is_recording(&self) -> bool {
+        self.recording.is_some()
+    }
+
+    /// A path in the captures folder that nothing is at yet, with
+    /// `extension` on the end, making the folder if it is missing.
+    pub fn fresh_file(&self, extension: &str) -> io::Result<PathBuf> {
+        std::fs::create_dir_all(&self.dir)?;
+        Ok(fresh_path(&self.dir, extension))
+    }
+
     /// Start a recording in `format`, or stop the one that is running. Says
     /// what it did, for the panel.
     pub fn toggle_recording(&mut self, format: AnimationFormat, now: Instant) -> String {
-        if let Some(rec) = &mut self.recording {
-            rec.stopping = true;
-            self.finish_stopping();
+        if self.stop_recording().is_some() {
             return "Finishing the recording.".to_string();
         }
-        if let Err(err) = std::fs::create_dir_all(&self.dir) {
-            return format!("Could not make {}: {err}", self.dir.display());
+        match self.start_recording(None, format, now) {
+            Ok(path) => format!(
+                "Recording to {}. Press V or Stop to finish.",
+                path.display()
+            ),
+            Err(err) => err,
         }
-        let path = fresh_path(&self.dir, format.extension());
+    }
+
+    /// Start a recording to `path`, in the format its extension asks for, or
+    /// to a fresh file in the captures folder in `format`. `now` is when it
+    /// starts, which the frames are timed from. Gives back where it is going.
+    pub fn start_recording(
+        &mut self,
+        path: Option<PathBuf>,
+        format: AnimationFormat,
+        now: Instant,
+    ) -> Result<PathBuf, String> {
+        if let Some(rec) = &self.recording {
+            return Err(format!(
+                "a recording is already running, to {}",
+                rec.path.display()
+            ));
+        }
+        let (path, format) = match path {
+            Some(path) => {
+                let format = AnimationFormat::from_path(&path)
+                    .ok_or("a recording is saved as .webp, .gif or .png")?;
+                if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+                    std::fs::create_dir_all(parent)
+                        .map_err(|err| format!("could not make {}: {err}", parent.display()))?;
+                }
+                (path, format)
+            }
+            None => {
+                let path = self
+                    .fresh_file(format.extension())
+                    .map_err(|err| format!("could not make {}: {err}", self.dir.display()))?;
+                (path, format)
+            }
+        };
         let (tx, rx) = mpsc::channel();
         let report = self.report.clone();
         let thread_path = path.clone();
@@ -393,10 +493,30 @@ impl Capture {
             cadence: Cadence::new(now),
             stopping: false,
         });
-        format!(
-            "Recording to {}. Press V or Stop to finish.",
-            path.display()
-        )
+        Ok(path)
+    }
+
+    /// Stop the recording, if one is running, and say where it is going. The
+    /// file is finished once the frames still on their way back from the GPU
+    /// have arrived, and the thread reports when it is done.
+    pub fn stop_recording(&mut self) -> Option<PathBuf> {
+        let rec = self.recording.as_mut()?;
+        rec.stopping = true;
+        let path = rec.path.clone();
+        self.finish_stopping();
+        Some(path)
+    }
+
+    /// Wait for the next thing an encoder thread has to say: what a headless
+    /// script does after stopping a recording, so the file is finished by the
+    /// time the script carries on. The line, as an error if the file was not
+    /// written.
+    pub fn wait_report(&mut self) -> Result<String, String> {
+        match self.reports.recv() {
+            Ok(Report { line, ok: true }) => Ok(line),
+            Ok(Report { line, ok: false }) => Err(line),
+            Err(_) => Err("nothing was being written".to_string()),
+        }
     }
 
     /// Whether the frame about to be drawn at `now` should be copied out, and
@@ -455,7 +575,10 @@ impl Capture {
 
     /// Whatever the encoder threads have finished saying since last time.
     pub fn reports(&mut self) -> Vec<String> {
-        self.reports.try_iter().map(|Report(line)| line).collect()
+        self.reports
+            .try_iter()
+            .map(|Report { line, .. }| line)
+            .collect()
     }
 
     /// Encode `frame` on a thread and report the file it went to.
@@ -470,11 +593,12 @@ impl Capture {
                 file.flush()?;
                 Ok(path)
             });
+            let ok = result.is_ok();
             let line = match result {
                 Ok(path) => format!("Saved {}.", path.display()),
                 Err(err) => format!("Screenshot failed: {err}"),
             };
-            let _ = report.send(Report(line));
+            let _ = report.send(Report { line, ok });
         });
     }
 
@@ -552,6 +676,7 @@ fn record(
         }
         Ok((count, shown))
     })();
+    let ok = result.is_ok();
     let line = match result {
         Ok((0, _)) => "The recording had no frames, so nothing was saved.".to_string(),
         Ok((count, shown)) => {
@@ -572,7 +697,7 @@ fn record(
             format!("Recording failed: {err}")
         }
     };
-    let _ = report.send(Report(line));
+    let _ = report.send(Report { line, ok });
 }
 
 #[cfg(test)]
@@ -674,6 +799,85 @@ mod tests {
             };
             assert_eq!(decoded, frame.rgb, "{}", format.name());
         }
+    }
+
+    #[test]
+    fn a_format_is_read_off_the_extension() {
+        assert_eq!(
+            ImageFormat::from_path(Path::new("a/b.PNG")),
+            Some(ImageFormat::Png)
+        );
+        assert_eq!(
+            ImageFormat::from_path(Path::new("shot.webp")),
+            Some(ImageFormat::WebP)
+        );
+        assert_eq!(ImageFormat::from_path(Path::new("shot.gif")), None);
+        assert_eq!(ImageFormat::from_path(Path::new("shot")), None);
+        assert_eq!(
+            AnimationFormat::from_path(Path::new("clip.gif")),
+            Some(AnimationFormat::Gif)
+        );
+        assert_eq!(
+            AnimationFormat::from_path(Path::new("clip.png")),
+            Some(AnimationFormat::Apng)
+        );
+        assert_eq!(
+            AnimationFormat::from_path(Path::new("clip.webp")),
+            Some(AnimationFormat::WebP)
+        );
+        assert_eq!(AnimationFormat::from_path(Path::new("clip.mp4")), None);
+    }
+
+    #[test]
+    fn a_still_is_saved_where_asked_and_a_bad_extension_is_refused() {
+        let dir = std::env::temp_dir().join(format!("sandy-still-test-{}", std::process::id()));
+        let frame = test_frame(9, 7, 1);
+        let path = dir.join("nested").join("shot.png");
+        save_still(&path, &frame).unwrap();
+        assert!(path.exists(), "the directory was made and the file written");
+        let err = save_still(&dir.join("shot.bmp"), &frame).unwrap_err();
+        assert!(err.to_string().contains(".png"), "{err}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_recording_can_be_started_at_a_path_and_stopped() {
+        let dir = std::env::temp_dir().join(format!("sandy-record-test-{}", std::process::id()));
+        let now = Instant::now();
+        let mut capture = Capture::default();
+        assert!(!capture.is_recording());
+        assert!(capture.stop_recording().is_none());
+        let err = capture
+            .start_recording(Some(dir.join("clip.mp4")), AnimationFormat::WebP, now)
+            .unwrap_err();
+        assert!(err.contains(".webp"), "{err}");
+
+        let path = dir.join("clip.gif");
+        let started = capture
+            .start_recording(Some(path.clone()), AnimationFormat::WebP, now)
+            .unwrap();
+        assert_eq!(started, path);
+        assert!(capture.is_recording());
+        assert!(
+            capture
+                .start_recording(None, AnimationFormat::WebP, now)
+                .is_err(),
+            "one at a time"
+        );
+        // Two frames, delivered as the GPU would deliver them.
+        for i in 0..2 {
+            let at = now + Duration::from_millis(40 * i);
+            let wanted = capture.plan(at).expect("a frame is due");
+            capture.taken(wanted);
+            capture.deliver(test_frame(9, 7, i as u8));
+        }
+        assert_eq!(capture.stop_recording(), Some(path.clone()));
+        let line = capture.wait_report().unwrap();
+        assert!(line.starts_with("Saved"), "{line}");
+        assert!(!capture.is_recording());
+        let bytes = std::fs::read(&path).unwrap();
+        assert!(bytes.starts_with(b"GIF89a"));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

@@ -16,6 +16,11 @@
 //! Screenshots and recordings go through [`crate::capture`]: each frame, it
 //! is asked whether the scene should be copied out, and the frames that come
 //! back are handed to it to save.
+//!
+//! A control script given on the command line (see [`crate::scripting`]) is
+//! started once the world is built and advanced at the top of every frame,
+//! so what it did shows in that frame, and a frame it asked to let go by is
+//! a real one.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -30,17 +35,14 @@ use winit::window::{Window, WindowId};
 use crate::capture::Capture;
 use crate::gpu::State;
 use crate::materials::{EMPTY, MaterialId};
-use crate::plugins::{Command, Kind, Plugins, Stroke};
+use crate::plugins::{Kind, PLUGIN_DIR, Plugins, Stroke};
+use crate::scripting::{Host, Script, Status};
+use crate::sim::Simulation;
 use crate::ui;
 
 /// The window size the app opens at, in logical pixels. Twice as wide as it is
 /// tall, matching the grid, so nothing is stretched out of shape at the start.
 const WINDOW_SIZE: (f64, f64) = (1100.0, 620.0);
-
-/// Where the user's own plugins are looked for at startup, relative to the
-/// working directory. Every `.lua` file in it is loaded, in name order, after
-/// the built-in ones.
-const PLUGIN_DIR: &str = "plugins";
 
 /// What the foot of the panel says when there is nothing more recent to say.
 const DROP_HINT: &str = "Drop a .lua file on the window to load a plugin.";
@@ -60,6 +62,16 @@ const GUST_SCALE: i32 = 3;
 /// The smallest gust the wind tool blows, whatever the brush is set to, so even
 /// a fine brush moves something when it is used as a fan.
 const MIN_GUST_RADIUS: i32 = 30;
+
+/// One frame of the wind tool: blow a gust the way the cursor has swept, from
+/// `from` to `to` since the last frame, with the brush at `radius`. A script
+/// sweeping the tool goes through the same function as the mouse.
+pub(crate) fn wind_tool(sim: &mut Simulation, from: (i32, i32), to: (i32, i32), radius: i32) {
+    let dvx = (to.0 - from.0) as f32 * WIND_DRAG_GAIN;
+    let dvy = (to.1 - from.1) as f32 * WIND_DRAG_GAIN;
+    let gust = (radius * GUST_SCALE).max(MIN_GUST_RADIUS);
+    sim.add_wind_disk(to.0, to.1, gust, dvx, dvy);
+}
 
 /// Where the mouse is and what it is doing, plus the [`ui::Controls`] the panel
 /// and the shortcuts share.
@@ -105,10 +117,19 @@ struct App {
     egui_ctx: egui::Context,
     /// Per-window input translation for egui, built once the window exists.
     egui_state: Option<egui_winit::State>,
+    /// A control script from the command line, as its name and its text,
+    /// waiting for the world to exist so it can be started.
+    script_text: Option<(String, String)>,
+    /// The control script running, if one is.
+    script: Option<Script>,
+    /// The script asked for the window to close.
+    quit: bool,
 }
 
-impl Default for App {
-    fn default() -> Self {
+impl App {
+    /// An app that will run `script`, a name and the text, once its window
+    /// and world are up.
+    fn new(script: Option<(String, String)>) -> Self {
         Self {
             state: None,
             input: Input::default(),
@@ -117,11 +138,12 @@ impl Default for App {
             status: DROP_HINT.to_string(),
             egui_ctx: egui::Context::default(),
             egui_state: None,
+            script_text: script,
+            script: None,
+            quit: false,
         }
     }
-}
 
-impl App {
     /// Build the bridge between egui and winit, once the GPU state and so the
     /// window exist. Doing nothing if it is already built, or if it cannot be
     /// built yet, keeps this safe to call more than once.
@@ -170,6 +192,21 @@ impl ApplicationHandler for App {
         // Open on a landscape, as long as some plugin has provided one.
         if !self.plugins.world_names().is_empty() {
             self.generate();
+        }
+        // The script goes last, so it finds the world it would see on the
+        // screen. Its first requests are answered on the first frame.
+        if let Some((name, source)) = self.script_text.take() {
+            match Script::start(&self.plugins, &name, &source) {
+                Ok(script) => {
+                    log::info!("running script {name}");
+                    self.status = format!("Running {name}.");
+                    self.script = Some(script);
+                }
+                Err(err) => {
+                    log::error!("script {name} failed: {err}");
+                    self.status = err;
+                }
+            }
         }
     }
 
@@ -240,7 +277,12 @@ impl ApplicationHandler for App {
                 }
             }
 
-            WindowEvent::RedrawRequested => self.redraw(),
+            WindowEvent::RedrawRequested => {
+                self.redraw();
+                if self.quit {
+                    event_loop.exit();
+                }
+            }
 
             _ => {}
         }
@@ -262,6 +304,10 @@ impl App {
             return;
         }
 
+        // The script first, so whatever it does is in this frame, and a
+        // frame it lets go by is the whole of one.
+        self.advance_script();
+
         if self.input.drawing {
             let c = &self.input.controls;
             let (tool, material, brush, radius) = (c.tool, c.material, c.brush, c.radius);
@@ -282,12 +328,9 @@ impl App {
                 ui::Tool::Wind => {
                     // Blow a gust the way the cursor has swept since the last
                     // frame. The first frame of a stroke only notes where it is.
-                    if let Some((px, py)) = last {
-                        let dvx = (gx - px) as f32 * WIND_DRAG_GAIN;
-                        let dvy = (gy - py) as f32 * WIND_DRAG_GAIN;
-                        let gust = (radius * GUST_SCALE).max(MIN_GUST_RADIUS);
+                    if let Some(from) = last {
                         let state = self.state.as_mut().unwrap();
-                        state.sim.add_wind_disk(gx, gy, gust, dvx, dvy);
+                        wind_tool(&mut state.sim, from, (gx, gy), radius);
                     }
                     None
                 }
@@ -380,13 +423,47 @@ impl App {
             if let (true, Some(wanted)) = (captured, wanted) {
                 self.capture.taken(wanted);
             }
-            for frame in state.take_frames() {
+            for frame in state.renderer.take_frames() {
                 self.capture.deliver(frame);
             }
         }
         for line in self.capture.reports() {
             log::info!("{line}");
             self.status = line;
+        }
+    }
+
+    /// Give the control script its turn: answer what it asks until it is done
+    /// with this frame, or with everything.
+    fn advance_script(&mut self) {
+        let (Some(script), Some(state)) = (&mut self.script, &mut self.state) else {
+            return;
+        };
+        let mut host = Host {
+            plugins: &mut self.plugins,
+            sim: &mut state.sim,
+            renderer: &mut state.renderer,
+            capture: &mut self.capture,
+            controls: &mut self.input.controls,
+            clock: None,
+        };
+        match script.advance(&mut host) {
+            Status::Running => {}
+            Status::Finished => {
+                log::info!("script finished");
+                self.status = format!("Script finished. {DROP_HINT}");
+                self.script = None;
+            }
+            Status::Quit => {
+                log::info!("script asked to quit");
+                self.script = None;
+                self.quit = true;
+            }
+            Status::Failed(err) => {
+                log::error!("script failed: {err}");
+                self.status = err;
+                self.script = None;
+            }
         }
     }
 
@@ -435,8 +512,8 @@ impl App {
         match code {
             // The wind tool: sweep the cursor to blow a gust.
             KeyCode::KeyW => c.tool = ui::Tool::Wind,
-            KeyCode::BracketLeft => c.radius = (c.radius - 1).max(1),
-            KeyCode::BracketRight => c.radius = (c.radius + 1).min(60),
+            KeyCode::BracketLeft => c.radius = (c.radius - 1).max(ui::MIN_RADIUS),
+            KeyCode::BracketRight => c.radius = (c.radius + 1).min(ui::MAX_RADIUS),
             // Time: freeze the world, nudge it one tick, or run it slower or
             // faster.
             KeyCode::Space => c.paused = !c.paused,
@@ -483,30 +560,27 @@ impl App {
         self.generate();
     }
 
-    /// Load every `.lua` file in [`PLUGIN_DIR`], in name order. No folder is
-    /// not a problem; a script that fails is logged and the rest still load.
+    /// Load the user's plugins from [`PLUGIN_DIR`], and say on the panel how
+    /// many there were, or what went wrong with the last one that failed.
     fn load_plugin_dir(&mut self) {
-        let Ok(entries) = std::fs::read_dir(PLUGIN_DIR) else {
+        let loaded = self.plugins.load_dir();
+        if loaded.is_empty() {
             return;
-        };
-        let mut paths: Vec<_> = entries
-            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
-            .filter(|path| path.extension().is_some_and(|ext| ext == "lua"))
-            .collect();
-        paths.sort();
-        for path in &paths {
-            self.load_plugin(path);
         }
-        if !paths.is_empty() {
-            self.status = format!(
-                "Loaded {} from {PLUGIN_DIR}/. {DROP_HINT}",
-                if paths.len() == 1 {
-                    "1 plugin".to_string()
-                } else {
-                    format!("{} plugins", paths.len())
-                }
-            );
-        }
+        self.status =
+            match loaded.iter().rev().find_map(|(label, result)| {
+                result.as_ref().err().map(|err| format!("{label}: {err}"))
+            }) {
+                Some(failure) => failure,
+                None => format!(
+                    "Loaded {} from {PLUGIN_DIR}/. {DROP_HINT}",
+                    if loaded.len() == 1 {
+                        "1 plugin".to_string()
+                    } else {
+                        format!("{} plugins", loaded.len())
+                    }
+                ),
+            };
     }
 
     /// Run one script, put what it registered into the world, and say on the
@@ -541,29 +615,14 @@ impl App {
             return;
         };
         for command in self.plugins.take_commands() {
-            match command {
-                Command::Paint {
-                    x,
-                    y,
-                    radius,
-                    material,
-                } => state.sim.paint_disk(x, y, radius, material),
-                Command::Wind {
-                    x,
-                    y,
-                    radius,
-                    dvx,
-                    dvy,
-                } => state.sim.add_wind_disk(x, y, radius, dvx, dvy),
-            }
+            command.apply(&mut state.sim);
         }
     }
 }
 
-/// Open the window and run until it closes.
-pub fn run() {
-    env_logger::init();
-
+/// Open the window and run until it closes, with `script`, a name and its
+/// text, running in it if there is one.
+pub fn run(script: Option<(String, String)>) {
     log::info!(
         "Controls: use the panel, or press 1-9 to pick a material in picker order \
          (1=Sand 2=Stone 3=Water 4=Lava 5=Soil, then the plugin materials)  0/Backspace=Erase  \
@@ -577,6 +636,6 @@ pub fn run() {
 
     let event_loop = EventLoop::new().expect("build event loop");
     event_loop.set_control_flow(ControlFlow::Poll);
-    let mut app = App::default();
+    let mut app = App::new(script);
     event_loop.run_app(&mut app).expect("run event loop");
 }

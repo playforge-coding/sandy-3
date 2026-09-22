@@ -6,6 +6,12 @@
 //! glowing pixels out of it and blur them twice, then put the two together on
 //! the window with the control panel over the top.
 //!
+//! The first three passes need no window, and nor does the capture below, so
+//! they live in [`Renderer`] on their own. [`State`] is the rest: the surface,
+//! the composite onto it, and the panel. A headless script (see
+//! [`crate::headless`]) has a [`Renderer`] and no [`State`], which is how it
+//! takes a screenshot that looks exactly as the window would.
+//!
 //! The glow buffers stay at the grid's resolution. They are small, and a halo is
 //! soft anyway, so only the surface is reconfigured when the window changes size.
 //!
@@ -13,8 +19,9 @@
 //! the composite drawn again, at the grid's resolution and without the panel,
 //! into an image that is then copied out to a buffer the CPU can map. The
 //! mapping is left to complete on its own and collected by
-//! [`State::take_frames`] a frame or two later, so a recording does not hold
-//! the frame up waiting on the GPU.
+//! [`Renderer::take_frames`] a frame or two later, so a recording does not
+//! hold the frame up waiting on the GPU. A script wants its screenshot in hand
+//! before it carries on, so [`Renderer::frame_now`] does the same and waits.
 
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -35,6 +42,10 @@ const GLOW_SPREAD: f32 = 1.5;
 const CAPTURE_ROW_BYTES: u32 =
     (GRID_W * 4).div_ceil(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT) * wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
 
+/// The format the offscreen images are drawn in. sRGB whatever the window
+/// turns out to be, so the blur adds light rather than adding byte values.
+const OFFSCREEN_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
+
 /// A captured frame on its way back: the buffer the GPU is copying it into,
 /// and where the mapping says when it is ready to read.
 struct Readback {
@@ -48,27 +59,27 @@ struct Readback {
 /// is stepped. Keeping that separate from the frame rate (see [`State::update`])
 /// is what makes the world run at the same pace on a 60 Hz monitor and a 144 Hz
 /// one; a fast display just draws the same grid more than once between ticks.
-const TICKS_PER_SECOND: f64 = 60.0;
+pub const TICKS_PER_SECOND: f64 = 60.0;
 
 /// Real seconds one tick stands for.
-const TICK_DT: f64 = 1.0 / TICKS_PER_SECOND;
+pub const TICK_DT: f64 = 1.0 / TICKS_PER_SECOND;
 
 /// The most real time a single frame may put into the tick accumulator. Without
 /// it, one long stall would bank a huge backlog and the next frame would try to
 /// run all of it at once. Dropping the missed time instead is the usual answer.
 const MAX_FRAME_TIME: f64 = 0.25;
 
-pub struct State {
-    window: Arc<Window>,
-    surface: wgpu::Surface<'static>,
+/// The offscreen half of the drawing: the world lit and bloomed at the grid's
+/// own resolution, and the copy of that picture out to main memory. Nothing
+/// here touches a window, so a headless run has one of these and nothing else.
+pub struct Renderer {
     device: wgpu::Device,
     queue: wgpu::Queue,
-    config: wgpu::SurfaceConfiguration,
 
     pipeline_scene: wgpu::RenderPipeline,
     pipeline_blur_h: wgpu::RenderPipeline,
     pipeline_blur_v: wgpu::RenderPipeline,
-    pipeline_composite: wgpu::RenderPipeline,
+    pipeline_capture: wgpu::RenderPipeline,
 
     bg_scene: wgpu::BindGroup,
     bg_blur_h: wgpu::BindGroup,
@@ -76,6 +87,12 @@ pub struct State {
     bg_blur_v: wgpu::BindGroup,
     bg_blur_v_step: wgpu::BindGroup,
     bg_composite: wgpu::BindGroup,
+
+    /// What a composite pipeline needs, kept so [`State`] can build the one
+    /// that draws onto its window in whatever format the surface turns out
+    /// to be.
+    bloom_shader: wgpu::ShaderModule,
+    composite_layout: wgpu::PipelineLayout,
 
     scene_view: wgpu::TextureView,
     glow_a_view: wgpu::TextureView,
@@ -85,11 +102,21 @@ pub struct State {
     /// a plain format whose bytes are the sRGB values a file wants.
     capture_texture: wgpu::Texture,
     capture_view: wgpu::TextureView,
-    pipeline_capture: wgpu::RenderPipeline,
     /// Captured frames the GPU is still copying out, oldest first, and the
     /// staging buffers that have been read and can be used again.
     readbacks: VecDeque<Readback>,
     spare_staging: Vec<wgpu::Buffer>,
+}
+
+pub struct State {
+    window: Arc<Window>,
+    surface: wgpu::Surface<'static>,
+    device: wgpu::Device,
+    queue: wgpu::Queue,
+    config: wgpu::SurfaceConfiguration,
+
+    /// Scene plus glow, onto the window.
+    pipeline_composite: wgpu::RenderPipeline,
 
     /// egui's wgpu backend, which turns the tessellated panel into draw calls
     /// layered over the finished scene.
@@ -102,6 +129,7 @@ pub struct State {
     tick_accumulator: f64,
 
     pub sim: Simulation,
+    pub renderer: Renderer,
 }
 
 /// Pack the sixteen-byte blur uniform: a per-tap UV offset, padded out to a
@@ -113,78 +141,85 @@ fn blur_step_bytes(step_x: f32, step_y: f32) -> [u8; 16] {
     bytes
 }
 
-impl State {
-    /// Bring up the GPU and build a world that knows the materials in
-    /// `registry`. Later changes to the registry go through
-    /// [`Simulation::set_tables`].
-    pub async fn new(window: Arc<Window>, registry: &Registry) -> State {
-        let size = window.inner_size();
-        let width = size.width.max(1);
-        let height = size.height.max(1);
+/// A pipeline that draws one fullscreen triangle with `fs_entry` into a
+/// `target` of the given format. Every pass here is one of these; they differ
+/// only in their shader, entry point and target.
+fn fullscreen_pipeline(
+    device: &wgpu::Device,
+    label: &str,
+    module: &wgpu::ShaderModule,
+    layout: &wgpu::PipelineLayout,
+    fs_entry: &str,
+    target: wgpu::TextureFormat,
+) -> wgpu::RenderPipeline {
+    device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some(label),
+        layout: Some(layout),
+        vertex: wgpu::VertexState {
+            module,
+            entry_point: Some("vs_main"),
+            buffers: &[],
+            compilation_options: Default::default(),
+        },
+        fragment: Some(wgpu::FragmentState {
+            module,
+            entry_point: Some(fs_entry),
+            targets: &[Some(wgpu::ColorTargetState {
+                format: target,
+                blend: Some(wgpu::BlendState::REPLACE),
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+            compilation_options: Default::default(),
+        }),
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            ..Default::default()
+        },
+        depth_stencil: None,
+        multisample: wgpu::MultisampleState::default(),
+        multiview_mask: None,
+        cache: None,
+    })
+}
 
-        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
-            backends: wgpu::Backends::all(),
-            ..wgpu::InstanceDescriptor::new_without_display_handle()
-        });
+/// One fullscreen pass into `target`. Group one is optional; only the blurs
+/// have anything to put there.
+fn fullscreen_pass(
+    encoder: &mut wgpu::CommandEncoder,
+    label: &str,
+    target: &wgpu::TextureView,
+    pipeline: &wgpu::RenderPipeline,
+    bg0: &wgpu::BindGroup,
+    bg1: Option<&wgpu::BindGroup>,
+) {
+    let mut rp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+        label: Some(label),
+        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+            view: target,
+            resolve_target: None,
+            depth_slice: None,
+            ops: wgpu::Operations {
+                load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                store: wgpu::StoreOp::Store,
+            },
+        })],
+        depth_stencil_attachment: None,
+        timestamp_writes: None,
+        occlusion_query_set: None,
+        multiview_mask: None,
+    });
+    rp.set_pipeline(pipeline);
+    rp.set_bind_group(0, bg0, &[]);
+    if let Some(bg1) = bg1 {
+        rp.set_bind_group(1, bg1, &[]);
+    }
+    rp.draw(0..3, 0..1);
+}
 
-        // An `Arc<Window>` gives a 'static surface that keeps the window alive.
-        let surface = instance
-            .create_surface(window.clone())
-            .expect("create surface");
-
-        let adapter = instance
-            .request_adapter(&wgpu::RequestAdapterOptions {
-                power_preference: wgpu::PowerPreference::HighPerformance,
-                compatible_surface: Some(&surface),
-                ..Default::default()
-            })
-            .await
-            .expect(
-                "no suitable GPU adapter found. This needs a GPU with compute shaders, so Vulkan, \
-                 Metal or D3D12",
-            );
-
-        let (device, queue) = adapter
-            .request_device(&wgpu::DeviceDescriptor {
-                label: Some("sandy device"),
-                required_features: wgpu::Features::empty(),
-                required_limits: wgpu::Limits::default(),
-                ..Default::default()
-            })
-            .await
-            .expect("request device");
-
-        let caps = surface.get_capabilities(&adapter);
-        // Prefer a surface in gamma space, which is the one egui asks for and
-        // warns about not getting. The offscreen images this draws through are
-        // sRGB whatever the window turns out to be, so the blur still adds
-        // light rather than adding byte values; the composite is what puts the
-        // result back into the space the window wants (see `bloom.wgsl`).
-        let format = caps
-            .formats
-            .iter()
-            .copied()
-            .find(|f| !f.is_srgb())
-            .unwrap_or(caps.formats[0]);
-        let tex_format = wgpu::TextureFormat::Rgba8UnormSrgb;
-
-        let config = wgpu::SurfaceConfiguration {
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-            format,
-            // Plain sRGB, standard dynamic range: the space the composite pass
-            // already writes into. `Auto` picks exactly that for these formats.
-            color_space: wgpu::SurfaceColorSpace::Auto,
-            width,
-            height,
-            present_mode: wgpu::PresentMode::Fifo, // vsync, supported everywhere
-            alpha_mode: caps.alpha_modes[0],
-            view_formats: vec![],
-            desired_maximum_frame_latency: 2,
-        };
-        surface.configure(&device, &config);
-
-        let sim = Simulation::new(&device, &queue, registry);
-
+impl Renderer {
+    /// The offscreen passes over `sim`'s buffers. The bind groups hold those
+    /// buffers, and the simulation never replaces them, so this is built once.
+    pub fn new(device: &wgpu::Device, queue: &wgpu::Queue, sim: &Simulation) -> Self {
         // ---- Offscreen targets, all at the grid's own resolution ----
         let offscreen = |label: &str| {
             device
@@ -198,7 +233,7 @@ impl State {
                     mip_level_count: 1,
                     sample_count: 1,
                     dimension: wgpu::TextureDimension::D2,
-                    format: tex_format,
+                    format: OFFSCREEN_FORMAT,
                     usage: wgpu::TextureUsages::RENDER_ATTACHMENT
                         | wgpu::TextureUsages::TEXTURE_BINDING,
                     view_formats: &[],
@@ -435,88 +470,341 @@ impl State {
         let blur_layout = pipeline_layout("blur layout", &[Some(&bgl_in), Some(&bgl_step)]);
         let composite_layout = pipeline_layout("composite layout", &[Some(&bgl_composite)]);
 
-        // The four pipelines differ only in their shader, entry point and target.
-        let make_pipeline = |label: &str,
-                             module: &wgpu::ShaderModule,
-                             layout: &wgpu::PipelineLayout,
-                             fs_entry: &str,
-                             target: wgpu::TextureFormat| {
-            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some(label),
-                layout: Some(layout),
-                vertex: wgpu::VertexState {
-                    module,
-                    entry_point: Some("vs_main"),
-                    buffers: &[],
-                    compilation_options: Default::default(),
-                },
-                fragment: Some(wgpu::FragmentState {
-                    module,
-                    entry_point: Some(fs_entry),
-                    targets: &[Some(wgpu::ColorTargetState {
-                        format: target,
-                        blend: Some(wgpu::BlendState::REPLACE),
-                        write_mask: wgpu::ColorWrites::ALL,
-                    })],
-                    compilation_options: Default::default(),
-                }),
-                primitive: wgpu::PrimitiveState {
-                    topology: wgpu::PrimitiveTopology::TriangleList,
-                    ..Default::default()
-                },
-                depth_stencil: None,
-                multisample: wgpu::MultisampleState::default(),
-                multiview_mask: None,
-                cache: None,
-            })
-        };
-
-        let pipeline_scene = make_pipeline(
+        let pipeline_scene = fullscreen_pipeline(
+            device,
             "scene",
             &scene_shader,
             &scene_layout,
             "fs_scene",
-            tex_format,
+            OFFSCREEN_FORMAT,
         );
-        let pipeline_blur_h = make_pipeline(
+        let pipeline_blur_h = fullscreen_pipeline(
+            device,
             "blur h",
             &bloom_shader,
             &blur_layout,
             "fs_blur_h",
-            tex_format,
+            OFFSCREEN_FORMAT,
         );
-        let pipeline_blur_v = make_pipeline(
+        let pipeline_blur_v = fullscreen_pipeline(
+            device,
             "blur v",
             &bloom_shader,
             &blur_layout,
             "fs_blur_v",
-            tex_format,
+            OFFSCREEN_FORMAT,
         );
-        // The composite has to end up in whatever space the window is in, and
-        // only one of the two needs the encoding done by hand, so the choice is
-        // which entry point to build the pipeline from.
-        let composite_entry = if format.is_srgb() {
-            "fs_composite_linear"
-        } else {
-            "fs_composite"
-        };
-        let pipeline_composite = make_pipeline(
-            "composite",
-            &bloom_shader,
-            &composite_layout,
-            composite_entry,
-            config.format,
-        );
-        // The capture is the same composite into a plain, non-sRGB image, so
-        // it always takes the entry point that encodes by hand, whatever the
-        // window does.
-        let pipeline_capture = make_pipeline(
+        // The capture is the composite into a plain, non-sRGB image, so it
+        // always takes the entry point that encodes by hand, whatever a
+        // window would do.
+        let pipeline_capture = fullscreen_pipeline(
+            device,
             "capture",
             &bloom_shader,
             &composite_layout,
             "fs_composite",
             wgpu::TextureFormat::Rgba8Unorm,
         );
+
+        Renderer {
+            device: device.clone(),
+            queue: queue.clone(),
+            pipeline_scene,
+            pipeline_blur_h,
+            pipeline_blur_v,
+            pipeline_capture,
+            bg_scene,
+            bg_blur_h,
+            bg_blur_h_step,
+            bg_blur_v,
+            bg_blur_v_step,
+            bg_composite,
+            bloom_shader,
+            composite_layout,
+            scene_view,
+            glow_a_view,
+            glow_b_view,
+            capture_texture,
+            capture_view,
+            readbacks: VecDeque::new(),
+            spare_staging: Vec::new(),
+        }
+    }
+
+    /// A pipeline that puts the scene and its glow onto a window in `format`.
+    /// The composite has to end up in whatever space the window is in, and
+    /// only one of the two needs the encoding done by hand, so the choice is
+    /// which entry point to build the pipeline from (see `bloom.wgsl`).
+    pub fn window_pipeline(&self, format: wgpu::TextureFormat) -> wgpu::RenderPipeline {
+        let entry = if format.is_srgb() {
+            "fs_composite_linear"
+        } else {
+            "fs_composite"
+        };
+        fullscreen_pipeline(
+            &self.device,
+            "composite",
+            &self.bloom_shader,
+            &self.composite_layout,
+            entry,
+            format,
+        )
+    }
+
+    /// The world, lit: draw it straight out of the simulation's buffer, pull
+    /// out the glowing pixels and blur them sideways, then up and down.
+    pub fn draw(&self, encoder: &mut wgpu::CommandEncoder) {
+        fullscreen_pass(
+            encoder,
+            "scene pass",
+            &self.scene_view,
+            &self.pipeline_scene,
+            &self.bg_scene,
+            None,
+        );
+        fullscreen_pass(
+            encoder,
+            "blur h pass",
+            &self.glow_a_view,
+            &self.pipeline_blur_h,
+            &self.bg_blur_h,
+            Some(&self.bg_blur_h_step),
+        );
+        fullscreen_pass(
+            encoder,
+            "blur v pass",
+            &self.glow_b_view,
+            &self.pipeline_blur_v,
+            &self.bg_blur_v,
+            Some(&self.bg_blur_v_step),
+        );
+    }
+
+    /// Scene plus glow, onto `target`, with a pipeline from
+    /// [`Renderer::window_pipeline`]. Follows [`Renderer::draw`].
+    pub fn composite(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        pipeline: &wgpu::RenderPipeline,
+        target: &wgpu::TextureView,
+    ) {
+        fullscreen_pass(
+            encoder,
+            "composite pass",
+            target,
+            pipeline,
+            &self.bg_composite,
+            None,
+        );
+    }
+
+    /// The composite again into the capture image, and from there into a
+    /// staging buffer, which is handed back. Follows [`Renderer::draw`]. Once
+    /// the encoder is submitted the buffer goes to [`Renderer::queue_readback`]
+    /// to be collected later, or is read there and then.
+    pub fn capture(&mut self, encoder: &mut wgpu::CommandEncoder) -> wgpu::Buffer {
+        fullscreen_pass(
+            encoder,
+            "capture pass",
+            &self.capture_view,
+            &self.pipeline_capture,
+            &self.bg_composite,
+            None,
+        );
+        let buffer = self.spare_staging.pop().unwrap_or_else(|| {
+            self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("capture staging"),
+                size: (CAPTURE_ROW_BYTES * GRID_H) as wgpu::BufferAddress,
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            })
+        });
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture: &self.capture_texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &buffer,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(CAPTURE_ROW_BYTES),
+                    rows_per_image: Some(GRID_H),
+                },
+            },
+            wgpu::Extent3d {
+                width: GRID_W,
+                height: GRID_H,
+                depth_or_array_layers: 1,
+            },
+        );
+        buffer
+    }
+
+    /// Ask for a staging buffer from [`Renderer::capture`] to be mapped once
+    /// the copy into it is done, and keep it until [`Renderer::take_frames`]
+    /// finds it ready. The callback only drops a note in the channel; the
+    /// reading is done on the main thread.
+    pub fn queue_readback(&mut self, buffer: wgpu::Buffer) {
+        let (tx, mapped) = mpsc::channel();
+        buffer.map_async(wgpu::MapMode::Read, .., move |result| {
+            let _ = tx.send(result);
+        });
+        self.readbacks.push_back(Readback { buffer, mapped });
+    }
+
+    /// The captured frames that have finished copying out, oldest first, in
+    /// the order they were asked for. Nothing waits: a frame the GPU has not
+    /// finished with yet is left for next time.
+    pub fn take_frames(&mut self) -> Vec<Frame> {
+        if self.readbacks.is_empty() {
+            return Vec::new();
+        }
+        // Give the mapping callbacks a chance to run, without blocking.
+        let _ = self.device.poll(wgpu::PollType::Poll);
+
+        let mut frames = Vec::new();
+        while let Some(front) = self.readbacks.front() {
+            let result = match front.mapped.try_recv() {
+                Ok(result) => result,
+                Err(mpsc::TryRecvError::Empty) => break,
+                // The callback was dropped without running, which means the
+                // device is gone. Nothing more will come of this one.
+                Err(mpsc::TryRecvError::Disconnected) => Err(wgpu::BufferAsyncError),
+            };
+            let Readback { buffer, .. } = self.readbacks.pop_front().expect("just peeked");
+            match result {
+                Ok(()) => {
+                    match buffer.slice(..).get_mapped_range() {
+                        Ok(data) => frames.push(Self::frame_from(&data)),
+                        Err(err) => log::error!("could not read a captured frame back: {err}"),
+                    }
+                    buffer.unmap();
+                    self.spare_staging.push(buffer);
+                }
+                Err(err) => log::error!("could not read a captured frame back: {err}"),
+            }
+        }
+        frames
+    }
+
+    /// Draw the world as it is now and bring the picture back, waiting for
+    /// the GPU. A frame wants nothing of the sort, but a script that has
+    /// asked for a screenshot wants the file before it carries on.
+    pub fn frame_now(&mut self) -> Result<Frame, String> {
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("frame now"),
+            });
+        self.draw(&mut encoder);
+        let buffer = self.capture(&mut encoder);
+        self.queue.submit([encoder.finish()]);
+
+        let (tx, mapped) = mpsc::channel();
+        buffer.map_async(wgpu::MapMode::Read, .., move |result| {
+            let _ = tx.send(result);
+        });
+        self.device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .map_err(|err| format!("waiting for the GPU: {err}"))?;
+        match mapped.try_recv() {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => return Err(format!("could not read the frame back: {err}")),
+            Err(_) => return Err("the GPU never said the frame was ready".to_string()),
+        }
+        let frame = {
+            let data = buffer
+                .slice(..)
+                .get_mapped_range()
+                .map_err(|err| format!("could not read the frame back: {err}"))?;
+            Self::frame_from(&data)
+        };
+        buffer.unmap();
+        self.spare_staging.push(buffer);
+        Ok(frame)
+    }
+
+    fn frame_from(data: &[u8]) -> Frame {
+        Frame::from_padded_rgba(data, GRID_W, GRID_H, CAPTURE_ROW_BYTES as usize)
+    }
+}
+
+impl State {
+    /// Bring up the GPU and build a world that knows the materials in
+    /// `registry`. Later changes to the registry go through
+    /// [`Simulation::set_tables`].
+    pub async fn new(window: Arc<Window>, registry: &Registry) -> State {
+        let size = window.inner_size();
+        let width = size.width.max(1);
+        let height = size.height.max(1);
+
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+            backends: wgpu::Backends::all(),
+            ..wgpu::InstanceDescriptor::new_without_display_handle()
+        });
+
+        // An `Arc<Window>` gives a 'static surface that keeps the window alive.
+        let surface = instance
+            .create_surface(window.clone())
+            .expect("create surface");
+
+        let adapter = instance
+            .request_adapter(&wgpu::RequestAdapterOptions {
+                power_preference: wgpu::PowerPreference::HighPerformance,
+                compatible_surface: Some(&surface),
+                ..Default::default()
+            })
+            .await
+            .expect(
+                "no suitable GPU adapter found. This needs a GPU with compute shaders, so Vulkan, \
+                 Metal or D3D12",
+            );
+
+        let (device, queue) = adapter
+            .request_device(&wgpu::DeviceDescriptor {
+                label: Some("sandy device"),
+                required_features: wgpu::Features::empty(),
+                required_limits: wgpu::Limits::default(),
+                ..Default::default()
+            })
+            .await
+            .expect("request device");
+
+        let caps = surface.get_capabilities(&adapter);
+        // Prefer a surface in gamma space, which is the one egui asks for and
+        // warns about not getting. The offscreen images the renderer draws
+        // through are sRGB whatever the window turns out to be, so the blur
+        // still adds light rather than adding byte values; the composite is
+        // what puts the result back into the space the window wants (see
+        // `bloom.wgsl`).
+        let format = caps
+            .formats
+            .iter()
+            .copied()
+            .find(|f| !f.is_srgb())
+            .unwrap_or(caps.formats[0]);
+
+        let config = wgpu::SurfaceConfiguration {
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            format,
+            // Plain sRGB, standard dynamic range: the space the composite pass
+            // already writes into. `Auto` picks exactly that for these formats.
+            color_space: wgpu::SurfaceColorSpace::Auto,
+            width,
+            height,
+            present_mode: wgpu::PresentMode::Fifo, // vsync, supported everywhere
+            alpha_mode: caps.alpha_modes[0],
+            view_formats: vec![],
+            desired_maximum_frame_latency: 2,
+        };
+        surface.configure(&device, &config);
+
+        let sim = Simulation::new(&device, &queue, registry);
+        let renderer = Renderer::new(&device, &queue, &sim);
+        let pipeline_composite = renderer.window_pipeline(config.format);
 
         // egui paints into the surface format, in its own pass after the
         // composite. The defaults suit it: no MSAA, no depth, feathered edges.
@@ -532,28 +820,12 @@ impl State {
             device,
             queue,
             config,
-            pipeline_scene,
-            pipeline_blur_h,
-            pipeline_blur_v,
             pipeline_composite,
-            bg_scene,
-            bg_blur_h,
-            bg_blur_h_step,
-            bg_blur_v,
-            bg_blur_v_step,
-            bg_composite,
-            scene_view,
-            glow_a_view,
-            glow_b_view,
-            capture_texture,
-            capture_view,
-            pipeline_capture,
-            readbacks: VecDeque::new(),
-            spare_staging: Vec::new(),
             egui_renderer,
             last_update: Instant::now(),
             tick_accumulator: 0.0,
             sim,
+            renderer,
         }
     }
 
@@ -617,7 +889,7 @@ impl State {
     /// `paint_jobs` and `textures_delta` come from egui's `run` and `tessellate`
     /// over in [`crate::app`]; `pixels_per_point` is the scale it laid out at.
     /// With `capture` set, the scene is also copied out for
-    /// [`State::take_frames`]. Returns whether that copy was made: it is not
+    /// [`Renderer::take_frames`]. Returns whether that copy was made: it is not
     /// when the frame is skipped because the surface wants reconfiguring.
     pub fn render(
         &mut self,
@@ -666,118 +938,15 @@ impl State {
                 label: Some("frame"),
             });
 
-        // One fullscreen pass into `target`. Group one is optional; only the
-        // blurs have anything to put there.
-        let pass = |encoder: &mut wgpu::CommandEncoder,
-                    label: &str,
-                    target: &wgpu::TextureView,
-                    pipeline: &wgpu::RenderPipeline,
-                    bg0: &wgpu::BindGroup,
-                    bg1: Option<&wgpu::BindGroup>| {
-            let mut rp = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some(label),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: target,
-                    resolve_target: None,
-                    depth_slice: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-                multiview_mask: None,
-            });
-            rp.set_pipeline(pipeline);
-            rp.set_bind_group(0, bg0, &[]);
-            if let Some(bg1) = bg1 {
-                rp.set_bind_group(1, bg1, &[]);
-            }
-            rp.draw(0..3, 0..1);
-        };
-
-        // 1. The world, straight out of the simulation's buffer.
-        pass(
-            &mut encoder,
-            "scene pass",
-            &self.scene_view,
-            &self.pipeline_scene,
-            &self.bg_scene,
-            None,
-        );
-        // 2. Pull out the glowing pixels and blur them sideways.
-        pass(
-            &mut encoder,
-            "blur h pass",
-            &self.glow_a_view,
-            &self.pipeline_blur_h,
-            &self.bg_blur_h,
-            Some(&self.bg_blur_h_step),
-        );
-        // 3. Blur that up and down.
-        pass(
-            &mut encoder,
-            "blur v pass",
-            &self.glow_b_view,
-            &self.pipeline_blur_v,
-            &self.bg_blur_v,
-            Some(&self.bg_blur_v_step),
-        );
+        // 1 to 3. The world, and its glow.
+        self.renderer.draw(&mut encoder);
         // 4. Scene plus glow, onto the window.
-        pass(
-            &mut encoder,
-            "composite pass",
-            &view,
-            &self.pipeline_composite,
-            &self.bg_composite,
-            None,
-        );
-
+        self.renderer
+            .composite(&mut encoder, &self.pipeline_composite, &view);
         // 4a. The same again into the capture image, if a frame is wanted,
         //     and from there into a staging buffer. The buffer is mapped
         //     after the submit below, so the copy is in the queue ahead of it.
-        let staging = capture.then(|| {
-            pass(
-                &mut encoder,
-                "capture pass",
-                &self.capture_view,
-                &self.pipeline_capture,
-                &self.bg_composite,
-                None,
-            );
-            let buffer = self.spare_staging.pop().unwrap_or_else(|| {
-                self.device.create_buffer(&wgpu::BufferDescriptor {
-                    label: Some("capture staging"),
-                    size: (CAPTURE_ROW_BYTES * GRID_H) as wgpu::BufferAddress,
-                    usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-                    mapped_at_creation: false,
-                })
-            });
-            encoder.copy_texture_to_buffer(
-                wgpu::TexelCopyTextureInfo {
-                    texture: &self.capture_texture,
-                    mip_level: 0,
-                    origin: wgpu::Origin3d::ZERO,
-                    aspect: wgpu::TextureAspect::All,
-                },
-                wgpu::TexelCopyBufferInfo {
-                    buffer: &buffer,
-                    layout: wgpu::TexelCopyBufferLayout {
-                        offset: 0,
-                        bytes_per_row: Some(CAPTURE_ROW_BYTES),
-                        rows_per_image: Some(GRID_H),
-                    },
-                },
-                wgpu::Extent3d {
-                    width: GRID_W,
-                    height: GRID_H,
-                    depth_or_array_layers: 1,
-                },
-            );
-            buffer
-        });
+        let staging = capture.then(|| self.renderer.capture(&mut encoder));
 
         // 5. egui over the top, loading what is already there rather than
         //    clearing it.
@@ -823,63 +992,14 @@ impl State {
         );
         self.queue.present(frame);
 
-        // Ask for the staging buffer to be mapped once the copy into it is
-        // done. The callback only drops a note in the channel; the reading is
-        // done by `take_frames` on the main thread.
         if let Some(buffer) = staging {
-            let (tx, mapped) = mpsc::channel();
-            buffer.map_async(wgpu::MapMode::Read, .., move |result| {
-                let _ = tx.send(result);
-            });
-            self.readbacks.push_back(Readback { buffer, mapped });
+            self.renderer.queue_readback(buffer);
         }
 
         // Free whatever egui retired this frame, after the submit so nothing is
         // dropped while commands still in flight refer to it.
         self.free_textures(&mut textures_delta);
         true
-    }
-
-    /// The captured frames that have finished copying out, oldest first, in
-    /// the order they were asked for. Nothing waits: a frame the GPU has not
-    /// finished with yet is left for next time.
-    pub fn take_frames(&mut self) -> Vec<Frame> {
-        if self.readbacks.is_empty() {
-            return Vec::new();
-        }
-        // Give the mapping callbacks a chance to run, without blocking.
-        let _ = self.device.poll(wgpu::PollType::Poll);
-
-        let mut frames = Vec::new();
-        while let Some(front) = self.readbacks.front() {
-            let result = match front.mapped.try_recv() {
-                Ok(result) => result,
-                Err(mpsc::TryRecvError::Empty) => break,
-                // The callback was dropped without running, which means the
-                // device is gone. Nothing more will come of this one.
-                Err(mpsc::TryRecvError::Disconnected) => Err(wgpu::BufferAsyncError),
-            };
-            let Readback { buffer, .. } = self.readbacks.pop_front().expect("just peeked");
-            match result {
-                Ok(()) => {
-                    match buffer.slice(..).get_mapped_range() {
-                        Ok(data) => {
-                            frames.push(Frame::from_padded_rgba(
-                                &data,
-                                GRID_W,
-                                GRID_H,
-                                CAPTURE_ROW_BYTES as usize,
-                            ));
-                        }
-                        Err(err) => log::error!("could not read a captured frame back: {err}"),
-                    }
-                    buffer.unmap();
-                    self.spare_staging.push(buffer);
-                }
-                Err(err) => log::error!("could not read a captured frame back: {err}"),
-            }
-        }
-        frames
     }
 
     /// Hand back the textures egui has finished with, and leave the delta empty.

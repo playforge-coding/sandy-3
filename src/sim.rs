@@ -442,6 +442,121 @@ impl Simulation {
         &self.wind
     }
 
+    /// How many ticks the world has run.
+    pub fn ticks(&self) -> u32 {
+        self.frame
+    }
+
+    /// A fresh grain for a brush stroke or a load, so painting twice over the
+    /// same spot does not come out with the same speckle.
+    fn next_seed(&mut self) -> u32 {
+        self.seed = self
+            .seed
+            .wrapping_mul(1_664_525)
+            .wrapping_add(1_013_904_223);
+        self.seed
+    }
+
+    /// The word a cell holds for `material` at `index`: the id in the low
+    /// byte and a grain above it, from `seed`, the way [`kernels::paint`]
+    /// makes one.
+    fn cell_word(seed: u32, index: u32, material: MaterialId) -> u32 {
+        let variant = kernels::hash(seed.wrapping_add(index.wrapping_mul(2_654_435_761))) & 255;
+        material as u32 | (variant << 8)
+    }
+
+    /// Fill a rectangle, both corners included and in either order, with
+    /// `material`, clipped to the grid: a floor for a test, or a pool. Each
+    /// row is one write straight into the world buffer, with a grain given
+    /// to each cell as a brush stroke gives one.
+    pub fn fill(&mut self, x0: i32, y0: i32, x1: i32, y1: i32, material: MaterialId) {
+        let (x0, x1) = (x0.min(x1).max(0), x0.max(x1).min(self.width as i32 - 1));
+        let (y0, y1) = (y0.min(y1).max(0), y0.max(y1).min(self.height as i32 - 1));
+        if x0 > x1 || y0 > y1 {
+            return;
+        }
+        let seed = self.next_seed();
+        for y in y0..=y1 {
+            let start = y as u32 * self.width + x0 as u32;
+            let words: Vec<u32> = (0..=(x1 - x0) as u32)
+                .map(|dx| Self::cell_word(seed, start + dx, material))
+                .collect();
+            self.queue
+                .write_buffer(&self.cells, start as u64 * 4, bytemuck::cast_slice(&words));
+        }
+    }
+
+    /// The whole world, read back: one word per cell from the top left, the
+    /// material in the low byte. This waits for the GPU to catch up, which
+    /// nothing in a frame ever does; it is for scripts and tests.
+    pub fn read_cells(&self) -> Result<Vec<u32>, String> {
+        self.read_buffer(&self.cells, 0, self.cells.size())
+    }
+
+    /// One cell, read back: the material in the low byte, or `None` off the
+    /// grid.
+    pub fn read_cell(&self, x: i32, y: i32) -> Result<Option<u32>, String> {
+        if x < 0 || y < 0 || x >= self.width as i32 || y >= self.height as i32 {
+            return Ok(None);
+        }
+        let index = (y as u32 * self.width + x as u32) as u64;
+        Ok(self
+            .read_buffer(&self.cells, index * 4, 4)?
+            .first()
+            .copied())
+    }
+
+    /// The wind, read back: one `[x, y]` velocity per cell in cells per tick,
+    /// laid out like the grid.
+    pub fn read_wind(&self) -> Result<Vec<[f32; 2]>, String> {
+        self.read_buffer(&self.wind, 0, self.wind.size())
+    }
+
+    /// `size` bytes of one of the buffers from `offset`, read back into main
+    /// memory, blocking until the GPU has caught up.
+    fn read_buffer<T: bytemuck::Pod>(
+        &self,
+        buffer: &wgpu::Buffer,
+        offset: u64,
+        size: u64,
+    ) -> Result<Vec<T>, String> {
+        let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("readback"),
+            size,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("readback"),
+            });
+        encoder.copy_buffer_to_buffer(buffer, offset, &staging, 0, size);
+        self.queue.submit([encoder.finish()]);
+
+        let (tx, mapped) = std::sync::mpsc::channel();
+        let slice = staging.slice(..);
+        slice.map_async(wgpu::MapMode::Read, move |result| {
+            let _ = tx.send(result);
+        });
+        self.device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .map_err(|err| format!("waiting for the GPU: {err}"))?;
+        match mapped.try_recv() {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => return Err(format!("could not read the world back: {err}")),
+            Err(_) => return Err("the GPU never said the world was ready".to_string()),
+        }
+        let words = {
+            let view = slice
+                .get_mapped_range()
+                .map_err(|err| format!("could not read the world back: {err}"))?;
+            bytemuck::cast_slice(&view).to_vec()
+        };
+        staging.unmap();
+        Ok(words)
+    }
+
     /// Replace the materials and rules the kernels read with those in
     /// `registry`. This is how a plugin's material gets into the world: the
     /// props table is rewritten in place, since it always has a row for every
@@ -532,16 +647,11 @@ impl Simulation {
     /// [`crate::materials::EMPTY`] erases.
     pub fn paint_disk(&mut self, cx: i32, cy: i32, radius: i32, material: MaterialId) {
         let radius = radius.max(0);
-        // A fresh grain for every stroke, so painting twice over the same spot
-        // does not come out with the same speckle.
-        self.seed = self
-            .seed
-            .wrapping_mul(1_664_525)
-            .wrapping_add(1_013_904_223);
+        let seed = self.next_seed();
         self.queue.write_buffer(
             &self.paint_world,
             0,
-            bytemuck::cast_slice(&[self.width, self.height, self.seed, 0]),
+            bytemuck::cast_slice(&[self.width, self.height, seed, 0]),
         );
         self.queue.write_buffer(
             &self.paint_brush,
@@ -602,20 +712,11 @@ impl Simulation {
             (self.width * self.height) as usize,
             "a loaded world must be exactly the size of the grid"
         );
-        self.seed = self
-            .seed
-            .wrapping_mul(1_664_525)
-            .wrapping_add(1_013_904_223);
-        let seed = self.seed;
+        let seed = self.next_seed();
         let words: Vec<u32> = cells
             .iter()
             .enumerate()
-            .map(|(index, &material)| {
-                let variant =
-                    kernels::hash(seed.wrapping_add((index as u32).wrapping_mul(2_654_435_761)))
-                        & 255;
-                material as u32 | (variant << 8)
-            })
+            .map(|(index, &material)| Self::cell_word(seed, index as u32, material))
             .collect();
         // The clear is submitted first, and a queued write lands ahead of the
         // next submission, so the cells go in after the buffer is zeroed
@@ -664,50 +765,18 @@ mod tests {
         .expect("request device")
     }
 
-    /// One of the simulation's buffers, read back so a test can look at it.
-    /// Blocks until the GPU has caught up, which is the one thing the game
-    /// itself never does.
-    fn read_back<T: bytemuck::Pod>(sim: &Simulation, buffer: &wgpu::Buffer) -> Vec<T> {
-        let size = buffer.size();
-        let staging = sim.device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("readback"),
-            size,
-            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-            mapped_at_creation: false,
-        });
-        let mut encoder = sim
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("readback"),
-            });
-        encoder.copy_buffer_to_buffer(buffer, 0, &staging, 0, size);
-        sim.queue.submit([encoder.finish()]);
-
-        let slice = staging.slice(..);
-        slice.map_async(wgpu::MapMode::Read, |result| result.expect("map readback"));
-        sim.device
-            .poll(wgpu::PollType::wait_indefinitely())
-            .expect("wait for the GPU");
-        let view = slice.get_mapped_range().expect("map readback range");
-        let words = bytemuck::cast_slice(&view).to_vec();
-        drop(view);
-        staging.unmap();
-        words
-    }
-
     /// The world, read back.
     fn snapshot(sim: &Simulation) -> World {
         World {
             width: sim.width,
             height: sim.height,
-            cells: read_back(sim, &sim.cells),
+            cells: sim.read_cells().expect("read the world back"),
         }
     }
 
-    /// The wind, read back: one `[x, y]` velocity per cell in cells per tick,
-    /// laid out like the grid.
+    /// The wind, read back.
     fn wind(sim: &Simulation) -> Vec<[f32; 2]> {
-        read_back(sim, &sim.wind)
+        sim.read_wind().expect("read the wind back")
     }
 
     struct World {
@@ -1317,6 +1386,29 @@ mod tests {
         assert!(snapshot(&sim).count(STONE) > 0);
         sim.paint_disk(500, 250, 25, EMPTY);
         assert_eq!(snapshot(&sim).count(STONE), 0);
+    }
+
+    #[test]
+    fn a_filled_rectangle_is_clipped_and_reads_back_cell_by_cell() {
+        let (device, queue) = headless();
+        let mut sim = Simulation::new(&device, &queue, &Registry::builtin());
+        // Corners in the wrong order, and hanging off the right edge.
+        sim.fill(GRID_W as i32 + 5, 12, 990, 10, STONE);
+        let world = snapshot(&sim);
+        assert_eq!(world.count(STONE), 10 * 3);
+        assert_eq!(world.at(990, 10), STONE);
+        assert_eq!(world.at(999, 12), STONE);
+        assert_eq!(world.at(989, 11), EMPTY);
+        assert_eq!(sim.read_cell(995, 11).unwrap().map(|w| w & 0xff), Some(2));
+        assert_eq!(sim.read_cell(0, 0).unwrap().map(|w| w & 0xff), Some(0));
+        assert_eq!(sim.read_cell(-1, 0).unwrap(), None);
+        assert_eq!(sim.read_cell(0, GRID_H as i32).unwrap(), None);
+        // Nothing at all is fine.
+        sim.fill(-10, -10, -5, -5, SAND);
+        assert_eq!(snapshot(&sim).count(SAND), 0);
+        assert_eq!(sim.ticks(), 0);
+        run(&mut sim, 3);
+        assert_eq!(sim.ticks(), 3);
     }
 
     #[test]

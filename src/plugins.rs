@@ -85,18 +85,23 @@ use std::path::Path;
 use std::rc::Rc;
 
 use mlua::{
-    FromLua, Function, Lua, LuaOptions, StdLib, Table, UserData, UserDataFields, UserDataMethods,
-    Value, Variadic,
+    FromLua, Function, Lua, LuaOptions, StdLib, Table, Thread, UserData, UserDataFields,
+    UserDataMethods, Value, Variadic,
 };
 
 use crate::materials::{Look, MaterialId, MaterialInfo, Registry, Rule};
-use crate::sim::{GRID_H, GRID_W};
+use crate::sim::{GRID_H, GRID_W, Simulation};
 use crate::worldgen::{Canvas, Noise};
 
 /// The widest brush a script can ask for, in cells. The paint and gust kernels
 /// are dispatched over the brush's bounding square, so an unbounded radius
 /// would be an unbounded amount of GPU work for one call.
 const MAX_RADIUS: i32 = 512;
+
+/// Where the user's own plugins are looked for at startup, relative to the
+/// working directory. Every `.lua` file in it is loaded, in name order, after
+/// the built-in ones.
+pub const PLUGIN_DIR: &str = "plugins";
 
 /// The plugins that ship with the game, compiled into the binary so they are
 /// there wherever it is run from. They are ordinary scripts in `src/plugins/`
@@ -156,6 +161,27 @@ pub enum Command {
         dvx: f32,
         dvy: f32,
     },
+}
+
+impl Command {
+    /// Do it to the world.
+    pub fn apply(self, sim: &mut Simulation) {
+        match self {
+            Command::Paint {
+                x,
+                y,
+                radius,
+                material,
+            } => sim.paint_disk(x, y, radius, material),
+            Command::Wind {
+                x,
+                y,
+                radius,
+                dvx,
+                dvy,
+            } => sim.add_wind_disk(x, y, radius, dvx, dvy),
+        }
+    }
 }
 
 /// One frame of a stroke, as a plugin tool sees it. Positions are grid cells.
@@ -547,6 +573,35 @@ impl Plugins {
         }
     }
 
+    /// Load every `.lua` file in [`PLUGIN_DIR`], in name order, and say how
+    /// each went: its file name, and the report or the error. No folder is
+    /// simply no plugins; a script that fails does not stop the rest loading.
+    pub fn load_dir(&mut self) -> Vec<(String, Result<Report, String>)> {
+        let Ok(entries) = std::fs::read_dir(PLUGIN_DIR) else {
+            return Vec::new();
+        };
+        let mut paths: Vec<_> = entries
+            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+            .filter(|path| path.extension().is_some_and(|ext| ext == "lua"))
+            .collect();
+        paths.sort();
+        paths
+            .iter()
+            .map(|path| {
+                let label = path
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| path.display().to_string());
+                let result = self.load_file(path);
+                match &result {
+                    Ok(report) => log::info!("loaded plugin {}: {report}", path.display()),
+                    Err(err) => log::error!("plugin {} failed: {err}", path.display()),
+                }
+                (label, result)
+            })
+            .collect()
+    }
+
     /// Run the script in `path`. What it registers stays registered even if it
     /// then fails partway through, so a script that got as far as adding a
     /// material has added it.
@@ -571,6 +626,27 @@ impl Plugins {
         result.map(|()| report).map_err(|err| describe(&err))
     }
 
+    /// The interpreter itself, for the control script in [`crate::scripting`],
+    /// which runs in it alongside the plugins.
+    pub(crate) fn lua(&self) -> &Lua {
+        &self.lua
+    }
+
+    /// `source` compiled as a coroutine, not yet started, named `name` in
+    /// error messages the way [`Plugins::load`] names a plugin. A syntax
+    /// error shows up here rather than on the first resume.
+    pub(crate) fn thread(&self, name: &str, source: &str) -> Result<Thread, String> {
+        let function = self
+            .lua
+            .load(source)
+            .set_name(format!("={name}"))
+            .into_function()
+            .map_err(|err| describe(&err))?;
+        self.lua
+            .create_thread(function)
+            .map_err(|err| describe(&err))
+    }
+
     /// The names of the brushes or tools scripts have registered, in the order
     /// they were added. The panel's choice of brush, and a
     /// [`crate::ui::Tool::Plugin`], are indexes into these.
@@ -581,6 +657,26 @@ impl Plugins {
             .iter()
             .map(|entry| entry.name.clone())
             .collect()
+    }
+
+    /// Where the brush or tool called `name`, in any case, sits in
+    /// [`Plugins::names`].
+    pub fn index_of(&self, kind: Kind, name: &str) -> Option<usize> {
+        self.shared
+            .borrow()
+            .list(kind)
+            .iter()
+            .position(|entry| entry.name.eq_ignore_ascii_case(name))
+    }
+
+    /// Where the world called `name`, in any case, sits in
+    /// [`Plugins::world_names`].
+    pub fn world_index(&self, name: &str) -> Option<usize> {
+        self.shared
+            .borrow()
+            .worlds
+            .iter()
+            .position(|entry| entry.name.eq_ignore_ascii_case(name))
     }
 
     /// Give a brush or a tool one frame of a stroke. Whatever it asks for lands
@@ -720,7 +816,7 @@ fn material_from(spec: &Table) -> mlua::Result<MaterialInfo> {
 }
 
 /// A material named by a script: its id, or its name in any case.
-fn resolve(registry: &Registry, value: &Value, what: &str) -> mlua::Result<MaterialId> {
+pub(crate) fn resolve(registry: &Registry, value: &Value, what: &str) -> mlua::Result<MaterialId> {
     let by_id = |id: i64| {
         if (0..registry.materials().len() as i64).contains(&id) {
             Ok(id as MaterialId)
@@ -759,21 +855,24 @@ fn look_from(name: Option<String>) -> mlua::Result<Look> {
     }
 }
 
-fn clamp_radius(radius: f64) -> i32 {
+pub(crate) fn clamp_radius(radius: f64) -> i32 {
     (radius.round() as i32).clamp(0, MAX_RADIUS)
 }
 
 /// The one line of an error worth showing on the panel: what went wrong, and
 /// where in the script if that can be told. Lua's own errors say where on
 /// their first line; an error raised from the Rust side does not, but the
-/// traceback under it does, so that is looked for and added.
-fn describe(err: &mlua::Error) -> String {
+/// traceback under it does, so that is looked for and added. Frames in C
+/// and in the control API's own Lua are passed over, since neither is
+/// anywhere the user wrote.
+pub(crate) fn describe(err: &mlua::Error) -> String {
     let text = err.to_string();
     let first = plain(err);
+    let prelude = format!("{}:", crate::scripting::PRELUDE_NAME);
     let place = text
         .lines()
         .map(str::trim)
-        .filter(|line| !line.starts_with("[C]"))
+        .filter(|line| !line.starts_with("[C]") && !line.starts_with(&prelude))
         .find_map(|line| line.split_once(": in ").map(|(place, _)| place));
     match place {
         Some(place) if !first.starts_with(place) => format!("{first} (at {place})"),
@@ -783,7 +882,7 @@ fn describe(err: &mlua::Error) -> String {
 
 /// An error's message with mlua's own framing taken off: the root cause of a
 /// callback error, and only the first line of it.
-fn plain(err: &mlua::Error) -> String {
+pub(crate) fn plain(err: &mlua::Error) -> String {
     let mut cause = err;
     while let mlua::Error::CallbackError { cause: inner, .. } = cause {
         cause = inner;

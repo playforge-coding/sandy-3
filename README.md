@@ -3,7 +3,10 @@
 A **falling-sand** world written in Rust, where the physics runs on the GPU.
 
 It runs natively on Windows, macOS and Linux. Plugins are Lua scripts: drop one
-on the window to add a material, a tool or a world.
+on the window to add a material, a tool or a world. A Lua script can also
+drive the whole game, in the window or with no window at all, which is how
+it is tested and how anything else that wants to run it by remote does so
+(see [Scripting](#scripting)).
 
 It is a companion to [Sandy 2](https://github.com/playforge-coding/sandy-2),
 which does the same job with a cellular automaton on the CPU. The difference is
@@ -288,13 +291,113 @@ whatever it registered before failing stays registered. Scripts get Lua's base
 library plus `string`, `table`, `math`, `utf8` and `coroutine`, and no `io`,
 `os` or `require`. `print` goes to the log.
 
+## Scripting
+
+The game can be driven by a Lua script instead of the mouse: for a test, an
+automation, a language model at the controls, or to try something out from a
+terminal. A script runs in the window, where it can be watched and the mouse
+still works between its calls, or with no window at all:
+
+```sh
+sandy-3 demo.lua               # in the window, which stays open afterwards
+sandy-3 --headless test.lua    # no window: run it and exit
+sandy-3 --headless -e 'sim.generate("Forest", 7); print(sim.count("Water"))'
+echo 'sim.step(60); print(sim.ticks())' | sandy-3 --headless -
+```
+
+Headless, the process exits with a status of 1 if the script fails, and the
+error says which line, so a script with `assert` in it is a test and a folder
+of them is a test suite. `print` goes to stdout. A headless run starts on an
+empty world; in the window the script starts once the usual landscape has
+been built, and finds it as it is on screen.
+
+A script has the plugin API, `sandy`, in scope (see [Plugins](#plugins)), so
+it can register materials and brushes of its own, and a `sim` table that
+drives the game:
+
+```lua
+sim.fill(0, sim.height - 4, sim.width - 1, sim.height - 1, "Stone")
+sim.paint(500, 60, 14, "Sand")
+local before = sim.count("Sand")
+sim.step(400)
+local world = sim.snapshot()
+assert(world:count("Sand") == before, "no sand was lost on the way down")
+assert(world:highest("Sand") > 400, "and it reached the floor")
+sim.screenshot("heap.png")
+```
+
+| Function | What it does |
+|----------|--------------|
+| `sim.width`, `sim.height` | the grid, in cells |
+| `sim.step([n])` | run `n` ticks, one by default, there and then |
+| `sim.frame([n])` | let `n` frames go by, one by default; see below |
+| `sim.pause()`, `sim.resume()`, `sim.paused()` | the panel's pause |
+| `sim.speed([x])` | the panel's speed, set if given; returns it |
+| `sim.ticks()` | how many ticks the world has run |
+| `sim.paint(x, y, radius, material)` | a disk, as the plain brush paints one |
+| `sim.fill(x0, y0, x1, y1, material)` | a rectangle, both corners included |
+| `sim.wind(x, y, radius, dvx, dvy)` | a gust, as the wind tool blows one |
+| `sim.clear()` | empty the world and still the air |
+| `sim.generate(world, [seed])` | build a world by name, from a seed or a rolled one; returns the seed |
+| `sim.stroke { ... }` | drive a brush or a tool along a path, as the mouse would |
+| `sim.pick { ... }` | set what the panel has picked |
+| `sim.snapshot()` | the world and the wind at this moment, read back |
+| `sim.get(x, y)` | the material at one cell, or nil off the grid |
+| `sim.count(material)` | how many cells hold a material |
+| `sim.screenshot([path])` | save a picture, written before it returns; returns the path |
+| `sim.record([path])`, `sim.stop()` | a recording, from the one to the other; both return the path |
+| `sim.plugin(path)` | load a plugin file, as dropping it on the window would |
+| `sim.materials()`, `sim.brushes()`, `sim.tools()`, `sim.worlds()` | what there is |
+| `sim.quit()` | end the script, and close the window if there is one |
+
+A material is a name, in any case, or an id, as it is for a plugin.
+Coordinates are cells from the top left, and a fraction is rounded down. A
+path with no name for a screenshot or a recording goes to the `captures`
+folder in the panel's format; with one, the extension picks the format. A
+snapshot has `width`, `height` and `ticks`, and `get(x, y)`,
+`count(material)`, `bounds(material)` (`x0, y0, x1, y1` with both corners
+included, or nothing), `highest(material)` and `lowest(material)` (the top
+and bottom rows holding it, or nil), `center(material)` (`x, y`, or nothing)
+and `wind(x, y)` (`vx, vy` in cells per tick). `sim.get` and `sim.count`
+each read the world back from the GPU, so a script with many questions about
+the same moment takes one snapshot and asks it.
+
+`sim.stroke` takes a table: `path`, a list of `{x, y}` points with one frame
+of the stroke per point; `brush` or `tool` by name, `Wind` being the game's
+own, or neither for whatever the panel has picked; and `material` and
+`radius`, which also default to the panel's. `sim.pick` takes `material`,
+`brush`, `tool` and `radius`, any of them, and sets the panel as clicking
+would. `sim.materials()` is a list of records with `id`, `name`, `color` and
+the properties a plugin gives a material; the other three are lists of names.
+
+A step and a frame are different things. `sim.step` runs ticks, exactly and
+at once, which is what a test wants. `sim.frame` lets time pass as the game
+keeps it: in the window the frames are real ones, drawn with the world
+running at the panel's speed unless it is paused, so a script can be watched;
+headless, a frame is a sixtieth of a second on a clock of the script's own,
+which runs the same ticks the window would at that speed. A recording takes
+its frames from the same time, thirty a second of it, so `sim.record`, a few
+hundred frames and `sim.stop` make the same animation with a window or
+without one. Headless, `sim.stop` waits for the file, and a recording still
+running when the script ends is finished before the process exits; in the
+window the file is finished a moment later and the panel says when. A
+screenshot is written before the call returns either way.
+
+A request the game refuses, a material that does not exist or a file that
+cannot be written, is an ordinary Lua error raised at the line that asked, so
+`pcall` catches it and an uncaught one ends the script with the line number.
+Scripts get the same sandbox plugins do, with `sim` added; the files a script
+needs go through `sim.screenshot`, `sim.record` and `sim.plugin`.
+
 ## Run it
 
 ```sh
 cargo run --release
 ```
 
-It needs a GPU with compute shaders, so Vulkan, Metal or D3D12.
+It needs a GPU with compute shaders, so Vulkan, Metal or D3D12. `sandy-3
+--help` lists the few arguments, all of them about running a script (see
+[Scripting](#scripting)).
 
 Each [GitHub release](https://github.com/playforge-coding/sandy-3/releases)
 also carries prebuilt binaries for Linux (x86_64), macOS (Apple silicon) and
@@ -315,7 +418,7 @@ src/
 │   └── …             water, lava, soil
 ├── kernels.rs      The simulation, as compute kernels written in Rust
 ├── sim.rs          The GPU buffers the world lives in, and the pass order
-├── gpu.rs          wgpu setup and the per-frame draw
+├── gpu.rs          The renderer, which needs no window, and the surface, which does
 ├── scene.wgsl      Draws the world straight out of the cell buffer
 ├── bloom.wgsl      Gives the emissive materials their halo
 ├── capture/        Screenshots and recordings
@@ -335,6 +438,10 @@ src/
 │   ├── fan.lua       a tool
 │   ├── worlds.lua    four landscapes from one generator
 │   └── caverns.lua   a world from a sheet of noise
+├── scripting.rs    The control API: a script's requests, and the host that answers them
+├── scripting.lua   The `sim` table, which turns each call into a request
+├── headless.rs     Running a script with no window
+├── cli.rs          The command line
 ├── ui.rs           The egui control panel
 ├── app.rs          winit window, input and the event loop
 ├── lib.rs          Module wiring

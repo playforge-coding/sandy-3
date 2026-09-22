@@ -253,8 +253,8 @@ cargo run --release
 It needs a GPU with compute shaders, so Vulkan, Metal or D3D12.
 
 Each [GitHub release](https://github.com/playforge-coding/sandy-3/releases)
-also carries prebuilt binaries for Linux (x86_64 and aarch64), macOS (Apple
-silicon) and Windows (x86_64). The release is made by hand; the workflow in
+also carries prebuilt binaries for Linux (x86_64), macOS (Apple silicon) and
+Windows (x86_64). The release is made by hand; the workflow in
 `.github/workflows/release.yml` sees it get published, builds each platform
 and attaches the archives. The built-in plugins are compiled in, so the
 binary on its own is the whole program.

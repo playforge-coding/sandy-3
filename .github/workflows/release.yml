@@ -55,8 +55,7 @@ jobs:
       - name: Package
         shell: bash
         run: |
-          tag="${{ github.event.release.tag_name }}"
-          name="sandy-3-${tag}-${{ matrix.target }}"
+          name="sandy-3-${{ matrix.target }}"
           mkdir "$name"
           cp LICENSE README.md "$name/"
           if [[ "${{ runner.os }}" == "Windows" ]]; then

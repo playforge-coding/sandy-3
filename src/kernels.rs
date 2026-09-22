@@ -216,6 +216,21 @@ fn rule_row(rule: &Rule) -> [u32; RULE_STRIDE] {
     row
 }
 
+/// The cheap integer hash the kernels use, for the host to use on the same
+/// terms: [`crate::sim::Simulation::load`] gives a generated world its grain
+/// with it, the way [`paint`] gives a brush stroke one. Each kernel carries
+/// its own copy of the body below, since a kernel can only call functions
+/// declared inside itself; this one is the reference the others are copies of.
+pub fn hash(seed: u32) -> u32 {
+    let mut v = seed;
+    v ^= v >> 16;
+    v = v.wrapping_mul(2_246_822_519);
+    v ^= v >> 13;
+    v = v.wrapping_mul(3_266_489_917);
+    v ^= v >> 16;
+    v
+}
+
 // ---------------------------------------------------------------------------
 // The kernels
 // ---------------------------------------------------------------------------

@@ -3,7 +3,7 @@
 A **falling-sand** world written in Rust, where the physics runs on the GPU.
 
 It runs natively on Windows, macOS and Linux. Plugins are Lua scripts: drop one
-on the window to add a material or a tool.
+on the window to add a material, a tool or a world.
 
 It is a companion to [Sandy 2](https://github.com/playforge-coding/sandy-2),
 which does the same job with a cellular automaton on the CPU. The difference is
@@ -30,17 +30,20 @@ Painted from the on-screen picker, or with the number keys:
 | **Acid** | liquid, runny | eats through stone and soil |
 | **Fire** | gas, rises | flickers out in about half a second; boils water; heats the air above it |
 | **Steam** | gas, rises | boiled off water by fire or lava; heats the air above it; thins away, or condenses on a ceiling and rains |
+| **Wood** | solid, immovable | a tree trunk; catches from fire or lava, slowly |
+| **Leaves** | solid, immovable | a tree's canopy; catches in a moment |
 
-The last three come from the built-in plugins (see [Plugins](#plugins)), and
+The last five come from the built-in plugins (see [Plugins](#plugins)), and
 that is the order the picker lists them in after the five above.
 
 Fire and steam are ordinary tiles that rise instead of fall, being lighter
 than the air. What sets them apart is that they warm it: a cell of either
 pushes the air it sits in upwards every tick, so a plume of steam off a
 boiling pool, or a bonfire, stands in its own updraft, which the haze shows
-and which lifts loose sand it passes over. Nothing burns yet, since there is
-no fuel material, so fire is something to paint rather than something that
-spreads.
+and which lifts loose sand it passes over. Wood and leaves are the fuel: a
+cell of either next to fire becomes fire, so a flame held to a tree runs up
+through the canopy and works its way down the trunk, and the fire it makes
+burns out as it reaches the open air.
 
 ## Brushes and tools
 
@@ -72,6 +75,32 @@ because a small one fades before it has moved anything.
 There is also a gentle prevailing breeze that swings on its own, enough to lean
 a falling stream of sand without disturbing anything that has settled.
 
+## Worlds
+
+The game opens on a landscape rather than a blank grid, built from a seed
+rolled at startup, so it is a different one each time. The panel's World
+section picks which kind, the seed box says which one of that kind, and
+Generate builds it; Random rolls a new seed and builds that. The same seed
+always gives the same world, so one worth keeping can be typed back in.
+Picking another kind builds it there and then.
+
+| World | What it is |
+|-------|------------|
+| **Forest** | rolling hills of soil over stone, water pooled in the valleys, and trees |
+| **Plains** | near-flat grassland, dry, with the odd tree |
+| **Ocean** | a deep sea over a gently rolling bed of sand |
+| **Desert** | dunes of sand over stone, bone dry |
+| **Caverns** | solid rock riddled with hollows, water in the deeper ones and lava in the deepest |
+
+Every one of them is a plugin (see [Plugins](#plugins)): a Lua function that
+is handed a blank canvas the size of the grid and paints the landscape into
+it, with noise from [FastNoise2](https://github.com/Auburn/FastNoise2) for
+the shape of the land. The first four share one generator and differ only in
+its knobs; the caverns use a whole sheet of noise rather than a line of it.
+Generation only places cells. The tick loop takes over from there, so the
+water finds its level and a stream of sand pours off a ledge the moment the
+world appears.
+
 ## Controls
 
 | Input | Action |
@@ -85,6 +114,8 @@ a falling stream of sand without disturbing anything that has settled.
 | **.** | step one tick |
 | **-** / **=** | halve / double the speed |
 | **C** | clear the world |
+| **G** | build the world again from the seed in the box |
+| **R** | roll a new seed and build the world from it |
 
 The panel drives the same state as the shortcuts, so the two stay in step.
 
@@ -101,13 +132,14 @@ running pauses it first.
 
 A plugin is one Lua file. Drop it on the window and it loads on the spot.
 Leave it in a `plugins` folder in the directory the game is run from and it
-loads at startup. Six are built into the binary and always there, from
+loads at startup. Nine are built into the binary and always there, from
 [`src/plugins/`](src/plugins/): `acid.lua` adds a material that eats through
-rock, `fire.lua` and `steam.lua` add the two gases, `disk.lua` is the plain
-brush, `spray.lua` a brush that sprinkles grains, and `fan.lua` a tool that
-blows an updraft. They are ordinary scripts
-that go through the same loader as a dropped file, so they double as worked
-examples.
+rock, `fire.lua` and `steam.lua` add the two gases, `wood.lua` adds wood and
+leaves and the rules that make them burn, `disk.lua` is the plain brush,
+`spray.lua` a brush that sprinkles grains, `fan.lua` a tool that blows an
+updraft, `worlds.lua` the four landscapes and `caverns.lua` the fifth. They
+are ordinary scripts that go through the same loader as a dropped file, so
+they double as worked examples.
 
 A script has a `sandy` table in scope and registers things through it:
 
@@ -144,6 +176,18 @@ sandy.tool {
         sandy.wind(t.x, t.y, 30, 0, -4)
     end,
 }
+
+-- A world: paints a whole landscape from a seed.
+sandy.world {
+    name = "Hills",
+    generate = function(w)
+        local hills = sandy.noise { seed = w.seed, frequency = 0.01, octaves = 4 }
+        for x = 0, w.width - 1 do
+            local top = w.height * 0.6 - hills:at(x, 0) * 80
+            w:fill(x, top, x, w.height - 1, "Soil")
+        end
+    end,
+}
 ```
 
 A material is referred to by its name, in any case, or by the id that
@@ -165,6 +209,30 @@ and `sandy.wind(x, y, radius, dvx, dvy)`, which is the wind tool.
 `sandy.find(name)` gives a material's id or nil, and `sandy.width` and
 `sandy.height` are the grid. Whatever a script asks for is queued and applied
 after it returns; a script is never handed the simulation.
+
+A world is a function, `generate`, that runs once when the world is built
+and is handed `w`: the `seed` from the panel, the grid's `width` and
+`height`, and four ways to paint. `w:set(x, y, material)` puts down one
+cell, `w:get(x, y)` reads one back (an id, or nil off the grid),
+`w:fill(x0, y0, x1, y1, material)` fills a rectangle with both corners
+included, and `w:disk(x, y, radius, material)` a circle. Coordinates are
+cells from the top left, and anything off the grid is quietly dropped.
+Nothing reaches the GPU until the function returns, when the whole grid goes
+across in one write, so a world can be painted a cell at a time. `w` is only
+good for the one build it was made for. `math.random` is reseeded from the
+seed before each build, so a script can scatter things with it and the same
+seed will still give the same world.
+
+`sandy.noise { ... }` makes a noise field to shape the land with. Its table
+takes `seed` (default 0), `kind` (`simplex`, the default, `supersimplex`,
+`perlin` or `value`), `frequency` (default 0.01, so a feature every hundred
+cells or so), `octaves` (default 1; more stack finer detail on top), `gain`
+and `lacunarity` (how much quieter and how much finer each octave is, 0.5
+and 2 by default) and `ridged` (fold the octaves into ridges rather than
+hills). The result has `n:at(x, y)`, one value in about -1 to 1 at a cell,
+and `n:grid(width, height)`, every cell from the origin at once as a table of
+rows read `rows[y][x]`, both counted from zero. The grid is what FastNoise2
+is for, and it fills the whole world's worth in a few milliseconds.
 
 A plugin material is data, exactly as the built-in ones are (see "A material
 is data, not code" below). There is no per-cell function to write, because the
@@ -200,13 +268,17 @@ src/
 ├── scene.wgsl      Draws the world straight out of the cell buffer
 ├── bloom.wgsl      Gives the emissive materials their halo
 ├── plugins.rs      Lua plugins: the `sandy` table and the loader
+├── worldgen.rs     The canvas a world is painted on, and the noise (FastNoise2)
 ├── plugins/        The built-in plugins, compiled into the binary
 │   ├── acid.lua      a material
 │   ├── fire.lua      a gas, and the rules that put it out
 │   ├── steam.lua     a gas, and the rules that boil water into it
+│   ├── wood.lua      wood and leaves, and the rules that burn them
 │   ├── disk.lua      the plain brush
 │   ├── spray.lua     a brush
-│   └── fan.lua       a tool
+│   ├── fan.lua       a tool
+│   ├── worlds.lua    four landscapes from one generator
+│   └── caverns.lua   a world from a sheet of noise
 ├── ui.rs           The egui control panel
 ├── app.rs          winit window, input and the event loop
 ├── lib.rs          Module wiring
@@ -362,9 +434,9 @@ also a liquid licks sideways as it climbs, which is all a gas is here.
 ## Not here yet
 
 Sandy 2 has a good deal more: oil, clouds, rain, seeds that sprout trees,
-creatures that walk over the grid, a seed-based world generator, meteors,
-tsunamis, and screenshot and GIF capture. None of that is here.
-This is the elements and the tools, on the GPU, and the rest can follow.
+creatures that walk over the grid, meteors, tsunamis, and screenshot and GIF
+capture. None of that is here. This is the elements, the tools and the
+worlds, on the GPU, and the rest can follow.
 
 ## Building
 
@@ -379,8 +451,12 @@ cargo install sccache
 Without it every cargo command stops at `could not execute process sccache
 rustc -vV`. A C compiler is needed as well, because the Lua interpreter the
 plugins run in is built from source (`mlua` with its `vendored` feature), so
-nothing has to be installed for it. Setting the variable to nothing turns the
-wrapper off for a single command, without touching the checked-in config:
+nothing has to be installed for it. The world generator's noise is
+[FastNoise2](https://github.com/Auburn/FastNoise2), a C++ library that the
+`fastnoise2` crate bundles and builds with CMake, so `cmake` and a C++17
+compiler have to be on the path too; the first build takes a minute longer
+for it. Setting the variable to nothing turns the wrapper off for a single
+command, without touching the checked-in config:
 
 ```sh
 RUSTC_WRAPPER= cargo build

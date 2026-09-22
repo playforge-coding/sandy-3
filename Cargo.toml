@@ -28,6 +28,18 @@ egui-wgpu = { version = "0.36", default-features = false, features = [
 egui-winit = "0.36"
 
 env_logger = "0.11"
+
+# Noise for the world generator. A safe wrapper over FastNoise2, the C++
+# successor to FastNoise Lite, whose Rust port has not been touched since 2024.
+# The C++ library is bundled and built with cmake, so cmake and a C++17
+# compiler have to be about.
+fastnoise2 = "0.4"
+
+# A small, fast, non-cryptographic random number generator, for rolling a
+# world seed at startup and on the Random button. The seed only has to differ
+# from the last one; it is shown on the panel so a good one can be kept.
+fastrand = "2.5"
+
 log = "0.4"
 
 # Plugins. A plugin is a Lua script that registers materials and tools through

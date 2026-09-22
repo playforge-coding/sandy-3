@@ -2,10 +2,10 @@
 //!
 //! egui draws as its own pass over the finished scene (see
 //! [`crate::gpu::State::render`]), so nothing here touches the world. The panel
-//! is a material picker, a brush picker, the tools, a size, and the clock:
-//! pause, a single step and a speed. The keyboard
-//! shortcuts in [`crate::app`] drive the very same [`Controls`], which is what
-//! keeps the two in step.
+//! is a material picker, a brush picker, the tools, a size, the clock (pause,
+//! a single step and a speed), and the world: a preset, a seed, and the
+//! buttons that build one. The keyboard shortcuts in [`crate::app`] drive the
+//! very same [`Controls`], which is what keeps the two in step.
 //!
 //! A material and a brush are picked together: the material is what a stroke
 //! puts down and the brush is how. A tool is picked instead of them, and does
@@ -14,6 +14,21 @@
 use egui::{Color32, RichText, Stroke};
 
 use crate::materials::{EMPTY, MaterialId, Registry, SAND};
+
+/// The most digits the seed box takes. Nine digits always fit a `u32`, and
+/// that is more seeds than anyone will type.
+const MAX_SEED_DIGITS: usize = 9;
+
+/// A rolled seed is kept below this so it always fits the seed box.
+const SEED_RANGE: u32 = 1_000_000_000;
+
+/// A fresh seed, from a random number generator that is quick rather than
+/// secure, which is all a world seed needs. The game opens on one of these
+/// so it does not open on the same world every time, and the Random button
+/// rolls another.
+pub fn random_seed() -> u32 {
+    fastrand::u32(..SEED_RANGE)
+}
 
 /// The slowest the world can be run, as a multiple of real time. Below a
 /// quarter speed sand falls so slowly it looks stuck, and pausing does that job
@@ -62,6 +77,12 @@ pub struct Controls {
     /// How fast the world runs, as a multiple of real time, between
     /// [`MIN_SPEED`] and [`MAX_SPEED`]. One is the usual sixty ticks a second.
     pub speed: f64,
+    /// The world preset the next generation builds: a position in the world
+    /// list from [`crate::plugins::Plugins::world_names`].
+    pub world: usize,
+    /// The world seed, kept as text so it can be typed into a box. It is
+    /// parsed when a world is actually built; see [`Controls::seed_value`].
+    pub seed: String,
 }
 
 impl Default for Controls {
@@ -73,11 +94,24 @@ impl Default for Controls {
             radius: 8,
             paused: false,
             speed: 1.0,
+            world: 0,
+            seed: random_seed().to_string(),
         }
     }
 }
 
 impl Controls {
+    /// The seed as a number: zero if the box is empty or holds anything that
+    /// is not a `u32`.
+    pub fn seed_value(&self) -> u32 {
+        self.seed.trim().parse().unwrap_or(0)
+    }
+
+    /// Put a seed in the box, as the Random button does.
+    pub fn set_seed(&mut self, seed: u32) {
+        self.seed = seed.to_string();
+    }
+
     /// The rate the world should advance at this frame, as a multiple of real
     /// time: the chosen speed, or nothing at all while paused.
     pub fn rate(&self) -> f64 {
@@ -103,20 +137,26 @@ pub struct Actions {
     /// Advance the world by exactly one tick, pausing it first if it was
     /// running.
     pub step: bool,
+    /// Build the chosen world from the seed in the box.
+    pub generate: bool,
+    /// Roll a fresh seed into the box and build the chosen world from it.
+    pub randomize: bool,
 }
 
 /// Build the panel for this frame and report which buttons were hit.
 ///
-/// `registry` is where the material swatches come from, `brushes` and `tools`
-/// the names of the plugin brushes and tools in the order [`Controls::brush`]
-/// and [`Tool::Plugin`] count them, and `status` a line for the foot of the
-/// panel: what the last plugin drop did, or a hint.
+/// `registry` is where the material swatches come from, `brushes`, `tools`
+/// and `worlds` the names of the plugin brushes, tools and worlds in the
+/// order [`Controls::brush`], [`Tool::Plugin`] and [`Controls::world`] count
+/// them, and `status` a line for the foot of the panel: what the last plugin
+/// drop did, or a hint.
 pub fn draw(
     ctx: &egui::Context,
     c: &mut Controls,
     registry: &Registry,
     brushes: &[String],
     tools: &[String],
+    worlds: &[String],
     status: &str,
 ) -> Actions {
     let mut actions = Actions::default();
@@ -214,16 +254,50 @@ pub fn draw(
                     .text("Speed"),
             );
 
+            // The world: which landscape, from which seed. Picking another
+            // landscape builds it there and then, so the change can be seen
+            // without a second click; so does pressing Enter in the seed box.
             ui.separator();
-            actions.clear |= ui
-                .add(egui::Button::new("Clear").min_size(button_size))
-                .clicked();
+            ui.label("World");
+            if worlds.is_empty() {
+                ui.label(RichText::new("No world plugins loaded.").small().weak());
+            } else {
+                c.world = c.world.min(worlds.len() - 1);
+                let before = c.world;
+                egui::ComboBox::from_id_salt("world")
+                    .width(button_size.x)
+                    .selected_text(&worlds[c.world])
+                    .show_ui(ui, |ui| {
+                        for (index, name) in worlds.iter().enumerate() {
+                            ui.selectable_value(&mut c.world, index, name);
+                        }
+                    });
+                actions.generate |= c.world != before;
+            }
+            ui.horizontal(|ui| {
+                ui.label("Seed");
+                let response = ui.add(
+                    egui::TextEdit::singleline(&mut c.seed)
+                        .char_limit(MAX_SEED_DIGITS)
+                        .desired_width(button_size.x - 40.0),
+                );
+                actions.generate |=
+                    response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+            });
+            // Digits only, so whatever is in the box parses as a seed.
+            c.seed.retain(|ch| ch.is_ascii_digit());
+            ui.horizontal(|ui| {
+                actions.generate |= ui.button("Generate").clicked();
+                actions.randomize |= ui.button("Random").clicked();
+                actions.clear |= ui.button("Clear").clicked();
+            });
 
             ui.separator();
             ui.label(
                 RichText::new(
                     "Hold left mouse to draw. Pick Wind and sweep to blow a gust. \
-                     Space pauses, . steps a tick, - and = change the speed.",
+                     Space pauses, . steps a tick, - and = change the speed. \
+                     G builds the world again, R from a new seed.",
                 )
                 .small()
                 .weak(),
@@ -267,6 +341,36 @@ mod tests {
             c.slower();
         }
         assert_eq!(c.speed, MIN_SPEED);
+    }
+
+    #[test]
+    fn the_seed_box_parses_to_a_number_or_to_zero() {
+        let mut c = Controls::default();
+        assert!(
+            c.seed.len() <= MAX_SEED_DIGITS && c.seed.parse::<u32>().is_ok(),
+            "the box opens on a seed that fits it: {:?}",
+            c.seed
+        );
+        c.set_seed(42);
+        assert_eq!(c.seed, "42");
+        assert_eq!(c.seed_value(), 42);
+        c.seed = " 7 ".to_string();
+        assert_eq!(c.seed_value(), 7);
+        c.seed = String::new();
+        assert_eq!(c.seed_value(), 0);
+        c.seed = "99999999999".to_string();
+        assert_eq!(c.seed_value(), 0, "too big for a u32");
+    }
+
+    #[test]
+    fn rolled_seeds_fit_the_box_and_are_not_all_the_same() {
+        let seeds: Vec<u32> = (0..20).map(|_| random_seed()).collect();
+        assert!(seeds.iter().all(|&s| s < SEED_RANGE));
+        assert!(
+            seeds.iter().any(|&s| s != seeds[0]),
+            "twenty rolls all came up {}",
+            seeds[0]
+        );
     }
 
     #[test]

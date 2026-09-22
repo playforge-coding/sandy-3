@@ -8,7 +8,10 @@
 //!
 //! A file dropped on the window is taken to be a plugin (see
 //! [`crate::plugins`]) and loaded on the spot. The plugins built into the
-//! binary, and then any in [`PLUGIN_DIR`], are loaded before the window opens.
+//! binary, and then any in [`PLUGIN_DIR`], are loaded before the window opens,
+//! and the first world they registered is built from a freshly rolled seed
+//! so the game opens on a landscape rather than a blank grid, and a different
+//! one each time.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -153,6 +156,10 @@ impl ApplicationHandler for App {
         )));
         self.apply_commands();
         self.ensure_egui();
+        // Open on a landscape, as long as some plugin has provided one.
+        if !self.plugins.world_names().is_empty() {
+            self.generate();
+        }
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
@@ -305,6 +312,7 @@ impl App {
         let mut actions = ui::Actions::default();
         let brushes = self.plugins.names(Kind::Brush);
         let tools = self.plugins.names(Kind::Tool);
+        let worlds = self.plugins.world_names();
         let full_output = ctx.run_ui(raw_input, |ui| {
             actions = ui::draw(
                 ui.ctx(),
@@ -312,6 +320,7 @@ impl App {
                 &self.plugins.registry(),
                 &brushes,
                 &tools,
+                &worlds,
                 &self.status,
             );
         });
@@ -320,6 +329,12 @@ impl App {
             .unwrap()
             .handle_platform_output(&window, full_output.platform_output);
         let paint_jobs = ctx.tessellate(full_output.shapes, full_output.pixels_per_point);
+
+        if actions.randomize {
+            self.randomize();
+        } else if actions.generate {
+            self.generate();
+        }
 
         if let Some(state) = &mut self.state {
             if actions.clear {
@@ -385,8 +400,36 @@ impl App {
                     state.sim.clear();
                 }
             }
+            // The world: build it again from the seed in the box, or from a
+            // fresh one.
+            KeyCode::KeyG => self.generate(),
+            KeyCode::KeyR => self.randomize(),
             _ => {}
         }
+    }
+
+    /// Build the chosen world from the seed in the box and put it in place of
+    /// whatever was there. A world script that fails says so on the panel,
+    /// the way a plugin that fails to load does, and the old world stays.
+    fn generate(&mut self) {
+        let Some(state) = &mut self.state else {
+            return;
+        };
+        let c = &self.input.controls;
+        let (world, seed) = (c.world, c.seed_value());
+        match self.plugins.generate(world, seed) {
+            Ok(cells) => state.sim.load(&cells),
+            Err(err) => {
+                log::error!("world failed: {err}");
+                self.status = err;
+            }
+        }
+    }
+
+    /// Roll a new seed into the box and build the chosen world from it.
+    fn randomize(&mut self) {
+        self.input.controls.set_seed(ui::random_seed());
+        self.generate();
     }
 
     /// Load every `.lua` file in [`PLUGIN_DIR`], in name order. No folder is
@@ -475,7 +518,8 @@ pub fn run() {
          (1=Sand 2=Stone 3=Water 4=Lava 5=Soil, then the plugin materials)  0/Backspace=Erase  \
          W=wind tool (sweep to blow a gust)  [ ]=brush size  Space=pause  .=step one tick  \
          - ==slower/faster  \
-         C=clear  (hold left mouse to draw). \
+         C=clear  G=build the world again  R=build it from a new seed  \
+         (hold left mouse to draw). \
          Drop a .lua file on the window to load a plugin."
     );
 

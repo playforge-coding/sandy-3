@@ -589,6 +589,42 @@ impl Simulation {
         self.queue.submit([encoder.finish()]);
     }
 
+    /// Replace the whole world with `cells`, one material per cell from the
+    /// top left, as a world generator hands them over. The weather is stilled
+    /// as [`Simulation::clear`] stills it, so a fresh world starts calm.
+    ///
+    /// Each cell is given a grain the way the brush gives one, from a seed
+    /// that changes every load, so two loads of the same landscape do not
+    /// look identical down to the speckle.
+    pub fn load(&mut self, cells: &[MaterialId]) {
+        assert_eq!(
+            cells.len(),
+            (self.width * self.height) as usize,
+            "a loaded world must be exactly the size of the grid"
+        );
+        self.seed = self
+            .seed
+            .wrapping_mul(1_664_525)
+            .wrapping_add(1_013_904_223);
+        let seed = self.seed;
+        let words: Vec<u32> = cells
+            .iter()
+            .enumerate()
+            .map(|(index, &material)| {
+                let variant =
+                    kernels::hash(seed.wrapping_add((index as u32).wrapping_mul(2_654_435_761)))
+                        & 255;
+                material as u32 | (variant << 8)
+            })
+            .collect();
+        // The clear is submitted first, and a queued write lands ahead of the
+        // next submission, so the cells go in after the buffer is zeroed
+        // rather than being wiped by it.
+        self.clear();
+        self.queue
+            .write_buffer(&self.cells, 0, bytemuck::cast_slice(&words));
+    }
+
     /// Empty the world and still the weather.
     pub fn clear(&mut self) {
         let mut encoder = self
@@ -1202,6 +1238,74 @@ mod tests {
             (after - calm).abs() < 6.0,
             "a gust blown fifteen seconds ago should have died away, but sand still \
              lands at {after:.0} against {calm:.0} in a world that was never blown"
+        );
+    }
+
+    #[test]
+    fn a_loaded_world_replaces_what_was_there_and_then_runs() {
+        // A generated world arrives as one grid and goes in with one write.
+        // Sand left hanging in the air by the generator should then fall
+        // like any painted sand, which is the whole point of loading rather
+        // than drawing: the world is alive the moment it is in.
+        let (device, queue) = headless();
+        let mut sim = Simulation::new(&device, &queue, &Registry::builtin());
+        sim.paint_disk(500, 250, 40, LAVA);
+        run(&mut sim, 5);
+
+        let mut cells = vec![EMPTY; (GRID_W * GRID_H) as usize];
+        for x in 0..GRID_W {
+            cells[((GRID_H - 1) * GRID_W + x) as usize] = STONE;
+        }
+        for x in 400..600 {
+            cells[(100 * GRID_W + x) as usize] = SAND;
+        }
+        sim.load(&cells);
+
+        let world = snapshot(&sim);
+        assert_eq!(world.count(LAVA), 0, "the old world is gone");
+        assert_eq!(world.count(STONE), GRID_W as usize);
+        assert_eq!(world.count(SAND), 200);
+        assert_eq!(world.highest(SAND), Some(100));
+
+        run(&mut sim, 400);
+        let world = snapshot(&sim);
+        assert_eq!(world.count(SAND), 200, "loading loses nothing");
+        assert!(
+            world.highest(SAND).unwrap() > 400,
+            "the loaded sand should have fallen to the floor"
+        );
+    }
+
+    #[test]
+    fn a_tree_catches_fire_from_a_flame_at_its_foot() {
+        // Wood and leaves are the plugins' fuel: a cell of either next to
+        // fire becomes fire. A trunk with a canopy is set alight at the
+        // bottom, and after a while there should be a good deal less tree.
+        let registry = with_plugins();
+        let fire = registry.find("Fire").unwrap();
+        let wood = registry.find("Wood").unwrap();
+        let leaves = registry.find("Leaves").unwrap();
+        let (device, queue) = headless();
+        let mut sim = Simulation::new(&device, &queue, &registry);
+        floor(&mut sim, STONE);
+        for y in 400..460 {
+            sim.paint_disk(500, y, 1, wood);
+        }
+        sim.paint_disk(500, 390, 14, leaves);
+        let before = snapshot(&sim);
+        let fuel = before.count(wood) + before.count(leaves);
+
+        for _ in 0..60 {
+            sim.paint_disk(500, 465, 6, fire);
+            sim.step();
+        }
+        run(&mut sim, 600);
+
+        let after = snapshot(&sim);
+        let left = after.count(wood) + after.count(leaves);
+        assert!(
+            left < fuel / 2,
+            "the fire should have taken most of the tree, but {left} of {fuel} cells are left"
         );
     }
 

@@ -1,13 +1,14 @@
-//! Lua plugins: scripts that add materials, brushes and tools while the game
-//! runs.
+//! Lua plugins: scripts that add materials, brushes, tools and worlds while
+//! the game runs.
 //!
 //! A plugin is one `.lua` file. Dropped on the window, left in the `plugins`
 //! folder next to where the game is run from, or compiled in as one of
 //! [`BUILTIN`], it is executed once with a `sandy` table in scope, and whatever
 //! it registers through that table is in the game from then on. A material is
 //! a row in the [`Registry`] that [`crate::sim::Simulation::set_tables`] then
-//! uploads, and a brush or a tool is a Lua function the app calls every frame
-//! the mouse is held with it selected.
+//! uploads, a brush or a tool is a Lua function the app calls every frame
+//! the mouse is held with it selected, and a world is a Lua function that
+//! paints a whole landscape when the panel asks for it.
 //!
 //! # What a script sees
 //!
@@ -24,16 +25,24 @@
 //! sandy.tool { name = "Fan", on_drag = function(t)
 //!     sandy.wind(t.x, t.y, 30, 0, -4)
 //! end }
+//! sandy.world { name = "Flat", generate = function(w)
+//!     local hills = sandy.noise { seed = w.seed, frequency = 0.01, octaves = 4 }
+//!     for x = 0, w.width - 1 do
+//!         local top = w.height * 0.6 - hills:at(x, 0) * 40
+//!         w:fill(x, top, x, w.height - 1, "Soil")
+//!     end
+//! end }
 //! sandy.find("Water")                   -- an id, or nil
 //! sandy.paint(x, y, radius, material)   -- material is a name or an id
 //! sandy.wind(x, y, radius, dvx, dvy)
+//! sandy.noise { seed = 1, frequency = 0.01, octaves = 4 }
 //! sandy.width, sandy.height             -- the grid, in cells
 //! ```
 //!
-//! Materials, brushes and tools go by name. Registering a name that already
-//! exists replaces the old entry in place, which is what makes dropping a file
-//! on the window a second time a reload, and lets a plugin retune a built-in
-//! material or brush.
+//! Materials, brushes, tools and worlds go by name. Registering a name that
+//! already exists replaces the old entry in place, which is what makes
+//! dropping a file on the window a second time a reload, and lets a plugin
+//! retune a built-in material or brush.
 //!
 //! A brush and a tool are the same thing to this module, a function called
 //! once a frame while the mouse is held (see [`Kind`]). The difference is what
@@ -55,6 +64,12 @@
 //! it once the script has returned, so the Lua state and the GPU state never
 //! have to know about each other.
 //!
+//! A world is the same idea at a larger scale. Its `generate` function paints
+//! into a [`Canvas`] in main memory, and when it returns the whole grid goes
+//! to the GPU in one write (see [`Plugins::generate`]). The canvas is handed
+//! to the script as an object, `w`, that only works while that one generation
+//! is running.
+//!
 //! # Sandbox
 //!
 //! A script gets Lua's base library, `string`, `table`, `math`, `utf8` and
@@ -69,10 +84,14 @@ use std::fmt;
 use std::path::Path;
 use std::rc::Rc;
 
-use mlua::{FromLua, Function, Lua, LuaOptions, StdLib, Table, Value, Variadic};
+use mlua::{
+    FromLua, Function, Lua, LuaOptions, StdLib, Table, UserData, UserDataFields, UserDataMethods,
+    Value, Variadic,
+};
 
 use crate::materials::{Look, MaterialId, MaterialInfo, Registry, Rule};
 use crate::sim::{GRID_H, GRID_W};
+use crate::worldgen::{Canvas, Noise};
 
 /// The widest brush a script can ask for, in cells. The paint and gust kernels
 /// are dispatched over the brush's bounding square, so an unbounded radius
@@ -91,6 +110,12 @@ pub const BUILTIN: &[(&str, &str)] = &[
     ("fire.lua", include_str!("plugins/fire.lua")),
     ("spray.lua", include_str!("plugins/spray.lua")),
     ("steam.lua", include_str!("plugins/steam.lua")),
+    // Wood's rules name fire too.
+    ("wood.lua", include_str!("plugins/wood.lua")),
+    // The worlds only name materials when they are generated, so they could
+    // go anywhere, but the panel lists them in this order.
+    ("worlds.lua", include_str!("plugins/worlds.lua")),
+    ("caverns.lua", include_str!("plugins/caverns.lua")),
 ];
 
 /// The two kinds of script a stroke can drive. They are registered with
@@ -157,6 +182,7 @@ pub struct Report {
     pub rules: usize,
     pub brushes: usize,
     pub tools: usize,
+    pub worlds: usize,
 }
 
 impl fmt::Display for Report {
@@ -170,11 +196,12 @@ impl fmt::Display for Report {
         };
         write!(
             f,
-            "{}, {}, {}, {}",
+            "{}, {}, {}, {}, {}",
             count(self.materials, "material", "materials"),
             count(self.rules, "rule", "rules"),
             count(self.brushes, "brush", "brushes"),
-            count(self.tools, "tool", "tools")
+            count(self.tools, "tool", "tools"),
+            count(self.worlds, "world", "worlds")
         )
     }
 }
@@ -185,6 +212,13 @@ struct PluginTool {
     on_drag: Function,
 }
 
+/// A world preset a script registered: a name for the panel and the function
+/// that paints it.
+struct PluginWorld {
+    name: String,
+    generate: Function,
+}
+
 /// Everything the `sandy` functions write to. The Lua closures each hold a
 /// handle to this, and so does [`Plugins`], which is how what a script did
 /// gets back out.
@@ -192,7 +226,15 @@ struct Shared {
     registry: Registry,
     brushes: Vec<PluginTool>,
     tools: Vec<PluginTool>,
+    worlds: Vec<PluginWorld>,
     commands: Vec<Command>,
+    /// The world being generated, while a world's `generate` function is
+    /// running, and nothing the rest of the time. See [`Plugins::generate`].
+    canvas: Option<Canvas>,
+    /// Which generation is running, counted up each time one starts, so a
+    /// handle a script kept from an earlier one can be told apart from the
+    /// current one.
+    generation: u64,
     /// What the script currently being loaded has registered so far.
     report: Report,
 }
@@ -238,6 +280,108 @@ fn register(shared: &Rc<RefCell<Shared>>, kind: Kind, spec: Table) -> mlua::Resu
     Ok(())
 }
 
+/// `sandy.world`: the same registration again, for a landscape. A name
+/// already in the list is replaced in place, so the panel's choice of world
+/// still points at the same entry.
+fn register_world(shared: &Rc<RefCell<Shared>>, spec: Table) -> mlua::Result<()> {
+    let name: String = required(&spec, "name")?;
+    if name.trim().is_empty() {
+        return Err(runtime("a world needs a name"));
+    }
+    let generate: Function = required(&spec, "generate")?;
+    let mut shared = shared.borrow_mut();
+    match shared
+        .worlds
+        .iter_mut()
+        .find(|entry| entry.name.eq_ignore_ascii_case(&name))
+    {
+        Some(entry) => entry.generate = generate,
+        None => shared.worlds.push(PluginWorld { name, generate }),
+    }
+    shared.report.worlds += 1;
+    Ok(())
+}
+
+/// What a world's `generate` function is handed: the seed and the size of
+/// the world, and the methods that paint into the canvas. It is only good
+/// for the one generation it was made for; the canvas is taken away when the
+/// function returns, and a stashed handle used later says so.
+struct World {
+    shared: Rc<RefCell<Shared>>,
+    seed: u32,
+    /// The generation this handle belongs to; see [`Shared::generation`].
+    generation: u64,
+}
+
+impl World {
+    /// The canvas, as long as this handle's generation is the one running.
+    fn canvas<'a>(&self, shared: &'a mut Shared) -> mlua::Result<&'a mut Canvas> {
+        if shared.generation != self.generation {
+            return Err(runtime("this world has already been built"));
+        }
+        shared
+            .canvas
+            .as_mut()
+            .ok_or_else(|| runtime("this world has already been built"))
+    }
+
+    /// Run `f` on the canvas, with a material a script named resolved to its
+    /// id first, since both live in the same borrow.
+    fn paint(&self, material: &Value, f: impl FnOnce(&mut Canvas, MaterialId)) -> mlua::Result<()> {
+        let shared = &mut *self.shared.borrow_mut();
+        let material = resolve(&shared.registry, material, "material")?;
+        let canvas = self.canvas(shared)?;
+        f(canvas, material);
+        Ok(())
+    }
+}
+
+/// A cell coordinate a script gave, which may be a float from its arithmetic.
+/// Rounded down, so a tree planted at `top - 0.5` stands on the cell above.
+fn cell(v: f64) -> i64 {
+    if v.is_finite() {
+        v.floor() as i64
+    } else {
+        // Off the grid, so anything painted here is clipped away.
+        i64::MIN / 2
+    }
+}
+
+impl UserData for World {
+    fn add_fields<F: UserDataFields<Self>>(fields: &mut F) {
+        fields.add_field_method_get("seed", |_, w| Ok(w.seed));
+        fields.add_field_method_get("width", |_, _| Ok(GRID_W));
+        fields.add_field_method_get("height", |_, _| Ok(GRID_H));
+    }
+
+    fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
+        methods.add_method("set", |_, w, (x, y, material): (f64, f64, Value)| {
+            w.paint(&material, |canvas, m| canvas.set(cell(x), cell(y), m))
+        });
+        methods.add_method("get", |_, w, (x, y): (f64, f64)| {
+            let shared = &mut *w.shared.borrow_mut();
+            Ok(w.canvas(shared)?.get(cell(x), cell(y)))
+        });
+        methods.add_method(
+            "fill",
+            |_, w, (x0, y0, x1, y1, material): (f64, f64, f64, f64, Value)| {
+                w.paint(&material, |canvas, m| {
+                    canvas.fill(cell(x0), cell(y0), cell(x1), cell(y1), m)
+                })
+            },
+        );
+        methods.add_method(
+            "disk",
+            |_, w, (x, y, radius, material): (f64, f64, f64, Value)| {
+                let radius = clamp_radius(radius) as i64;
+                w.paint(&material, |canvas, m| {
+                    canvas.disk(cell(x), cell(y), radius, m)
+                })
+            },
+        );
+    }
+}
+
 /// The Lua interpreter, the materials, brushes and tools the scripts have
 /// registered, and the commands they have queued.
 pub struct Plugins {
@@ -267,7 +411,10 @@ impl Plugins {
             registry: Registry::builtin(),
             brushes: Vec::new(),
             tools: Vec::new(),
+            worlds: Vec::new(),
             commands: Vec::new(),
+            canvas: None,
+            generation: 0,
             report: Report::default(),
         }));
 
@@ -334,6 +481,17 @@ impl Plugins {
                 lua.create_function(move |_, spec: Table| register(&s, kind, spec))?,
             )?;
         }
+
+        let s = shared.clone();
+        sandy.set(
+            "world",
+            lua.create_function(move |_, spec: Table| register_world(&s, spec))?,
+        )?;
+
+        sandy.set(
+            "noise",
+            lua.create_function(|_, spec: Table| Noise::from_spec(&spec))?,
+        )?;
 
         let s = shared.clone();
         sandy.set(
@@ -452,6 +610,56 @@ impl Plugins {
         on_drag.call::<()>(frame).map_err(|err| describe(&err))
     }
 
+    /// The names of the worlds scripts have registered, in the order they were
+    /// added. The panel's choice of world is an index into these.
+    pub fn world_names(&self) -> Vec<String> {
+        self.shared
+            .borrow()
+            .worlds
+            .iter()
+            .map(|entry| entry.name.clone())
+            .collect()
+    }
+
+    /// Build world number `index` from `seed`: run its `generate` function
+    /// over a fresh canvas and hand back the grid it painted, one material
+    /// per cell from the top left, for [`crate::sim::Simulation::load`].
+    ///
+    /// The same world and seed always give the same grid. Lua's `math.random`
+    /// is reseeded from `seed` first, so a script can scatter trees with it
+    /// and still be reproducible; the noise it makes carries its own seed.
+    pub fn generate(&mut self, index: usize, seed: u32) -> Result<Vec<MaterialId>, String> {
+        let generate = self
+            .shared
+            .borrow()
+            .worlds
+            .get(index)
+            .map(|entry| entry.generate.clone())
+            .ok_or_else(|| format!("there is no world number {index}"))?;
+        let generation = {
+            let mut shared = self.shared.borrow_mut();
+            shared.canvas = Some(Canvas::new(GRID_W, GRID_H));
+            shared.generation += 1;
+            shared.generation
+        };
+
+        let result = (|| {
+            let math: Table = self.lua.globals().get("math")?;
+            math.get::<Function>("randomseed")?.call::<()>(seed)?;
+            let world = World {
+                shared: self.shared.clone(),
+                seed,
+                generation,
+            };
+            generate.call::<()>(world)
+        })();
+        // The canvas comes out whatever happened, so a script that failed
+        // halfway leaves nothing behind for the next one to paint over.
+        let canvas = self.shared.borrow_mut().canvas.take();
+        result.map_err(|err| describe(&err))?;
+        Ok(canvas.expect("the canvas is only taken here").into_cells())
+    }
+
     /// Every material and rule, built in and from scripts.
     pub fn registry(&self) -> Ref<'_, Registry> {
         Ref::map(self.shared.borrow(), |shared| &shared.registry)
@@ -464,7 +672,7 @@ impl Plugins {
     }
 }
 
-fn runtime(message: impl fmt::Display) -> mlua::Error {
+pub(crate) fn runtime(message: impl fmt::Display) -> mlua::Error {
     mlua::Error::runtime(message.to_string())
 }
 
@@ -474,7 +682,7 @@ fn required<T: FromLua>(spec: &Table, key: &str) -> mlua::Result<T> {
 }
 
 /// A field that may be missing, in which case `default` stands in.
-fn optional<T: FromLua>(spec: &Table, key: &str, default: T) -> mlua::Result<T> {
+pub(crate) fn optional<T: FromLua>(spec: &Table, key: &str, default: T) -> mlua::Result<T> {
     let value: Option<T> = spec
         .get(key)
         .map_err(|err| runtime(format!("'{key}': {}", plain(&err))))?;
@@ -592,7 +800,7 @@ fn plain(err: &mlua::Error) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::materials::{EMPTY, SAND, STONE, WATER};
+    use crate::materials::{EMPTY, LAVA, SAND, SOIL, STONE, WATER};
 
     #[test]
     fn a_script_can_add_a_material_and_a_rule() {
@@ -616,10 +824,14 @@ mod tests {
                 materials: 1,
                 rules: 1,
                 brushes: 0,
-                tools: 0
+                tools: 0,
+                worlds: 0,
             }
         );
-        assert_eq!(report.to_string(), "1 material, 1 rule, 0 brushes, 0 tools");
+        assert_eq!(
+            report.to_string(),
+            "1 material, 1 rule, 0 brushes, 0 tools, 0 worlds"
+        );
 
         let registry = plugins.registry();
         let acid = registry.find("Acid").expect("the material was registered");
@@ -846,6 +1058,10 @@ mod tests {
         drop(registry);
         assert_eq!(plugins.names(Kind::Brush), ["Disk", "Spray"]);
         assert_eq!(plugins.names(Kind::Tool), ["Fan"]);
+        assert_eq!(
+            plugins.world_names(),
+            ["Forest", "Plains", "Ocean", "Desert", "Caverns"]
+        );
 
         // The plain brush is brush zero, the panel's default, and it paints
         // the chosen material at the chosen size, which is all it does.
@@ -889,6 +1105,188 @@ mod tests {
                 "({x}, {y}) is outside the brush"
             );
         }
+    }
+
+    /// How many cells of each material a generated world holds.
+    fn census(cells: &[MaterialId]) -> impl Fn(MaterialId) -> usize + '_ {
+        move |material| cells.iter().filter(|&&m| m == material).count()
+    }
+
+    #[test]
+    fn a_script_can_register_a_world_and_paint_it() {
+        let mut plugins = Plugins::new();
+        let report = plugins
+            .load(
+                "flat.lua",
+                r#"
+                sandy.world { name = "Flat", generate = function(w)
+                    assert(w.width == sandy.width and w.height == sandy.height)
+                    assert(w:get(0, 0) == 0, "a fresh canvas is air")
+                    assert(w:get(-1, 0) == nil, "off the grid is nil")
+                    -- A floor, a pond in it, a boulder, and one grain of sand
+                    -- off the edge that goes nowhere.
+                    w:fill(0, w.height - 10, w.width - 1, w.height - 1, "Stone")
+                    w:fill(100, w.height - 10, 199, w.height - 6, "water")
+                    w:disk(500, 100, 3, sandy.find("Soil"))
+                    w:set(w.width, 5, "Sand")
+                    assert(w:get(500, 100) == sandy.find("Soil"))
+                end }
+                "#,
+            )
+            .unwrap();
+        assert_eq!(report.worlds, 1);
+        assert_eq!(plugins.world_names(), ["Flat"]);
+
+        let cells = plugins.generate(0, 5).unwrap();
+        assert_eq!(cells.len(), (GRID_W * GRID_H) as usize);
+        let count = census(&cells);
+        assert_eq!(count(WATER), 100 * 5);
+        assert_eq!(count(STONE), (GRID_W * 10) as usize - 100 * 5);
+        assert_eq!(count(SAND), 0, "off the grid is clipped");
+        assert_eq!(count(SOIL), 29, "a disk of radius three");
+        assert_eq!(cells[(100 * GRID_W + 500) as usize], SOIL);
+
+        // Registering the same name again replaces the world in place.
+        plugins
+            .load(
+                "flat.lua",
+                r#"sandy.world { name = "flat", generate = function(w) end }"#,
+            )
+            .unwrap();
+        assert_eq!(plugins.world_names(), ["Flat"]);
+        assert!(plugins.generate(0, 5).unwrap().iter().all(|&m| m == EMPTY));
+        assert!(plugins.generate(1, 5).is_err(), "no such world");
+    }
+
+    #[test]
+    fn the_same_seed_builds_the_same_world_and_another_seed_a_different_one() {
+        let mut plugins = Plugins::new();
+        plugins.load_builtin();
+        let forest = plugins
+            .world_names()
+            .iter()
+            .position(|name| name == "Forest")
+            .unwrap();
+        let first = plugins.generate(forest, 1337).unwrap();
+        let again = plugins.generate(forest, 1337).unwrap();
+        let other = plugins.generate(forest, 1338).unwrap();
+        assert_eq!(first, again, "the seed decides everything, trees included");
+        assert_ne!(first, other);
+
+        // The forest has ground, water in the valleys, and trees.
+        let count = census(&first);
+        let registry = plugins.registry();
+        let wood = registry.find("Wood").unwrap();
+        let leaves = registry.find("Leaves").unwrap();
+        assert!(count(SOIL) > 5_000);
+        assert!(count(STONE) > 50_000);
+        assert!(count(WATER) > 3_000, "only {} water", count(WATER));
+        assert!(count(wood) > 100, "only {} wood", count(wood));
+        assert!(
+            count(leaves) > count(wood),
+            "canopies are bigger than trunks"
+        );
+        assert!(count(EMPTY) > 100_000, "there is sky");
+        // The top row is sky and the bottom row is rock, whatever the seed.
+        assert!(first[..GRID_W as usize].iter().all(|&m| m == EMPTY));
+        assert!(
+            first[((GRID_H - 1) * GRID_W) as usize..]
+                .iter()
+                .all(|&m| m == STONE)
+        );
+    }
+
+    #[test]
+    fn every_built_in_world_builds_and_is_its_own_kind_of_place() {
+        let mut plugins = Plugins::new();
+        plugins.load_builtin();
+        let names = plugins.world_names();
+        let by_name = |name: &str| names.iter().position(|n| n == name).unwrap();
+        let build =
+            |plugins: &mut Plugins, name: &str| plugins.generate(by_name(name), 99).unwrap();
+
+        let plains = build(&mut plugins, "Plains");
+        assert_eq!(census(&plains)(WATER), 0, "the plains are dry");
+        assert!(census(&plains)(SOIL) > 5_000);
+
+        let ocean = build(&mut plugins, "Ocean");
+        let count = census(&ocean);
+        assert!(count(WATER) > 300_000, "the ocean is mostly water");
+        assert!(count(SAND) > 10_000, "over a sandy bed");
+        assert_eq!(count(SOIL) + count(STONE), 0);
+
+        let desert = build(&mut plugins, "Desert");
+        let count = census(&desert);
+        assert_eq!(count(WATER), 0);
+        assert!(count(SAND) > 5_000 && count(STONE) > 50_000);
+
+        let caverns = build(&mut plugins, "Caverns");
+        let count = census(&caverns);
+        assert!(count(STONE) > 150_000, "mostly rock");
+        assert!(count(EMPTY) > 120_000, "with the sky and the hollows");
+        assert!(
+            count(WATER) > 0 && count(LAVA) > 0,
+            "pools in the deep pockets"
+        );
+    }
+
+    #[test]
+    fn a_world_that_fails_says_where_and_leaves_nothing_behind() {
+        let mut plugins = Plugins::new();
+        plugins
+            .load(
+                "bad.lua",
+                r#"
+                stash = nil
+                sandy.world { name = "Half", generate = function(w)
+                    stash = w
+                    w:fill(0, 0, 10, 10, "Stone")
+                    w:set(0, 0, "Unobtainium")
+                end }
+                sandy.world { name = "Late", generate = function(w)
+                    return stash:get(0, 0)
+                end }
+                "#,
+            )
+            .unwrap();
+        let err = plugins.generate(0, 1).unwrap_err();
+        assert!(err.contains("Unobtainium"), "{err}");
+        assert!(err.contains("bad.lua:6"), "{err}");
+
+        // The canvas the failed script painted on is gone, and so a handle to
+        // it kept from that run is no use to a later one.
+        let err = plugins.generate(1, 1).unwrap_err();
+        assert!(err.contains("already been built"), "{err}");
+
+        // A world with no generate function is refused at registration.
+        let err = plugins
+            .load("bad.lua", r#"sandy.world { name = "Nothing" }"#)
+            .unwrap_err();
+        assert!(err.contains("generate"), "{err}");
+    }
+
+    #[test]
+    fn noise_from_a_script_is_seeded_and_the_grid_is_by_row() {
+        let mut plugins = Plugins::new();
+        plugins
+            .load(
+                "noise.lua",
+                r#"
+                local a = sandy.noise { seed = 3, frequency = 0.05, octaves = 2 }
+                local b = sandy.noise { seed = 3, frequency = 0.05, octaves = 2 }
+                local c = sandy.noise { seed = 4, frequency = 0.05, octaves = 2 }
+                assert(a:at(10, 20) == b:at(10, 20), "same seed, same noise")
+                assert(a:at(10, 20) ~= c:at(10, 20), "another seed, other noise")
+                local g = a:grid(30, 25)
+                assert(math.abs(g[20][10] - a:at(10, 20)) < 1e-4, "rows then columns")
+                assert(g[24][29] ~= nil and g[25] == nil and g[0][30] == nil)
+                "#,
+            )
+            .unwrap();
+        let err = plugins
+            .load("noise.lua", r#"sandy.noise { kind = "static" }"#)
+            .unwrap_err();
+        assert!(err.contains("static"), "{err}");
     }
 
     #[test]

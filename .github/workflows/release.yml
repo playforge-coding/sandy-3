@@ -13,10 +13,11 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  # `.cargo/config.toml` routes rustc through sccache, which the runners do not
-  # have. Cargo treats an empty wrapper as none, the same as the README's
-  # `RUSTC_WRAPPER= cargo build`.
-  RUSTC_WRAPPER: ""
+  # `.cargo/config.toml` routes rustc through sccache. The sccache-action step
+  # below installs it on the runner, and this tells it to keep the cache in
+  # the GitHub Actions cache rather than on the runner's disk, so it survives
+  # from one release to the next.
+  SCCACHE_GHA_ENABLED: "true"
 
 jobs:
   build:
@@ -43,6 +44,13 @@ jobs:
       - name: Install toolchain
         run: rustup toolchain install
 
+      # Puts sccache on the path, so the wrapper in `.cargo/config.toml` works
+      # here the same as it does locally.
+      - uses: mozilla-actions/sccache-action@v0.0.11
+
+      # Caches the registry and `target`; sccache covers the compiled crates
+      # themselves, so between the two a rebuild of an unchanged dependency
+      # never happens on a runner either.
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.target }}
@@ -51,6 +59,9 @@ jobs:
       # runner image ships a C/C++ compiler and cmake already.
       - name: Build
         run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: sccache stats
+        run: sccache --show-stats
 
       - name: Package
         shell: bash

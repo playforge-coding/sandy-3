@@ -572,5 +572,13 @@ cold build, so any measurement of compile time wants the `RUSTC_WRAPPER=` above
 to switch the wrapper off for that run. The 23s and 18s figures were taken that
 way.
 
+The release workflow uses the same wrapper. The
+[sccache-action](https://github.com/mozilla-actions/sccache-action) puts
+sccache on each runner, and `SCCACHE_GHA_ENABLED` keeps its cache in the
+GitHub Actions cache rather than on the runner's disk, so crates built for one
+release come back out of the cache for the next. The build's `sccache
+--show-stats` step is the place to look when a release build takes longer than
+it should.
+
 The tests drive real compute kernels on a real adapter, so a machine with no
 usable GPU cannot run them.

@@ -8,17 +8,39 @@
 //!
 //! The glow buffers stay at the grid's resolution. They are small, and a halo is
 //! soft anyway, so only the surface is reconfigured when the window changes size.
+//!
+//! A frame that is wanted for a screenshot or a recording gets a fifth pass:
+//! the composite drawn again, at the grid's resolution and without the panel,
+//! into an image that is then copied out to a buffer the CPU can map. The
+//! mapping is left to complete on its own and collected by
+//! [`State::take_frames`] a frame or two later, so a recording does not hold
+//! the frame up waiting on the GPU.
 
+use std::collections::VecDeque;
 use std::sync::Arc;
+use std::sync::mpsc;
 use std::time::Instant;
 
 use winit::window::Window;
 
+use crate::capture::Frame;
 use crate::materials::Registry;
 use crate::sim::{GRID_H, GRID_W, Simulation};
 
 /// How far the glow spreads, in grid cells per blur tap. Larger is a wider halo.
 const GLOW_SPREAD: f32 = 1.5;
+
+/// Bytes per row of a captured frame in its staging buffer: four per pixel,
+/// rounded up to the alignment a texture-to-buffer copy demands.
+const CAPTURE_ROW_BYTES: u32 =
+    (GRID_W * 4).div_ceil(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT) * wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+
+/// A captured frame on its way back: the buffer the GPU is copying it into,
+/// and where the mapping says when it is ready to read.
+struct Readback {
+    buffer: wgpu::Buffer,
+    mapped: mpsc::Receiver<Result<(), wgpu::BufferAsyncError>>,
+}
 
 /// How fast the world runs, in ticks per second.
 ///
@@ -58,6 +80,16 @@ pub struct State {
     scene_view: wgpu::TextureView,
     glow_a_view: wgpu::TextureView,
     glow_b_view: wgpu::TextureView,
+
+    /// The capture image: the composite again, at the grid's resolution, in
+    /// a plain format whose bytes are the sRGB values a file wants.
+    capture_texture: wgpu::Texture,
+    capture_view: wgpu::TextureView,
+    pipeline_capture: wgpu::RenderPipeline,
+    /// Captured frames the GPU is still copying out, oldest first, and the
+    /// staging buffers that have been read and can be used again.
+    readbacks: VecDeque<Readback>,
+    spare_staging: Vec<wgpu::Buffer>,
 
     /// egui's wgpu backend, which turns the tessellated panel into draw calls
     /// layered over the finished scene.
@@ -176,6 +208,25 @@ impl State {
         let scene_view = offscreen("scene");
         let glow_a_view = offscreen("glow a");
         let glow_b_view = offscreen("glow b");
+
+        // The capture image is the same size but not sRGB, so that what is
+        // copied out of it is exactly what the composite wrote, and it can be
+        // copied out at all.
+        let capture_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("capture"),
+            size: wgpu::Extent3d {
+                width: GRID_W,
+                height: GRID_H,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let capture_view = capture_texture.create_view(&wgpu::TextureViewDescriptor::default());
 
         // Nearest for the crisp grid, and for the glow mask so it stays exact;
         // linear for the glow buffers so the halo scales up smoothly.
@@ -456,6 +507,16 @@ impl State {
             composite_entry,
             config.format,
         );
+        // The capture is the same composite into a plain, non-sRGB image, so
+        // it always takes the entry point that encodes by hand, whatever the
+        // window does.
+        let pipeline_capture = make_pipeline(
+            "capture",
+            &bloom_shader,
+            &composite_layout,
+            "fs_composite",
+            wgpu::TextureFormat::Rgba8Unorm,
+        );
 
         // egui paints into the surface format, in its own pass after the
         // composite. The defaults suit it: no MSAA, no depth, feathered edges.
@@ -484,6 +545,11 @@ impl State {
             scene_view,
             glow_a_view,
             glow_b_view,
+            capture_texture,
+            capture_view,
+            pipeline_capture,
+            readbacks: VecDeque::new(),
+            spare_staging: Vec::new(),
             egui_renderer,
             last_update: Instant::now(),
             tick_accumulator: 0.0,
@@ -550,12 +616,16 @@ impl State {
     ///
     /// `paint_jobs` and `textures_delta` come from egui's `run` and `tessellate`
     /// over in [`crate::app`]; `pixels_per_point` is the scale it laid out at.
+    /// With `capture` set, the scene is also copied out for
+    /// [`State::take_frames`]. Returns whether that copy was made: it is not
+    /// when the frame is skipped because the surface wants reconfiguring.
     pub fn render(
         &mut self,
         paint_jobs: Vec<egui::ClippedPrimitive>,
         mut textures_delta: egui::TexturesDelta,
         pixels_per_point: f32,
-    ) {
+        capture: bool,
+    ) -> bool {
         // Take egui's new and changed textures first, before anything that
         // could bail out. A delta is sent once and never again, so a frame that
         // gave up here without applying it would lose the font atlas for good
@@ -577,12 +647,12 @@ impl State {
             wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
                 self.surface.configure(&self.device, &self.config);
                 self.free_textures(&mut textures_delta);
-                return;
+                return false;
             }
             // Occluded, timed out, or refused: just skip the frame.
             _ => {
                 self.free_textures(&mut textures_delta);
-                return;
+                return false;
             }
         };
 
@@ -665,6 +735,50 @@ impl State {
             None,
         );
 
+        // 4a. The same again into the capture image, if a frame is wanted,
+        //     and from there into a staging buffer. The buffer is mapped
+        //     after the submit below, so the copy is in the queue ahead of it.
+        let staging = capture.then(|| {
+            pass(
+                &mut encoder,
+                "capture pass",
+                &self.capture_view,
+                &self.pipeline_capture,
+                &self.bg_composite,
+                None,
+            );
+            let buffer = self.spare_staging.pop().unwrap_or_else(|| {
+                self.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("capture staging"),
+                    size: (CAPTURE_ROW_BYTES * GRID_H) as wgpu::BufferAddress,
+                    usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                    mapped_at_creation: false,
+                })
+            });
+            encoder.copy_texture_to_buffer(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &self.capture_texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::TexelCopyBufferInfo {
+                    buffer: &buffer,
+                    layout: wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(CAPTURE_ROW_BYTES),
+                        rows_per_image: Some(GRID_H),
+                    },
+                },
+                wgpu::Extent3d {
+                    width: GRID_W,
+                    height: GRID_H,
+                    depth_or_array_layers: 1,
+                },
+            );
+            buffer
+        });
+
         // 5. egui over the top, loading what is already there rather than
         //    clearing it.
         let screen = egui_wgpu::ScreenDescriptor {
@@ -709,9 +823,63 @@ impl State {
         );
         self.queue.present(frame);
 
+        // Ask for the staging buffer to be mapped once the copy into it is
+        // done. The callback only drops a note in the channel; the reading is
+        // done by `take_frames` on the main thread.
+        if let Some(buffer) = staging {
+            let (tx, mapped) = mpsc::channel();
+            buffer.map_async(wgpu::MapMode::Read, .., move |result| {
+                let _ = tx.send(result);
+            });
+            self.readbacks.push_back(Readback { buffer, mapped });
+        }
+
         // Free whatever egui retired this frame, after the submit so nothing is
         // dropped while commands still in flight refer to it.
         self.free_textures(&mut textures_delta);
+        true
+    }
+
+    /// The captured frames that have finished copying out, oldest first, in
+    /// the order they were asked for. Nothing waits: a frame the GPU has not
+    /// finished with yet is left for next time.
+    pub fn take_frames(&mut self) -> Vec<Frame> {
+        if self.readbacks.is_empty() {
+            return Vec::new();
+        }
+        // Give the mapping callbacks a chance to run, without blocking.
+        let _ = self.device.poll(wgpu::PollType::Poll);
+
+        let mut frames = Vec::new();
+        while let Some(front) = self.readbacks.front() {
+            let result = match front.mapped.try_recv() {
+                Ok(result) => result,
+                Err(mpsc::TryRecvError::Empty) => break,
+                // The callback was dropped without running, which means the
+                // device is gone. Nothing more will come of this one.
+                Err(mpsc::TryRecvError::Disconnected) => Err(wgpu::BufferAsyncError),
+            };
+            let Readback { buffer, .. } = self.readbacks.pop_front().expect("just peeked");
+            match result {
+                Ok(()) => {
+                    match buffer.slice(..).get_mapped_range() {
+                        Ok(data) => {
+                            frames.push(Frame::from_padded_rgba(
+                                &data,
+                                GRID_W,
+                                GRID_H,
+                                CAPTURE_ROW_BYTES as usize,
+                            ));
+                        }
+                        Err(err) => log::error!("could not read a captured frame back: {err}"),
+                    }
+                    buffer.unmap();
+                    self.spare_staging.push(buffer);
+                }
+                Err(err) => log::error!("could not read a captured frame back: {err}"),
+            }
+        }
+        frames
     }
 
     /// Hand back the textures egui has finished with, and leave the delta empty.

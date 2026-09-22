@@ -4,12 +4,14 @@
 //! - `kernels`   — the simulation, as compute kernels written in Rust.
 //! - `sim`       — the GPU buffers the world lives in, and the order of passes.
 //! - `gpu`       — wgpu setup and the per-frame draw.
+//! - `capture`   — screenshots and recordings, and the files they are written to.
 //! - `plugins`   — Lua scripts that add materials, tools and worlds.
 //! - `worldgen`  — the canvas and the noise a world script builds with.
 //! - `ui`        — the egui control panel.
 //! - `app`       — the window, the input and the event loop.
 
 mod app;
+mod capture;
 mod gpu;
 mod kernels;
 mod materials;

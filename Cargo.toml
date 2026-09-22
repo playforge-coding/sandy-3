@@ -15,6 +15,15 @@ path = "src/main.rs"
 # wants, without hand-rolling the casts.
 bytemuck = "1.25"
 
+# The palette for a GIF recording. GIF holds 256 colours a frame and a scene
+# has more, so NeuQuant boils them down; see `src/capture/gif.rs`.
+color_quant = "2.0"
+
+# The checksum every PNG chunk ends with. Screenshots and animated PNGs are
+# written chunk by chunk in `src/capture/png.rs`, which is what lets a
+# recording stream to disk frame by frame instead of sitting in memory.
+crc32fast = "1.5"
+
 # The control panel. `egui-wgpu` draws it in a pass over the finished frame and
 # `egui-winit` feeds it the window's input.
 #
@@ -40,6 +49,22 @@ fastnoise2 = "0.4"
 # from the last one; it is shown on the panel so a good one can be kept.
 fastrand = "2.5"
 
+# Deflate, for the PNG and animated PNG writers.
+flate2 = "1.1"
+
+# The GIF writer: the LZW side of a GIF recording, with the palette from
+# `color_quant` above.
+gif = "0.14"
+
+# Lossless WebP screenshots and recordings: Google's libwebp, built from
+# source with `cc` like Lua is, and called through its C API in
+# `src/capture/webp.rs`. The pure-Rust WebP encoders around are simple ones
+# that leave a file half as big again, and none of them writes an animation.
+libwebp-sys = "0.14"
+
+# The local date and time a capture is named after.
+jiff = "0.2"
+
 log = "0.4"
 
 # Plugins. A plugin is a Lua script that registers materials and tools through
@@ -60,6 +85,12 @@ unipute = { git = "https://github.com/playforge-coding/unipute", rev = "8d8f5708
 # `egui-wgpu` above asks for.
 wgpu = "30.0"
 winit = "0.30.13"
+
+[dev-dependencies]
+# Only to read back the PNGs the tests write. The writer in
+# `src/capture/png.rs` is hand-rolled, for reasons given there, so an
+# independent decoder is what shows it wrote a real PNG.
+png = "0.18"
 
 # Debug builds go through cranelift, which produces unoptimised code a good deal
 # faster than LLVM does. The first block covers this crate, the second every

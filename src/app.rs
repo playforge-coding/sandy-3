@@ -12,9 +12,14 @@
 //! and the first world they registered is built from a freshly rolled seed
 //! so the game opens on a landscape rather than a blank grid, and a different
 //! one each time.
+//!
+//! Screenshots and recordings go through [`crate::capture`]: each frame, it
+//! is asked whether the scene should be copied out, and the frames that come
+//! back are handed to it to save.
 
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Instant;
 
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, MouseButton, TouchPhase, WindowEvent};
@@ -22,6 +27,7 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Window, WindowId};
 
+use crate::capture::Capture;
 use crate::gpu::State;
 use crate::materials::{EMPTY, MaterialId};
 use crate::plugins::{Command, Kind, Plugins, Stroke};
@@ -88,7 +94,11 @@ struct App {
     /// The Lua side: the materials and tools scripts have added, and the
     /// interpreter they run in.
     plugins: Plugins,
-    /// The line at the foot of the panel: what the last plugin drop did.
+    /// Screenshots and recordings: what has been asked for, and the threads
+    /// writing the files.
+    capture: Capture,
+    /// The line at the foot of the panel: what the last plugin drop or
+    /// capture did.
     status: String,
     /// egui's context: fonts, memory and layout. Cheap to clone, since it is an
     /// `Arc` inside.
@@ -103,6 +113,7 @@ impl Default for App {
             state: None,
             input: Input::default(),
             plugins: Plugins::new(),
+            capture: Capture::default(),
             status: DROP_HINT.to_string(),
             egui_ctx: egui::Context::default(),
             egui_state: None,
@@ -310,17 +321,20 @@ impl App {
         let raw_input = self.egui_state.as_mut().unwrap().take_egui_input(&window);
         let ctx = self.egui_ctx.clone();
         let mut actions = ui::Actions::default();
-        let brushes = self.plugins.names(Kind::Brush);
-        let tools = self.plugins.names(Kind::Tool);
-        let worlds = self.plugins.world_names();
+        let names = ui::Names {
+            brushes: self.plugins.names(Kind::Brush),
+            tools: self.plugins.names(Kind::Tool),
+            worlds: self.plugins.world_names(),
+        };
+        let now = Instant::now();
+        let recording = self.capture.recording_for(now);
         let full_output = ctx.run_ui(raw_input, |ui| {
             actions = ui::draw(
                 ui.ctx(),
                 &mut self.input.controls,
                 &self.plugins.registry(),
-                &brushes,
-                &tools,
-                &worlds,
+                &names,
+                recording,
                 &self.status,
             );
         });
@@ -335,6 +349,12 @@ impl App {
         } else if actions.generate {
             self.generate();
         }
+        if actions.screenshot {
+            self.screenshot();
+        }
+        if actions.record {
+            self.toggle_recording();
+        }
 
         if let Some(state) = &mut self.state {
             if actions.clear {
@@ -347,12 +367,40 @@ impl App {
                 state.sim.step();
             }
             state.update(self.input.controls.rate());
-            state.render(
+
+            // Copy this frame out if a screenshot or the recording wants it,
+            // and pass on whichever earlier ones have finished copying.
+            let wanted = self.capture.plan(now);
+            let captured = state.render(
                 paint_jobs,
                 full_output.textures_delta,
                 full_output.pixels_per_point,
+                wanted.is_some(),
             );
+            if let (true, Some(wanted)) = (captured, wanted) {
+                self.capture.taken(wanted);
+            }
+            for frame in state.take_frames() {
+                self.capture.deliver(frame);
+            }
         }
+        for line in self.capture.reports() {
+            log::info!("{line}");
+            self.status = line;
+        }
+    }
+
+    /// Save the next frame as a screenshot, in the format on the panel.
+    fn screenshot(&mut self) {
+        self.capture
+            .screenshot(self.input.controls.screenshot_format);
+    }
+
+    /// Start a recording in the format on the panel, or stop the one running.
+    fn toggle_recording(&mut self) {
+        let format = self.input.controls.recording_format;
+        self.status = self.capture.toggle_recording(format, Instant::now());
+        log::info!("{}", self.status);
     }
 
     fn handle_key(&mut self, code: KeyCode) {
@@ -404,6 +452,9 @@ impl App {
             // fresh one.
             KeyCode::KeyG => self.generate(),
             KeyCode::KeyR => self.randomize(),
+            // Capture: a still, or a recording until pressed again.
+            KeyCode::KeyS => self.screenshot(),
+            KeyCode::KeyV => self.toggle_recording(),
             _ => {}
         }
     }
@@ -519,6 +570,7 @@ pub fn run() {
          W=wind tool (sweep to blow a gust)  [ ]=brush size  Space=pause  .=step one tick  \
          - ==slower/faster  \
          C=clear  G=build the world again  R=build it from a new seed  \
+         S=screenshot  V=start/stop recording  \
          (hold left mouse to draw). \
          Drop a .lua file on the window to load a plugin."
     );

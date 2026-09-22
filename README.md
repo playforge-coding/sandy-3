@@ -116,6 +116,8 @@ world appears.
 | **C** | clear the world |
 | **G** | build the world again from the seed in the box |
 | **R** | roll a new seed and build the world from it |
+| **S** | take a screenshot |
+| **V** | start a recording, or stop the one running |
 
 The panel drives the same state as the shortcuts, so the two stay in step.
 
@@ -127,6 +129,48 @@ rather than catching up on the time it spent paused. Stepping runs exactly one
 tick, a reaction pass and three movement passes, and leaves the world paused,
 so a grain can be watched fall a cell at a time; pressing it while the world is
 running pauses it first.
+
+## Screenshots and recordings
+
+The panel's Capture section, or the S and V keys, save what is on screen to a
+`captures` folder in the directory the game is run from, named after the
+time they were taken. A screenshot is the next frame; a recording runs from
+one press to the next. Both are the world alone, without the panel, at the
+grid's own resolution of 1000 by 500, one pixel per cell, whatever size or
+shape the window is. The line at the foot of the panel says where each one
+went.
+
+Each has a format box beside it. A screenshot is lossless WebP or PNG; a
+recording is lossless animated WebP, GIF, or animated PNG. WebP is the
+default for both, being the smallest by some way. The animated PNG keeps the
+`.png` extension, so a viewer that does not know about the animation shows
+the first frame as a still. A recording's format is read when it starts, so
+the box is greyed out until it stops.
+
+A recording takes thirty frames a second, whatever the display runs at, and
+each frame is compressed as it comes back from the GPU, so a recording is
+as long as you like and holds no more in memory than what has been
+compressed so far. The encoding runs on its own thread; if it falls behind
+the frames it catches up after Stop, and the panel says when the file is
+done.
+
+Every format writes only what changed. A frame of sand is mostly the same
+as the one before it, so after the first frame each one is the rectangle
+that differs, with the pixels inside it that did not change left
+transparent, and a world that is mostly still costs almost nothing a frame.
+libwebp works that out for itself; the GIF and PNG writers do it by hand.
+
+WebP and PNG keep every colour. A GIF holds 256 a frame, and a scene can
+have more, so those are chosen: a colour keeps its palette entry from frame
+to frame once it has one, so a still pile of sand stays still rather than
+twinkling as each frame picks slightly different shades, and the palette is
+only built again, from the frame in hand, when something with no close match
+in it comes into the scene, such as the first lava. That is a one-frame
+shift at the moment the scene itself changed, and that frame is written
+whole. A PNG screenshot with 256 colours or fewer, which most are, is
+written with a palette too, at a byte a pixel; the animated PNG cannot be,
+since a PNG has one palette for the whole file and a recording can pass 256
+colours as materials come into the scene.
 
 ## Plugins
 
@@ -274,6 +318,11 @@ src/
 ├── gpu.rs          wgpu setup and the per-frame draw
 ├── scene.wgsl      Draws the world straight out of the cell buffer
 ├── bloom.wgsl      Gives the emissive materials their halo
+├── capture/        Screenshots and recordings
+│   ├── mod.rs        what is wanted of each frame, and the threads that write
+│   ├── png.rs        PNG and animated PNG, chunk by chunk
+│   ├── gif.rs        GIF, and the palette that holds still
+│   └── webp.rs       lossless WebP, through libwebp
 ├── plugins.rs      Lua plugins: the `sandy` table and the loader
 ├── worldgen.rs     The canvas a world is painted on, and the noise (FastNoise2)
 ├── plugins/        The built-in plugins, compiled into the binary
@@ -393,6 +442,13 @@ blurs them twice, adds them back over the scene and blows the result up to the
 window with nearest-neighbour sampling, so grains stay crisp and lava keeps its
 halo.
 
+A frame that a screenshot or a recording wants gets one more pass: the same
+composite drawn again into an offscreen image at the grid's resolution, which
+is copied into a buffer the CPU can read. The read is not waited for; the
+buffer is collected a frame or two later, once the GPU says it is done, so a
+recording does not hold the frame rate up. What comes out of it is exactly
+the sRGB bytes the composite wrote, ready for a file.
+
 ### The world is bigger
 
 The grid is 1000 by 500, four times the area of Sandy 2's, which is most of the
@@ -441,9 +497,9 @@ also a liquid licks sideways as it climbs, which is all a gas is here.
 ## Not here yet
 
 Sandy 2 has a good deal more: oil, clouds, rain, seeds that sprout trees,
-creatures that walk over the grid, meteors, tsunamis, and screenshot and GIF
-capture. None of that is here. This is the elements, the tools and the
-worlds, on the GPU, and the rest can follow.
+creatures that walk over the grid, meteors and tsunamis. None of that is
+here. This is the elements, the tools, the worlds and the capture, on the
+GPU, and the rest can follow.
 
 ## Building
 
@@ -458,7 +514,8 @@ cargo install sccache
 Without it every cargo command stops at `could not execute process sccache
 rustc -vV`. A C compiler is needed as well, because the Lua interpreter the
 plugins run in is built from source (`mlua` with its `vendored` feature), so
-nothing has to be installed for it. The world generator's noise is
+nothing has to be installed for it, and so is libwebp, which writes the WebP
+screenshots and recordings. The world generator's noise is
 [FastNoise2](https://github.com/Auburn/FastNoise2), a C++ library that the
 `fastnoise2` crate bundles and builds with CMake, so `cmake` and a C++17
 compiler have to be on the path too; the first build takes a minute longer

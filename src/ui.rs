@@ -3,16 +3,20 @@
 //! egui draws as its own pass over the finished scene (see
 //! [`crate::gpu::State::render`]), so nothing here touches the world. The panel
 //! is a material picker, a brush picker, the tools, a size, the clock (pause,
-//! a single step and a speed), and the world: a preset, a seed, and the
-//! buttons that build one. The keyboard shortcuts in [`crate::app`] drive the
-//! very same [`Controls`], which is what keeps the two in step.
+//! a single step and a speed), the world: a preset, a seed, and the buttons
+//! that build one, and capture: a screenshot and a recording, each with a
+//! format. The keyboard shortcuts in [`crate::app`] drive the very same
+//! [`Controls`], which is what keeps the two in step.
 //!
 //! A material and a brush are picked together: the material is what a stroke
 //! puts down and the brush is how. A tool is picked instead of them, and does
 //! something else with the cursor.
 
+use std::time::Duration;
+
 use egui::{Color32, RichText, Stroke};
 
+use crate::capture::{AnimationFormat, ImageFormat};
 use crate::materials::{EMPTY, MaterialId, Registry, SAND};
 
 /// The most digits the seed box takes. Nine digits always fit a `u32`, and
@@ -83,6 +87,10 @@ pub struct Controls {
     /// The world seed, kept as text so it can be typed into a box. It is
     /// parsed when a world is actually built; see [`Controls::seed_value`].
     pub seed: String,
+    /// What a screenshot is saved as.
+    pub screenshot_format: ImageFormat,
+    /// What a recording is saved as. Read when the recording starts.
+    pub recording_format: AnimationFormat,
 }
 
 impl Default for Controls {
@@ -96,6 +104,8 @@ impl Default for Controls {
             speed: 1.0,
             world: 0,
             seed: random_seed().to_string(),
+            screenshot_format: ImageFormat::default(),
+            recording_format: AnimationFormat::default(),
         }
     }
 }
@@ -141,24 +151,39 @@ pub struct Actions {
     pub generate: bool,
     /// Roll a fresh seed into the box and build the chosen world from it.
     pub randomize: bool,
+    /// Save the next frame as a screenshot.
+    pub screenshot: bool,
+    /// Start a recording, or stop the one running.
+    pub record: bool,
+}
+
+/// The names of what the plugins have registered, in the order
+/// [`Controls::brush`], [`Tool::Plugin`] and [`Controls::world`] count them.
+pub struct Names {
+    pub brushes: Vec<String>,
+    pub tools: Vec<String>,
+    pub worlds: Vec<String>,
 }
 
 /// Build the panel for this frame and report which buttons were hit.
 ///
-/// `registry` is where the material swatches come from, `brushes`, `tools`
-/// and `worlds` the names of the plugin brushes, tools and worlds in the
-/// order [`Controls::brush`], [`Tool::Plugin`] and [`Controls::world`] count
-/// them, and `status` a line for the foot of the panel: what the last plugin
-/// drop did, or a hint.
+/// `registry` is where the material swatches come from, `names` the plugin
+/// brushes, tools and worlds, `recording` how long the recording has been
+/// running if one is, and `status` a line for the foot of the panel: what
+/// the last plugin drop or capture did, or a hint.
 pub fn draw(
     ctx: &egui::Context,
     c: &mut Controls,
     registry: &Registry,
-    brushes: &[String],
-    tools: &[String],
-    worlds: &[String],
+    names: &Names,
+    recording: Option<Duration>,
     status: &str,
 ) -> Actions {
+    let Names {
+        brushes,
+        tools,
+        worlds,
+    } = names;
     let mut actions = Actions::default();
     let button_size = egui::vec2(130.0, 18.0);
     let chosen = Stroke::new(2.0, Color32::WHITE);
@@ -292,12 +317,53 @@ pub fn draw(
                 actions.clear |= ui.button("Clear").clicked();
             });
 
+            // Capture: a screenshot of the next frame, or a recording until
+            // the button is pressed again, each in the format beside it. The
+            // recording's format is fixed once it has started, so the box
+            // is greyed out until it stops.
+            ui.separator();
+            ui.label("Capture");
+            let action_size = egui::vec2(78.0, 18.0);
+            ui.horizontal(|ui| {
+                actions.screenshot |= ui
+                    .add(egui::Button::new("Screenshot").min_size(action_size))
+                    .clicked();
+                egui::ComboBox::from_id_salt("screenshot format")
+                    .width(button_size.x - action_size.x - 8.0)
+                    .selected_text(c.screenshot_format.name())
+                    .show_ui(ui, |ui| {
+                        for format in ImageFormat::ALL {
+                            ui.selectable_value(&mut c.screenshot_format, format, format.name());
+                        }
+                    });
+            });
+            ui.horizontal(|ui| {
+                let label = match recording {
+                    Some(t) => format!("Stop {:.1} s", t.as_secs_f64()),
+                    None => "Record".to_string(),
+                };
+                actions.record |= ui
+                    .add(egui::Button::new(label).min_size(action_size))
+                    .clicked();
+                ui.add_enabled_ui(recording.is_none(), |ui| {
+                    egui::ComboBox::from_id_salt("recording format")
+                        .width(button_size.x - action_size.x - 8.0)
+                        .selected_text(c.recording_format.name())
+                        .show_ui(ui, |ui| {
+                            for format in AnimationFormat::ALL {
+                                ui.selectable_value(&mut c.recording_format, format, format.name());
+                            }
+                        });
+                });
+            });
+
             ui.separator();
             ui.label(
                 RichText::new(
                     "Hold left mouse to draw. Pick Wind and sweep to blow a gust. \
                      Space pauses, . steps a tick, - and = change the speed. \
-                     G builds the world again, R from a new seed.",
+                     G builds the world again, R from a new seed. \
+                     S takes a screenshot, V starts and stops a recording.",
                 )
                 .small()
                 .weak(),

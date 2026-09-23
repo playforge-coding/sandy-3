@@ -45,7 +45,7 @@ use crate::ui;
 const WINDOW_SIZE: (f64, f64) = (1100.0, 620.0);
 
 /// What the foot of the panel says when there is nothing more recent to say.
-const DROP_HINT: &str = "Drop a .lua file on the window to load a plugin.";
+const DROP_HINT: &str = "Drop a .js file on the window to load a plugin.";
 
 /// Wind added, in cells per tick, per grid cell the cursor sweeps in a frame.
 /// One would have the air move exactly with the cursor; a little more than that
@@ -103,8 +103,8 @@ impl Default for Input {
 struct App {
     state: Option<State>,
     input: Input,
-    /// The Lua side: the materials and tools scripts have added, and the
-    /// interpreter they run in.
+    /// The script side: the materials and tools plugins have added, and the
+    /// engine they run in.
     plugins: Plugins,
     /// Screenshots and recordings: what has been asked for, and the threads
     /// writing the files.
@@ -631,7 +631,7 @@ pub fn run(script: Option<(String, String)>) {
          C=clear  G=build the world again  R=build it from a new seed  \
          S=screenshot  V=start/stop recording  \
          (hold left mouse to draw). \
-         Drop a .lua file on the window to load a plugin."
+         Drop a .js file on the window to load a plugin."
     );
 
     let event_loop = EventLoop::new().expect("build event loop");

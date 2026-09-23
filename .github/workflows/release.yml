@@ -55,7 +55,7 @@ jobs:
         with:
           key: ${{ matrix.target }}
 
-      # The Lua interpreter is built with `cc` and FastNoise2 with CMake; every
+      # QuickJS is built with `cc` and FastNoise2 with CMake; every
       # runner image ships a C/C++ compiler and cmake already.
       - name: Build
         run: cargo build --release --locked --target ${{ matrix.target }}

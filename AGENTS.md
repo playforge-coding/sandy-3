@@ -32,7 +32,7 @@ Do not use em dashes or other special symbols not normally found in writing. Do 
 
 ## Plugins
 
-Prefer to write new tools, brushes, or materials in Lua as a built-in plugin when possible.
+Prefer to write new tools, brushes, materials, or worlds in JavaScript as a built-in plugin when possible.
 
 ## README (IMPORTANT!!!)
 

@@ -5,9 +5,9 @@
 //! - `sim`       — the GPU buffers the world lives in, and the order of passes.
 //! - `gpu`       — wgpu setup and the per-frame draw.
 //! - `capture`   — screenshots and recordings, and the files they are written to.
-//! - `plugins`   — Lua scripts that add materials, tools and worlds.
+//! - `plugins`   — JavaScript plugins that add materials, tools and worlds.
 //! - `worldgen`  — the canvas and the noise a world script builds with.
-//! - `scripting` — the control API: a Lua script that drives the game.
+//! - `scripting` — the control API: a JavaScript script that drives the game.
 //! - `headless`  — running a control script with no window.
 //! - `cli`       — the command line.
 //! - `ui`        — the egui control panel.

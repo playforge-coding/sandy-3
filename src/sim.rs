@@ -1082,14 +1082,14 @@ mod tests {
         let mut plugins = crate::plugins::Plugins::new();
         plugins
             .load(
-                "acid.lua",
+                "acid.js",
                 r#"
-                local acid = sandy.material {
-                    name = "Acid", color = {120, 230, 60}, density = 120,
-                    mobile = true, liquid = true, spread = 200,
-                }
-                sandy.rule { actor = "Stone", trigger = acid, product = "Empty",
-                             look = "around", chance = 2 }
+                const acid = sandy.material({
+                    name: "Acid", color: [120, 230, 60], density: 120,
+                    mobile: true, liquid: true, spread: 200,
+                });
+                sandy.rule({ actor: "Stone", trigger: acid, product: "Empty",
+                             look: "around", chance: 2 });
                 "#,
             )
             .unwrap();

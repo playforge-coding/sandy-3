@@ -2,11 +2,11 @@
 
 A **falling-sand** world written in Rust, where the physics runs on the GPU.
 
-It runs natively on Windows, macOS and Linux. Plugins are Lua scripts: drop one
-on the window to add a material, a tool or a world. A Lua script can also
-drive the whole game, in the window or with no window at all, which is how
-it is tested and how anything else that wants to run it by remote does so
-(see [Scripting](#scripting)).
+It runs natively on Windows, macOS and Linux. Plugins are JavaScript files:
+drop one on the window to add a material, a tool or a world. A JavaScript
+file can also drive the whole game, in the window or with no window at all,
+which is how it is tested and how anything else that wants to run it by
+remote does so (see [Scripting](#scripting)).
 
 It is a companion to [Sandy 2](https://github.com/playforge-coding/sandy-2),
 which does the same job with a cellular automaton on the CPU. The difference is
@@ -95,7 +95,7 @@ Picking another kind builds it there and then.
 | **Desert** | dunes of sand over stone, bone dry |
 | **Caverns** | solid rock riddled with hollows, water in the deeper ones and lava in the deepest |
 
-Every one of them is a plugin (see [Plugins](#plugins)): a Lua function that
+Every one of them is a plugin (see [Plugins](#plugins)): a JavaScript function that
 is handed a blank canvas the size of the grid and paints the landscape into
 it, with noise from [FastNoise2](https://github.com/Auburn/FastNoise2) for
 the shape of the land. The first four share one generator and differ only in
@@ -177,74 +177,75 @@ colours as materials come into the scene.
 
 ## Plugins
 
-A plugin is one Lua file. Drop it on the window and it loads on the spot.
-Leave it in a `plugins` folder in the directory the game is run from and it
-loads at startup. Nine are built into the binary and always there, from
-[`src/plugins/`](src/plugins/): `acid.lua` adds a material that eats through
-rock, `fire.lua` and `steam.lua` add the two gases, `wood.lua` adds wood and
-leaves and the rules that make them burn, `disk.lua` is the plain brush,
-`spray.lua` a brush that sprinkles grains, `fan.lua` a tool that blows an
-updraft, `worlds.lua` the four landscapes and `caverns.lua` the fifth. They
+A plugin is one JavaScript file. Drop it on the window and it loads on the
+spot. Leave it in a `plugins` folder in the directory the game is run from
+and it loads at startup. Nine are built into the binary and always there,
+from [`src/plugins/`](src/plugins/): `acid.js` adds a material that eats
+through rock, `fire.js` and `steam.js` add the two gases, `wood.js` adds wood
+and leaves and the rules that make them burn, `disk.js` is the plain brush,
+`spray.js` a brush that sprinkles grains, `fan.js` a tool that blows an
+updraft, `worlds.js` the four landscapes and `caverns.js` the fifth. They
 are ordinary scripts that go through the same loader as a dropped file, so
 they double as worked examples.
 
-A script has a `sandy` table in scope and registers things through it:
+A script has a `sandy` object in scope and registers things through it:
 
-```lua
-local acid = sandy.material {
-    name = "Acid",            -- shown in the picker
-    color = { 120, 230, 60 }, -- r, g, b
-    jitter = 20,              -- per-grain brightness variation, default 0
-    density = 120,            -- see "Adding a material" below
-    mobile = true,            -- default false
-    passable = true,          -- default true
-    liquid = true,            -- default false
-    spread = 200,             -- a liquid's runniness, default 0
-    windborne = false,        -- default false
-    glow = true,              -- default false
-    draft = 0,                -- upward push on the air each tick, default 0
-}
+```js
+const acid = sandy.material({
+    name: "Acid",             // shown in the picker
+    color: [120, 230, 60],    // r, g, b
+    jitter: 20,               // per-grain brightness variation, default 0
+    density: 120,             // see "Adding a material" below
+    mobile: true,             // default false
+    passable: true,           // default true
+    liquid: true,             // default false
+    spread: 200,              // a liquid's runniness, default 0
+    windborne: false,         // default false
+    glow: true,               // default false
+    draft: 0,                 // upward push on the air each tick, default 0
+});
 
--- Stone next to acid dissolves, one tick in six.
-sandy.rule { actor = "Stone", trigger = acid, product = "Empty", look = "around", chance = 6 }
+// Stone next to acid dissolves, one tick in six.
+sandy.rule({ actor: "Stone", trigger: acid, product: "Empty", look: "around", chance: 6 });
 
--- A brush: paints the chosen material, its own way.
-sandy.brush {
-    name = "Dot",
-    on_drag = function(t)
-        sandy.paint(t.x, t.y, 0, t.material)
-    end,
-}
+// A brush: paints the chosen material, its own way.
+sandy.brush({
+    name: "Dot",
+    onDrag: (t) => {
+        sandy.paint(t.x, t.y, 0, t.material);
+    },
+});
 
--- A tool: does something else with the cursor.
-sandy.tool {
-    name = "Fan",
-    on_drag = function(t)
-        sandy.wind(t.x, t.y, 30, 0, -4)
-    end,
-}
+// A tool: does something else with the cursor.
+sandy.tool({
+    name: "Fan",
+    onDrag: (t) => {
+        sandy.wind(t.x, t.y, 30, 0, -4);
+    },
+});
 
--- A world: paints a whole landscape from a seed.
-sandy.world {
-    name = "Hills",
-    generate = function(w)
-        local hills = sandy.noise { seed = w.seed, frequency = 0.01, octaves = 4 }
-        for x = 0, w.width - 1 do
-            local top = w.height * 0.6 - hills:at(x, 0) * 80
-            w:fill(x, top, x, w.height - 1, "Soil")
-        end
-    end,
-}
+// A world: paints a whole landscape from a seed.
+sandy.world({
+    name: "Hills",
+    generate: (w) => {
+        const hills = sandy.noise({ seed: w.seed, frequency: 0.01, octaves: 4 });
+        for (let x = 0; x < w.width; x++) {
+            const top = w.height * 0.6 - hills.at(x, 0) * 80;
+            w.fill(x, top, x, w.height - 1, "Soil");
+        }
+    },
+});
 ```
 
 A material is referred to by its name, in any case, or by the id that
-`sandy.material` returns. `look` is `ortho` (the default), `around`, `above` or
-`below`, and `chance` is one in how many ticks the rule fires. Registering a
-name that is already taken replaces the old entry and keeps its place, so
-dropping a file on the window a second time reloads it, and a plugin can retune
-a built-in material or brush.
+`sandy.material` returns. `look` is `ortho` (the default), `around`, `above`
+or `below`, and `chance` is one in how many ticks the rule fires. Registering
+a name that is already taken replaces the old entry and keeps its place, so
+dropping a file on the window a second time reloads it, and a plugin can
+retune a built-in material or brush. Each load runs as a module of its own,
+so a `const` at the top of a file is no trouble on reload.
 
-A brush and a tool are the same thing to the game: a function, `on_drag`,
+A brush and a tool are the same thing to the game: a function, `onDrag`,
 that runs once a frame while the mouse is held with it picked. The difference
 is in the panel, where a brush sits with the materials and is picked alongside
 one, and a tool is picked instead. `t` carries the cursor cell (`x`, `y`),
@@ -253,33 +254,34 @@ where it was the frame before (`px`, `py`, the same place on the first frame),
 two things a script can do to the world are `sandy.paint(x, y, radius,
 material)`, which is what the plain brush does with exactly those arguments,
 and `sandy.wind(x, y, radius, dvx, dvy)`, which is the wind tool.
-`sandy.find(name)` gives a material's id or nil, and `sandy.width` and
+`sandy.find(name)` gives a material's id or undefined, and `sandy.width` and
 `sandy.height` are the grid. Whatever a script asks for is queued and applied
 after it returns; a script is never handed the simulation.
 
 A world is a function, `generate`, that runs once when the world is built
 and is handed `w`: the `seed` from the panel, the grid's `width` and
-`height`, and four ways to paint. `w:set(x, y, material)` puts down one
-cell, `w:get(x, y)` reads one back (an id, or nil off the grid),
-`w:fill(x0, y0, x1, y1, material)` fills a rectangle with both corners
-included, and `w:disk(x, y, radius, material)` a circle. Coordinates are
+`height`, and four ways to paint. `w.set(x, y, material)` puts down one
+cell, `w.get(x, y)` reads one back (an id, or undefined off the grid),
+`w.fill(x0, y0, x1, y1, material)` fills a rectangle with both corners
+included, and `w.disk(x, y, radius, material)` a circle. Coordinates are
 cells from the top left, and anything off the grid is quietly dropped.
 Nothing reaches the GPU until the function returns, when the whole grid goes
 across in one write, so a world can be painted a cell at a time. `w` is only
-good for the one build it was made for. `math.random` is reseeded from the
-seed before each build, so a script can scatter things with it and the same
-seed will still give the same world.
+good for the one build it was made for. `Math.random` is the game's own
+generator, reseeded from the seed before each build, so a script can scatter
+things with it and the same seed will still give the same world.
 
-`sandy.noise { ... }` makes a noise field to shape the land with. Its table
-takes `seed` (default 0), `kind` (`simplex`, the default, `supersimplex`,
-`perlin` or `value`), `frequency` (default 0.01, so a feature every hundred
-cells or so), `octaves` (default 1; more stack finer detail on top), `gain`
-and `lacunarity` (how much quieter and how much finer each octave is, 0.5
-and 2 by default) and `ridged` (fold the octaves into ridges rather than
-hills). The result has `n:at(x, y)`, one value in about -1 to 1 at a cell,
-and `n:grid(width, height)`, every cell from the origin at once as a table of
-rows read `rows[y][x]`, both counted from zero. The grid is what FastNoise2
-is for, and it fills the whole world's worth in a few milliseconds.
+`sandy.noise({ ... })` makes a noise field to shape the land with. Its
+object takes `seed` (default 0), `kind` (`simplex`, the default,
+`supersimplex`, `perlin` or `value`), `frequency` (default 0.01, so a feature
+every hundred cells or so), `octaves` (default 1; more stack finer detail on
+top), `gain` and `lacunarity` (how much quieter and how much finer each
+octave is, 0.5 and 2 by default) and `ridged` (fold the octaves into ridges
+rather than hills). The result has `n.at(x, y)`, one value in about -1 to 1
+at a cell, and `n.grid(width, height)`, every cell from the origin at once
+as an array of rows read `rows[y][x]`, both counted from zero. The grid is
+what FastNoise2 is for, and it fills the whole world's worth in a few
+milliseconds.
 
 A plugin material is data, exactly as the built-in ones are (see "A material
 is data, not code" below). There is no per-cell function to write, because the
@@ -287,84 +289,91 @@ cells are stepped on the GPU, so a plugin material can be anything the
 properties and the rules can express, and nothing they cannot.
 
 A script that fails says so at the foot of the panel and in the log, and
-whatever it registered before failing stays registered. Scripts get Lua's base
-library plus `string`, `table`, `math`, `utf8` and `coroutine`, and no `io`,
-`os` or `require`. `print` goes to the log.
+whatever it registered before failing stays registered. The engine is
+[QuickJS](https://github.com/quickjs-ng/quickjs), built into the binary,
+with the standard JavaScript library and nothing that reaches outside it: no
+file system, no network, no `import` of anything but the script itself. The
+game adds `console`, whose output goes to the log, `print` as another name
+for `console.log`, and `assert(condition, message)`.
 
 ## Scripting
 
-The game can be driven by a Lua script instead of the mouse: for a test, an
-automation, a language model at the controls, or to try something out from a
-terminal. A script runs in the window, where it can be watched and the mouse
-still works between its calls, or with no window at all:
+The game can be driven by a JavaScript file instead of the mouse: for a
+test, an automation, a language model at the controls, or to try something
+out from a terminal. A script runs in the window, where it can be watched
+and the mouse still works between its calls, or with no window at all:
 
 ```sh
-sandy-3 demo.lua               # in the window, which stays open afterwards
-sandy-3 --headless test.lua    # no window: run it and exit
-sandy-3 --headless -e 'sim.generate("Forest", 7); print(sim.count("Water"))'
-echo 'sim.step(60); print(sim.ticks())' | sandy-3 --headless -
+sandy-3 demo.js                # in the window, which stays open afterwards
+sandy-3 --headless test.js     # no window: run it and exit
+sandy-3 --headless -e 'sim.generate("Forest", 7); console.log(sim.count("Water"))'
+echo 'sim.step(60); console.log(sim.ticks())' | sandy-3 --headless -
 ```
 
 Headless, the process exits with a status of 1 if the script fails, and the
 error says which line, so a script with `assert` in it is a test and a folder
-of them is a test suite. `print` goes to stdout. A headless run starts on an
-empty world; in the window the script starts once the usual landscape has
-been built, and finds it as it is on screen.
+of them is a test suite. `console.log` goes to stdout. A headless run starts
+on an empty world; in the window the script starts once the usual landscape
+has been built, and finds it as it is on screen.
 
 A script has the plugin API, `sandy`, in scope (see [Plugins](#plugins)), so
-it can register materials and brushes of its own, and a `sim` table that
+it can register materials and brushes of its own, and a `sim` object that
 drives the game:
 
-```lua
-sim.fill(0, sim.height - 4, sim.width - 1, sim.height - 1, "Stone")
-sim.paint(500, 60, 14, "Sand")
-local before = sim.count("Sand")
-sim.step(400)
-local world = sim.snapshot()
-assert(world:count("Sand") == before, "no sand was lost on the way down")
-assert(world:highest("Sand") > 400, "and it reached the floor")
-sim.screenshot("heap.png")
+```js
+sim.fill(0, sim.height - 4, sim.width - 1, sim.height - 1, "Stone");
+sim.paint(500, 60, 14, "Sand");
+const before = sim.count("Sand");
+sim.step(400);
+const world = sim.snapshot();
+assert(world.count("Sand") === before, "no sand was lost on the way down");
+assert(world.highest("Sand") > 400, "and it reached the floor");
+sim.screenshot("heap.png");
 ```
 
 | Function | What it does |
 |----------|--------------|
 | `sim.width`, `sim.height` | the grid, in cells |
-| `sim.step([n])` | run `n` ticks, one by default, there and then |
-| `sim.frame([n])` | let `n` frames go by, one by default; see below |
+| `sim.step(n)` | run `n` ticks, one by default, there and then |
+| `await sim.frame(n)` | let `n` frames go by, one by default; see below |
 | `sim.pause()`, `sim.resume()`, `sim.paused()` | the panel's pause |
-| `sim.speed([x])` | the panel's speed, set if given; returns it |
+| `sim.speed(x)` | the panel's speed, set if given; returns it |
 | `sim.ticks()` | how many ticks the world has run |
 | `sim.paint(x, y, radius, material)` | a disk, as the plain brush paints one |
 | `sim.fill(x0, y0, x1, y1, material)` | a rectangle, both corners included |
 | `sim.wind(x, y, radius, dvx, dvy)` | a gust, as the wind tool blows one |
 | `sim.clear()` | empty the world and still the air |
-| `sim.generate(world, [seed])` | build a world by name, from a seed or a rolled one; returns the seed |
-| `sim.stroke { ... }` | drive a brush or a tool along a path, as the mouse would |
-| `sim.pick { ... }` | set what the panel has picked |
+| `sim.generate(world, seed)` | build a world by name, from a seed or a rolled one; returns the seed |
+| `sim.stroke({ ... })` | drive a brush or a tool along a path, as the mouse would |
+| `sim.pick({ ... })` | set what the panel has picked |
 | `sim.snapshot()` | the world and the wind at this moment, read back |
-| `sim.get(x, y)` | the material at one cell, or nil off the grid |
+| `sim.get(x, y)` | the material at one cell, or undefined off the grid |
 | `sim.count(material)` | how many cells hold a material |
-| `sim.screenshot([path])` | save a picture, written before it returns; returns the path |
-| `sim.record([path])`, `sim.stop()` | a recording, from the one to the other; both return the path |
+| `sim.screenshot(path)` | save a picture, written before it returns; returns the path |
+| `sim.record(path)`, `sim.stop()` | a recording, from the one to the other; both return the path |
 | `sim.plugin(path)` | load a plugin file, as dropping it on the window would |
 | `sim.materials()`, `sim.brushes()`, `sim.tools()`, `sim.worlds()` | what there is |
 | `sim.quit()` | end the script, and close the window if there is one |
 
-A material is a name, in any case, or an id, as it is for a plugin.
-Coordinates are cells from the top left, and a fraction is rounded down. A
-path with no name for a screenshot or a recording goes to the `captures`
-folder in the panel's format; with one, the extension picks the format. A
-snapshot has `width`, `height` and `ticks`, and `get(x, y)`,
-`count(material)`, `bounds(material)` (`x0, y0, x1, y1` with both corners
-included, or nothing), `highest(material)` and `lowest(material)` (the top
-and bottom rows holding it, or nil), `center(material)` (`x, y`, or nothing)
-and `wind(x, y)` (`vx, vy` in cells per tick). `sim.get` and `sim.count`
-each read the world back from the GPU, so a script with many questions about
-the same moment takes one snapshot and asks it.
+Every call does its work before it returns, so a script reads top to bottom
+and `sim.count("Sand")` is a number, not a promise. The one exception is
+`sim.frame`, which has to hand the window back to its event loop, so it
+returns a promise and is awaited; top-level `await` works, since a script
+runs as a module. A material is a name, in any case, or an id, as it is for
+a plugin. Coordinates are cells from the top left, and a fraction is rounded
+down. A path with no name for a screenshot or a recording goes to the
+`captures` folder in the panel's format; with one, the extension picks the
+format. A snapshot has `width`, `height` and `ticks`, and `get(x, y)`,
+`count(material)`, `bounds(material)` (`[x0, y0, x1, y1]` with both corners
+included, or undefined), `highest(material)` and `lowest(material)` (the top
+and bottom rows holding it, or undefined), `center(material)` (`[x, y]`, or
+undefined) and `wind(x, y)` (`[vx, vy]` in cells per tick). `sim.get` and
+`sim.count` each read the world back from the GPU, so a script with many
+questions about the same moment takes one snapshot and asks it.
 
-`sim.stroke` takes a table: `path`, a list of `{x, y}` points with one frame
-of the stroke per point; `brush` or `tool` by name, `Wind` being the game's
-own, or neither for whatever the panel has picked; and `material` and
+`sim.stroke` takes an object: `path`, a list of `[x, y]` points with one
+frame of the stroke per point; `brush` or `tool` by name, `Wind` being the
+game's own, or neither for whatever the panel has picked; and `material` and
 `radius`, which also default to the panel's. `sim.pick` takes `material`,
 `brush`, `tool` and `radius`, any of them, and sets the panel as clicking
 would. `sim.materials()` is a list of records with `id`, `name`, `color` and
@@ -383,11 +392,13 @@ running when the script ends is finished before the process exits; in the
 window the file is finished a moment later and the panel says when. A
 screenshot is written before the call returns either way.
 
-A request the game refuses, a material that does not exist or a file that
-cannot be written, is an ordinary Lua error raised at the line that asked, so
-`pcall` catches it and an uncaught one ends the script with the line number.
-Scripts get the same sandbox plugins do, with `sim` added; the files a script
-needs go through `sim.screenshot`, `sim.record` and `sim.plugin`.
+A call the game refuses, a material that does not exist or a file that
+cannot be written, is an ordinary exception thrown at the line that asked, so
+`try`/`catch` catches it and an uncaught one ends the script with the line
+number. `sim` is for the script alone: a brush's `onDrag`, run by
+`sim.stroke`, cannot call it. Scripts get the same sandbox plugins do, with
+`sim` added and `console` going to stdout; the files a script needs go
+through `sim.screenshot`, `sim.record` and `sim.plugin`.
 
 ## Run it
 
@@ -426,20 +437,19 @@ src/
 │   ├── png.rs        PNG and animated PNG, chunk by chunk
 │   ├── gif.rs        GIF, and the palette that holds still
 │   └── webp.rs       lossless WebP, through libwebp
-├── plugins.rs      Lua plugins: the `sandy` table and the loader
+├── plugins.rs      JavaScript plugins: the `sandy` object, the engine and the loader
 ├── worldgen.rs     The canvas a world is painted on, and the noise (FastNoise2)
 ├── plugins/        The built-in plugins, compiled into the binary
-│   ├── acid.lua      a material
-│   ├── fire.lua      a gas, and the rules that put it out
-│   ├── steam.lua     a gas, and the rules that boil water into it
-│   ├── wood.lua      wood and leaves, and the rules that burn them
-│   ├── disk.lua      the plain brush
-│   ├── spray.lua     a brush
-│   ├── fan.lua       a tool
-│   ├── worlds.lua    four landscapes from one generator
-│   └── caverns.lua   a world from a sheet of noise
-├── scripting.rs    The control API: a script's requests, and the host that answers them
-├── scripting.lua   The `sim` table, which turns each call into a request
+│   ├── acid.js       a material
+│   ├── fire.js       a gas, and the rules that put it out
+│   ├── steam.js      a gas, and the rules that boil water into it
+│   ├── wood.js       wood and leaves, and the rules that burn them
+│   ├── disk.js       the plain brush
+│   ├── spray.js      a brush
+│   ├── fan.js        a tool
+│   ├── worlds.js     four landscapes from one generator
+│   └── caverns.js    a world from a sheet of noise
+├── scripting.rs    The control API: the `sim` object, and the host behind it
 ├── headless.rs     Running a script with no window
 ├── cli.rs          The command line
 ├── ui.rs           The egui control panel
@@ -619,10 +629,10 @@ cargo install sccache
 ```
 
 Without it every cargo command stops at `could not execute process sccache
-rustc -vV`. A C compiler is needed as well, because the Lua interpreter the
-plugins run in is built from source (`mlua` with its `vendored` feature), so
-nothing has to be installed for it, and so is libwebp, which writes the WebP
-screenshots and recordings. The world generator's noise is
+rustc -vV`. A C compiler is needed as well, because QuickJS, the JavaScript
+engine the plugins and scripts run in, is built from source by the `rquickjs`
+crate, so nothing has to be installed for it, and so is libwebp, which writes
+the WebP screenshots and recordings. The world generator's noise is
 [FastNoise2](https://github.com/Auburn/FastNoise2), a C++ library that the
 `fastnoise2` crate bundles and builds with CMake, so `cmake` and a C++17
 compiler have to be on the path too; the first build takes a minute longer

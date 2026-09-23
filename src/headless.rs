@@ -1,6 +1,6 @@
 //! Running a control script with no window.
 //!
-//! `sandy-3 --headless script.lua` brings the GPU up without a surface, the
+//! `sandy-3 --headless script.js` brings the GPU up without a surface, the
 //! way the tests do, loads the plugins, and runs the script (see
 //! [`crate::scripting`]) against an empty world until it finishes. There is
 //! no event loop and nothing to draw, so the script gets every answer at

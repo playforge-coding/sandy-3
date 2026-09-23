@@ -10,25 +10,27 @@
 //! sent as one buffer write than as five hundred thousand brush strokes.
 //!
 //! The shape of the land comes from [`Noise`], a wrapper over
-//! [FastNoise2](https://github.com/Auburn/FastNoise2) built from a small table
-//! of knobs: the kind of noise, its frequency, and how many octaves to stack.
-//! A script samples it a cell at a time, or asks for a whole grid of it, which
-//! FastNoise2 fills with SIMD in a few milliseconds.
+//! [FastNoise2](https://github.com/Auburn/FastNoise2) built from a small
+//! object of knobs: the kind of noise, its frequency, and how many octaves to
+//! stack. A script samples it a cell at a time, or asks for a whole grid of
+//! it, which FastNoise2 fills with SIMD in a few milliseconds.
 //!
-//! Both types are Lua userdata, so a script sees them as objects with
-//! methods. Everything else about generation, which script is which world and
-//! how the result reaches the GPU, is in [`crate::plugins`] and
-//! [`crate::sim::Simulation::load`].
+//! [`Noise`] is a JavaScript class, so a script sees it as an object with
+//! methods; the canvas reaches a script through the world handle in
+//! [`crate::plugins`]. Everything else about generation, which script is
+//! which world and how the result reaches the GPU, is in [`crate::plugins`]
+//! and [`crate::sim::Simulation::load`].
 
 use fastnoise2::SafeNode;
 use fastnoise2::generator::perlin::Perlin;
 use fastnoise2::generator::prelude::*;
 use fastnoise2::generator::simplex::{Simplex, SuperSimplex};
 use fastnoise2::generator::value::Value as ValueNoise;
-use mlua::{Table, UserData, UserDataMethods};
+use rquickjs::class::{Trace, Tracer};
+use rquickjs::{Ctx, JsLifetime, Object};
 
 use crate::materials::MaterialId;
-use crate::plugins::{optional, runtime};
+use crate::plugins::{fail, optional};
 
 /// The most cells of noise a script can ask for at once. A grid the size of
 /// the world is half a million floats, which is fine; this stops a typo asking
@@ -106,13 +108,15 @@ impl Canvas {
     }
 }
 
-/// A noise field a script can sample, built from `sandy.noise { ... }`.
+/// A noise field a script can sample, built from `sandy.noise({ ... })`.
 ///
 /// The value at a point is FastNoise2's, roughly in `-1..=1`, sampled at the
 /// cell coordinates. The frequency goes into the generator itself, as
 /// FastNoise2's feature scale (its reciprocal), so a frequency of `0.01`
 /// means a feature every hundred cells or so. The seed is fixed when the
 /// noise is made, so the same spec and seed give the same field every time.
+#[derive(JsLifetime)]
+#[rquickjs::class]
 pub struct Noise {
     node: SafeNode,
     seed: i32,
@@ -124,28 +128,35 @@ pub struct Noise {
     scale: f32,
 }
 
+/// Nothing in a noise field is a JavaScript value, so there is nothing for
+/// the garbage collector to follow.
+impl<'js> Trace<'js> for Noise {
+    fn trace<'a>(&self, _tracer: Tracer<'a, 'js>) {}
+}
+
 impl Noise {
-    /// Build a field from a script's spec table. The fields are `seed`
+    /// Build a field from a script's spec object. The fields are `seed`
     /// (default 0), `kind` (`simplex`, the default, `supersimplex`, `perlin`
     /// or `value`), `frequency` (default 0.01), `octaves` (default 1, which is
     /// plain noise; more stacks finer detail on top), `gain` and `lacunarity`
     /// (how much quieter and how much finer each octave is; 0.5 and 2), and
     /// `ridged`, which makes the octaves fold into ridges instead of hills.
-    pub fn from_spec(spec: &Table) -> mlua::Result<Self> {
-        let seed: i64 = optional(spec, "seed", 0)?;
-        let kind: String = optional(spec, "kind", "simplex".to_string())?;
-        let frequency: f64 = optional(spec, "frequency", 0.01)?;
-        let octaves: i64 = optional(spec, "octaves", 1)?;
-        let gain: f64 = optional(spec, "gain", 0.5)?;
-        let lacunarity: f64 = optional(spec, "lacunarity", 2.0)?;
-        let ridged: bool = optional(spec, "ridged", false)?;
+    pub fn from_spec<'js>(ctx: &Ctx<'js>, spec: &Object<'js>) -> rquickjs::Result<Self> {
+        let seed: f64 = optional(ctx, spec, "seed", 0.0)?;
+        let kind: String = optional(ctx, spec, "kind", "simplex".to_string())?;
+        let frequency: f64 = optional(ctx, spec, "frequency", 0.01)?;
+        let octaves: f64 = optional(ctx, spec, "octaves", 1.0)?;
+        let gain: f64 = optional(ctx, spec, "gain", 0.5)?;
+        let lacunarity: f64 = optional(ctx, spec, "lacunarity", 2.0)?;
+        let ridged: bool = optional(ctx, spec, "ridged", false)?;
 
         if !(frequency.is_finite() && frequency > 0.0) {
-            return Err(runtime("frequency should be a positive number"));
+            return Err(fail(ctx, "frequency should be a positive number"));
         }
-        if !(1..=16).contains(&octaves) {
-            return Err(runtime("octaves should be from 1 to 16"));
+        if !(octaves.fract() == 0.0 && (1.0..=16.0).contains(&octaves)) {
+            return Err(fail(ctx, "octaves should be a whole number from 1 to 16"));
         }
+        let octaves = octaves as i32;
 
         // FastNoise2 sizes its features in world units rather than taking a
         // frequency: a feature scale of a hundred is a feature every hundred
@@ -174,43 +185,44 @@ impl Noise {
             }
             .build(),
             other => {
-                return Err(runtime(format!(
-                    "kind should be simplex, supersimplex, perlin or value, not '{other}'"
-                )));
+                return Err(fail(
+                    ctx,
+                    format!("kind should be simplex, supersimplex, perlin or value, not '{other}'"),
+                ));
             }
         };
         let node = if octaves == 1 {
             base
         } else if ridged {
-            base.ridged(gain as f32, 0.0, octaves as i32, lacunarity as f32)
+            base.ridged(gain as f32, 0.0, octaves, lacunarity as f32)
                 .build()
         } else {
-            base.fbm(gain as f32, 0.0, octaves as i32, lacunarity as f32)
+            base.fbm(gain as f32, 0.0, octaves, lacunarity as f32)
                 .build()
         };
 
         // The most the octaves can add up to: one, plus the gain, plus the
         // gain squared, and so on.
-        let bound: f64 = (0..octaves).map(|i| gain.abs().powi(i as i32)).sum();
+        let bound: f64 = (0..octaves).map(|i| gain.abs().powi(i)).sum();
         Ok(Noise {
             node: node.0,
-            // A seed is a whole 32 bits to FastNoise2 and a plain integer to
+            // A seed is a whole 32 bits to FastNoise2 and a plain number to
             // a script, so a seed past the signed range wraps rather than
             // being refused; every number still names a world.
-            seed: seed as i32,
+            seed: seed as i64 as i32,
             scale: if bound > 0.0 { 1.0 / bound as f32 } else { 1.0 },
         })
     }
 
     /// The value at one cell.
-    pub fn at(&self, x: f32, y: f32) -> f32 {
+    pub fn sample(&self, x: f32, y: f32) -> f32 {
         self.node.gen_single_2d(x, y, self.seed) * self.scale
     }
 
     /// The values over a `width` by `height` grid of cells starting at the
-    /// origin, row by row from the top, so `grid[y * width + x]` is the same
-    /// number [`Noise::at`] gives for `(x, y)`.
-    pub fn grid(&self, width: usize, height: usize) -> Vec<f32> {
+    /// origin, row by row from the top, so `values[y * width + x]` is the
+    /// same number [`Noise::sample`] gives for `(x, y)`.
+    pub fn values(&self, width: usize, height: usize) -> Vec<f32> {
         let mut out = vec![0.0; width * height];
         if width > 0 && height > 0 {
             self.node.gen_uniform_grid_2d(
@@ -231,36 +243,37 @@ impl Noise {
     }
 }
 
-impl UserData for Noise {
-    fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
-        methods.add_method("at", |_, noise, (x, y): (f64, f64)| {
-            Ok(noise.at(x as f32, y as f32) as f64)
-        });
+/// What a script sees: `n.at(x, y)` and `n.grid(width, height)`.
+#[rquickjs::methods]
+impl Noise {
+    /// The value at one cell.
+    fn at(&self, x: f64, y: f64) -> f64 {
+        f64::from(self.sample(x as f32, y as f32))
+    }
 
-        // The grid comes back as a table of rows, `rows[y][x]`, both from
-        // zero, so a script reads it with the same coordinates it paints
-        // with.
-        methods.add_method("grid", |lua, noise, (width, height): (f64, f64)| {
-            if !(width >= 1.0 && height >= 1.0) || !(width.is_finite() && height.is_finite()) {
-                return Err(runtime("a grid needs a width and a height of at least one"));
-            }
-            let (width, height) = (width.floor() as usize, height.floor() as usize);
-            if width.saturating_mul(height) > MAX_NOISE_CELLS {
-                return Err(runtime(format!(
+    /// The grid as an array of rows, `rows[y][x]`, both from zero, so a
+    /// script reads it with the same coordinates it paints with.
+    fn grid(&self, ctx: Ctx<'_>, width: f64, height: f64) -> rquickjs::Result<Vec<Vec<f64>>> {
+        if !(width >= 1.0 && height >= 1.0) || !(width.is_finite() && height.is_finite()) {
+            return Err(fail(
+                &ctx,
+                "a grid needs a width and a height of at least one",
+            ));
+        }
+        let (width, height) = (width.floor() as usize, height.floor() as usize);
+        if width.saturating_mul(height) > MAX_NOISE_CELLS {
+            return Err(fail(
+                &ctx,
+                format!(
                     "a grid of {width} by {height} is too big; the most is {MAX_NOISE_CELLS} cells"
-                )));
-            }
-            let values = noise.grid(width, height);
-            let rows = lua.create_table_with_capacity(height, 0)?;
-            for y in 0..height {
-                let row = lua.create_table_with_capacity(width, 1)?;
-                for x in 0..width {
-                    row.raw_set(x, values[y * width + x] as f64)?;
-                }
-                rows.raw_set(y, row)?;
-            }
-            Ok(rows)
-        });
+                ),
+            ));
+        }
+        let values = self.values(width, height);
+        Ok(values
+            .chunks(width)
+            .map(|row| row.iter().map(|&v| f64::from(v)).collect())
+            .collect())
     }
 }
 
@@ -268,10 +281,17 @@ impl UserData for Noise {
 mod tests {
     use super::*;
     use crate::materials::{EMPTY, SAND, STONE, WATER};
-    use mlua::Lua;
+    use rquickjs::{Class, Context, Runtime};
 
-    fn spec(lua: &Lua, source: &str) -> Table {
-        lua.load(source).eval().unwrap()
+    /// Run `f` with a context to make spec objects in.
+    fn with_ctx<R>(f: impl FnOnce(&Ctx<'_>) -> R) -> R {
+        let runtime = Runtime::new().unwrap();
+        let context = Context::full(&runtime).unwrap();
+        context.with(|ctx| f(&ctx))
+    }
+
+    fn spec<'js>(ctx: &Ctx<'js>, source: &str) -> Object<'js> {
+        ctx.eval(format!("({source})")).unwrap()
     }
 
     #[test]
@@ -308,90 +328,93 @@ mod tests {
 
     #[test]
     fn noise_is_reproducible_and_the_grid_matches_single_samples() {
-        let lua = Lua::new();
-        let a = Noise::from_spec(&spec(
-            &lua,
-            "return { seed = 7, frequency = 0.02, octaves = 4 }",
-        ))
-        .unwrap();
-        let b = Noise::from_spec(&spec(
-            &lua,
-            "return { seed = 7, frequency = 0.02, octaves = 4 }",
-        ))
-        .unwrap();
-        let c = Noise::from_spec(&spec(
-            &lua,
-            "return { seed = 8, frequency = 0.02, octaves = 4 }",
-        ))
-        .unwrap();
+        with_ctx(|ctx| {
+            let a = Noise::from_spec(ctx, &spec(ctx, "{ seed: 7, frequency: 0.02, octaves: 4 }"))
+                .unwrap();
+            let b = Noise::from_spec(ctx, &spec(ctx, "{ seed: 7, frequency: 0.02, octaves: 4 }"))
+                .unwrap();
+            let c = Noise::from_spec(ctx, &spec(ctx, "{ seed: 8, frequency: 0.02, octaves: 4 }"))
+                .unwrap();
 
-        let grid = a.grid(50, 20);
-        assert_eq!(grid.len(), 1000);
-        let mut differs = false;
-        for y in 0..20 {
-            for x in 0..50 {
-                let v = grid[y * 50 + x];
-                assert!((-1.5..=1.5).contains(&v), "noise out of range: {v}");
-                assert!(
-                    (v - a.at(x as f32, y as f32)).abs() < 1e-4,
-                    "grid and single sample disagree at ({x}, {y})"
-                );
-                assert_eq!(v, b.at(x as f32, y as f32), "the same seed differs");
-                differs |= v != c.at(x as f32, y as f32);
+            let grid = a.values(50, 20);
+            assert_eq!(grid.len(), 1000);
+            let mut differs = false;
+            for y in 0..20 {
+                for x in 0..50 {
+                    let v = grid[y * 50 + x];
+                    assert!((-1.5..=1.5).contains(&v), "noise out of range: {v}");
+                    assert!(
+                        (v - a.sample(x as f32, y as f32)).abs() < 1e-4,
+                        "grid and single sample disagree at ({x}, {y})"
+                    );
+                    assert_eq!(v, b.sample(x as f32, y as f32), "the same seed differs");
+                    differs |= v != c.sample(x as f32, y as f32);
+                }
             }
-        }
-        assert!(differs, "another seed should give another field");
-        let spread = grid.iter().cloned().fold(0.0f32, f32::max)
-            - grid.iter().cloned().fold(0.0f32, f32::min);
-        assert!(
-            spread > 0.5,
-            "the field should actually vary, but spans {spread}"
-        );
+            assert!(differs, "another seed should give another field");
+            let spread = grid.iter().cloned().fold(0.0f32, f32::max)
+                - grid.iter().cloned().fold(0.0f32, f32::min);
+            assert!(
+                spread > 0.5,
+                "the field should actually vary, but spans {spread}"
+            );
+        });
     }
 
     #[test]
     fn every_kind_of_noise_builds_and_a_bad_spec_says_why() {
-        let lua = Lua::new();
-        for kind in ["simplex", "SuperSimplex", "perlin", "value"] {
-            let noise = Noise::from_spec(&spec(
-                &lua,
-                &format!("return {{ kind = '{kind}', octaves = 3, ridged = true }}"),
-            ))
-            .unwrap_or_else(|err| panic!("{kind}: {err}"));
-            assert!(noise.at(3.0, 4.0).is_finite());
-        }
-        let bad = |source: &str| match Noise::from_spec(&spec(&lua, source)) {
-            Err(err) => err.to_string(),
-            Ok(_) => panic!("{source} should have been refused"),
-        };
-        assert!(bad("return { kind = 'brown' }").contains("brown"));
-        assert!(bad("return { frequency = 0 }").contains("frequency"));
-        assert!(bad("return { octaves = 0 }").contains("octaves"));
+        with_ctx(|ctx| {
+            for kind in ["simplex", "SuperSimplex", "perlin", "value"] {
+                let noise = Noise::from_spec(
+                    ctx,
+                    &spec(
+                        ctx,
+                        &format!("{{ kind: '{kind}', octaves: 3, ridged: true }}"),
+                    ),
+                )
+                .unwrap_or_else(|err| panic!("{kind}: {err}"));
+                assert!(noise.sample(3.0, 4.0).is_finite());
+            }
+            let bad = |source: &str| match Noise::from_spec(ctx, &spec(ctx, source)) {
+                Err(err) => crate::plugins::describe(ctx, err),
+                Ok(_) => panic!("{source} should have been refused"),
+            };
+            assert!(bad("{ kind: 'brown' }").contains("brown"));
+            assert!(bad("{ frequency: 0 }").contains("frequency"));
+            assert!(bad("{ octaves: 0 }").contains("octaves"));
+            assert!(bad("{ octaves: 'many' }").contains("octaves"));
+        });
     }
 
     #[test]
     fn a_script_reads_the_grid_by_row_and_column_from_zero() {
-        let lua = Lua::new();
-        let noise = Noise::from_spec(&spec(&lua, "return { seed = 3 }")).unwrap();
-        let expected = noise.at(4.0, 2.0) as f64;
-        lua.globals().set("n", noise).unwrap();
-        let (value, rows, cols): (f64, i64, i64) = lua
-            .load(
-                r#"
-                local g = n:grid(6, 3)
-                local rows, cols = 0, 0
-                for _ in pairs(g) do rows = rows + 1 end
-                for _ in pairs(g[0]) do cols = cols + 1 end
-                return g[2][4], rows, cols
-                "#,
-            )
-            .eval()
-            .unwrap();
-        assert!((value - expected).abs() < 1e-4);
-        assert_eq!((rows, cols), (3, 6));
-        assert!(
-            lua.load("return n:grid(0, 5)").eval::<Table>().is_err(),
-            "an empty grid is refused"
-        );
+        with_ctx(|ctx| {
+            let noise = Noise::from_spec(ctx, &spec(ctx, "{ seed: 3 }")).unwrap();
+            let expected = f64::from(noise.sample(4.0, 2.0));
+            ctx.globals()
+                .set("n", Class::instance(ctx.clone(), noise).unwrap())
+                .unwrap();
+            let read: Vec<f64> = ctx
+                .eval(
+                    r#"
+                    const g = n.grid(6, 3);
+                    [g[2][4], g.length, g[0].length]
+                    "#,
+                )
+                .unwrap();
+            let [value, rows, cols] = read[..] else {
+                panic!("three numbers, not {read:?}");
+            };
+            assert!((value - expected).abs() < 1e-4);
+            assert_eq!((rows, cols), (3.0, 6.0));
+            assert!(
+                ctx.eval::<Vec<Vec<f64>>, _>("n.grid(0, 5)").is_err(),
+                "an empty grid is refused"
+            );
+            assert!(
+                ctx.eval::<f64, _>("n.at(1, 2)").unwrap().is_finite(),
+                "a single sample"
+            );
+        });
     }
 }

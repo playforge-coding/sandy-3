@@ -1,55 +1,57 @@
-//! Lua plugins: scripts that add materials, brushes, tools and worlds while
-//! the game runs.
+//! JavaScript plugins: scripts that add materials, brushes, tools and worlds
+//! while the game runs.
 //!
-//! A plugin is one `.lua` file. Dropped on the window, left in the `plugins`
+//! A plugin is one `.js` file. Dropped on the window, left in the `plugins`
 //! folder next to where the game is run from, or compiled in as one of
-//! [`BUILTIN`], it is executed once with a `sandy` table in scope, and whatever
-//! it registers through that table is in the game from then on. A material is
-//! a row in the [`Registry`] that [`crate::sim::Simulation::set_tables`] then
-//! uploads, a brush or a tool is a Lua function the app calls every frame
-//! the mouse is held with it selected, and a world is a Lua function that
-//! paints a whole landscape when the panel asks for it.
+//! [`BUILTIN`], it is run once as a module with a `sandy` object in scope, and
+//! whatever it registers through that object is in the game from then on. A
+//! material is a row in the [`Registry`] that
+//! [`crate::sim::Simulation::set_tables`] then uploads, a brush or a tool is a
+//! function the app calls every frame the mouse is held with it selected, and
+//! a world is a function that paints a whole landscape when the panel asks for
+//! it.
 //!
 //! # What a script sees
 //!
-//! ```lua
-//! local acid = sandy.material {
-//!     name = "Acid", color = {120, 230, 60}, density = 120,
-//!     mobile = true, liquid = true, spread = 200, glow = true,
-//! }
-//! sandy.rule { actor = "Stone", trigger = acid, product = "Empty",
-//!              look = "around", chance = 6 }
-//! sandy.brush { name = "Dot", on_drag = function(t)
-//!     sandy.paint(t.x, t.y, 0, t.material)
-//! end }
-//! sandy.tool { name = "Fan", on_drag = function(t)
-//!     sandy.wind(t.x, t.y, 30, 0, -4)
-//! end }
-//! sandy.world { name = "Flat", generate = function(w)
-//!     local hills = sandy.noise { seed = w.seed, frequency = 0.01, octaves = 4 }
-//!     for x = 0, w.width - 1 do
-//!         local top = w.height * 0.6 - hills:at(x, 0) * 40
-//!         w:fill(x, top, x, w.height - 1, "Soil")
-//!     end
-//! end }
-//! sandy.find("Water")                   -- an id, or nil
-//! sandy.paint(x, y, radius, material)   -- material is a name or an id
+//! ```js
+//! const acid = sandy.material({
+//!     name: "Acid", color: [120, 230, 60], density: 120,
+//!     mobile: true, liquid: true, spread: 200, glow: true,
+//! });
+//! sandy.rule({ actor: "Stone", trigger: acid, product: "Empty",
+//!              look: "around", chance: 6 });
+//! sandy.brush({ name: "Dot", onDrag: (t) => {
+//!     sandy.paint(t.x, t.y, 0, t.material);
+//! } });
+//! sandy.tool({ name: "Fan", onDrag: (t) => {
+//!     sandy.wind(t.x, t.y, 30, 0, -4);
+//! } });
+//! sandy.world({ name: "Flat", generate: (w) => {
+//!     const hills = sandy.noise({ seed: w.seed, frequency: 0.01, octaves: 4 });
+//!     for (let x = 0; x < w.width; x++) {
+//!         const top = w.height * 0.6 - hills.at(x, 0) * 40;
+//!         w.fill(x, top, x, w.height - 1, "Soil");
+//!     }
+//! } });
+//! sandy.find("Water")                   // an id, or undefined
+//! sandy.paint(x, y, radius, material)   // material is a name or an id
 //! sandy.wind(x, y, radius, dvx, dvy)
-//! sandy.noise { seed = 1, frequency = 0.01, octaves = 4 }
-//! sandy.width, sandy.height             -- the grid, in cells
+//! sandy.noise({ seed: 1, frequency: 0.01, octaves: 4 })
+//! sandy.width, sandy.height             // the grid, in cells
 //! ```
 //!
 //! Materials, brushes, tools and worlds go by name. Registering a name that
 //! already exists replaces the old entry in place, which is what makes
 //! dropping a file on the window a second time a reload, and lets a plugin
-//! retune a built-in material or brush.
+//! retune a built-in material or brush. Each load is a module of its own, so
+//! a `const` at the top of a plugin does not clash with itself on reload.
 //!
 //! A brush and a tool are the same thing to this module, a function called
 //! once a frame while the mouse is held (see [`Kind`]). The difference is what
 //! the panel does with them: a brush paints the material picked in the panel,
 //! in its own way, so a material and a brush are chosen together; a tool does
 //! something else with the cursor. Even the plain brush is a script,
-//! `disk.lua`, so there is one way to paint rather than a built-in way and a
+//! `disk.js`, so there is one way to paint rather than a built-in way and a
 //! plugin way.
 //!
 //! # Why a script never touches the world itself
@@ -58,11 +60,11 @@
 //! `update` function any more than a Rust material can (see
 //! [`crate::materials`]). What it can do is what the built-in materials do:
 //! fill in the properties and the reaction rules. A tool is different. It runs
-//! on the CPU once a frame, at cursor rate, so a real Lua function is fine
-//! there. Even so, the function is not handed the simulation. `sandy.paint` and
-//! `sandy.wind` queue a [`Command`], and the app drains the queue and applies
-//! it once the script has returned, so the Lua state and the GPU state never
-//! have to know about each other.
+//! on the CPU once a frame, at cursor rate, so a real JavaScript function is
+//! fine there. Even so, the function is not handed the simulation.
+//! `sandy.paint` and `sandy.wind` queue a [`Command`], and the app drains the
+//! queue and applies it once the script has returned, so the script engine and
+//! the GPU state never have to know about each other.
 //!
 //! A world is the same idea at a larger scale. Its `generate` function paints
 //! into a [`Canvas`] in main memory, and when it returns the whole grid goes
@@ -72,21 +74,37 @@
 //!
 //! # Sandbox
 //!
-//! A script gets Lua's base library, `string`, `table`, `math`, `utf8` and
-//! `coroutine`, and nothing that reaches outside the interpreter: no `io`, no
-//! `os`, no `require`. `print` goes to the log. A plugin is something the user
-//! chose to drop on the window, so this is not a security boundary, but a
-//! plugin has no business with any of that and a broken one should not be able
-//! to do much harm.
+//! The engine is QuickJS with the standard JavaScript library and nothing
+//! else: no file system, no network, no `require` or `import` of anything
+//! outside the script, since none of those exist in the engine unless the
+//! host adds them. What the host adds is `sandy`, `console` (whose output
+//! goes to the log), `print` as another name for `console.log`, and
+//! `assert(condition, message)`. `Math.random` is the game's own generator,
+//! reseeded from the world seed before each world is built, so a world that
+//! scatters things with it is still the same world for the same seed. A
+//! plugin is something the user chose to drop on the window, so this is not
+//! a security boundary, but a plugin has no business with any of that and a
+//! broken one should not be able to do much harm.
+//!
+//! # How the engine is driven
+//!
+//! rquickjs only lets the engine be used inside [`Context::with`], and that
+//! call cannot be nested: a Rust function a script calls is already inside
+//! one. So every operation here comes in two: a public method that opens the
+//! context, and a `*_in` method that takes a [`Ctx`] it was given and does
+//! the work. The control script in [`crate::scripting`] runs its requests
+//! from inside a script call and uses the `*_in` half.
 
 use std::cell::{Ref, RefCell};
 use std::fmt;
 use std::path::Path;
 use std::rc::Rc;
 
-use mlua::{
-    FromLua, Function, Lua, LuaOptions, StdLib, Table, Thread, UserData, UserDataFields,
-    UserDataMethods, Value, Variadic,
+use rquickjs::class::{Trace, Tracer};
+use rquickjs::function::{Opt, Rest};
+use rquickjs::{
+    CaughtError, Class, Coerced, Context, Ctx, Error, Exception, FromJs, Function, JsLifetime,
+    Module, Object, Persistent, Runtime, Type, Value,
 };
 
 use crate::materials::{Look, MaterialId, MaterialInfo, Registry, Rule};
@@ -99,7 +117,7 @@ use crate::worldgen::{Canvas, Noise};
 const MAX_RADIUS: i32 = 512;
 
 /// Where the user's own plugins are looked for at startup, relative to the
-/// working directory. Every `.lua` file in it is loaded, in name order, after
+/// working directory. Every `.js` file in it is loaded, in name order, after
 /// the built-in ones.
 pub const PLUGIN_DIR: &str = "plugins";
 
@@ -108,19 +126,19 @@ pub const PLUGIN_DIR: &str = "plugins";
 /// and go through the same loader as a dropped file, which also makes them the
 /// worked examples of what a plugin can do.
 pub const BUILTIN: &[(&str, &str)] = &[
-    ("acid.lua", include_str!("plugins/acid.lua")),
-    ("disk.lua", include_str!("plugins/disk.lua")),
-    ("fan.lua", include_str!("plugins/fan.lua")),
+    ("acid.js", include_str!("plugins/acid.js")),
+    ("disk.js", include_str!("plugins/disk.js")),
+    ("fan.js", include_str!("plugins/fan.js")),
     // Steam's rules name fire, so fire has to be registered first.
-    ("fire.lua", include_str!("plugins/fire.lua")),
-    ("spray.lua", include_str!("plugins/spray.lua")),
-    ("steam.lua", include_str!("plugins/steam.lua")),
+    ("fire.js", include_str!("plugins/fire.js")),
+    ("spray.js", include_str!("plugins/spray.js")),
+    ("steam.js", include_str!("plugins/steam.js")),
     // Wood's rules name fire too.
-    ("wood.lua", include_str!("plugins/wood.lua")),
+    ("wood.js", include_str!("plugins/wood.js")),
     // The worlds only name materials when they are generated, so they could
     // go anywhere, but the panel lists them in this order.
-    ("worlds.lua", include_str!("plugins/worlds.lua")),
-    ("caverns.lua", include_str!("plugins/caverns.lua")),
+    ("worlds.js", include_str!("plugins/worlds.js")),
+    ("caverns.js", include_str!("plugins/caverns.js")),
 ];
 
 /// The two kinds of script a stroke can drive. They are registered with
@@ -232,22 +250,26 @@ impl fmt::Display for Report {
     }
 }
 
+/// A JavaScript function kept outside the engine's context, which is how a
+/// handle to one survives between calls.
+type Callback = Persistent<Function<'static>>;
+
 /// A brush or a tool a script registered.
 struct PluginTool {
     name: String,
-    on_drag: Function,
+    on_drag: Callback,
 }
 
 /// A world preset a script registered: a name for the panel and the function
 /// that paints it.
 struct PluginWorld {
     name: String,
-    generate: Function,
+    generate: Callback,
 }
 
-/// Everything the `sandy` functions write to. The Lua closures each hold a
-/// handle to this, and so does [`Plugins`], which is how what a script did
-/// gets back out.
+/// Everything the `sandy` functions write to. The closures behind them each
+/// hold a handle to this, and so does [`Plugins`], which is how what a script
+/// did gets back out.
 struct Shared {
     registry: Registry,
     brushes: Vec<PluginTool>,
@@ -263,6 +285,9 @@ struct Shared {
     generation: u64,
     /// What the script currently being loaded has registered so far.
     report: Report,
+    /// What `Math.random` draws from. JavaScript has no way to seed its own,
+    /// and a world has to be the same for the same seed.
+    rng: fastrand::Rng,
 }
 
 impl Shared {
@@ -284,12 +309,18 @@ impl Shared {
 /// `sandy.brush` and `sandy.tool`: the same registration, into different
 /// lists. A name already in the list is replaced in place, so its position,
 /// which is what the panel's selection refers to, stays put.
-fn register(shared: &Rc<RefCell<Shared>>, kind: Kind, spec: Table) -> mlua::Result<()> {
-    let name: String = required(&spec, "name")?;
+fn register<'js>(
+    ctx: &Ctx<'js>,
+    shared: &Rc<RefCell<Shared>>,
+    kind: Kind,
+    spec: &Object<'js>,
+) -> rquickjs::Result<()> {
+    let name: String = required(ctx, spec, "name")?;
     if name.trim().is_empty() {
-        return Err(runtime(format!("a {} needs a name", kind.word())));
+        return Err(fail(ctx, format!("a {} needs a name", kind.word())));
     }
-    let on_drag: Function = required(&spec, "on_drag")?;
+    let on_drag: Function = required(ctx, spec, "onDrag")?;
+    let on_drag = Persistent::save(ctx, on_drag);
     let mut shared = shared.borrow_mut();
     let list = shared.list_mut(kind);
     match list
@@ -309,12 +340,17 @@ fn register(shared: &Rc<RefCell<Shared>>, kind: Kind, spec: Table) -> mlua::Resu
 /// `sandy.world`: the same registration again, for a landscape. A name
 /// already in the list is replaced in place, so the panel's choice of world
 /// still points at the same entry.
-fn register_world(shared: &Rc<RefCell<Shared>>, spec: Table) -> mlua::Result<()> {
-    let name: String = required(&spec, "name")?;
+fn register_world<'js>(
+    ctx: &Ctx<'js>,
+    shared: &Rc<RefCell<Shared>>,
+    spec: &Object<'js>,
+) -> rquickjs::Result<()> {
+    let name: String = required(ctx, spec, "name")?;
     if name.trim().is_empty() {
-        return Err(runtime("a world needs a name"));
+        return Err(fail(ctx, "a world needs a name"));
     }
-    let generate: Function = required(&spec, "generate")?;
+    let generate: Function = required(ctx, spec, "generate")?;
+    let generate = Persistent::save(ctx, generate);
     let mut shared = shared.borrow_mut();
     match shared
         .worlds
@@ -332,6 +368,8 @@ fn register_world(shared: &Rc<RefCell<Shared>>, spec: Table) -> mlua::Result<()>
 /// the world, and the methods that paint into the canvas. It is only good
 /// for the one generation it was made for; the canvas is taken away when the
 /// function returns, and a stashed handle used later says so.
+#[derive(JsLifetime)]
+#[rquickjs::class]
 struct World {
     shared: Rc<RefCell<Shared>>,
     seed: u32,
@@ -339,24 +377,39 @@ struct World {
     generation: u64,
 }
 
+/// Nothing in a world handle is a JavaScript value, so there is nothing for
+/// the garbage collector to follow.
+impl<'js> Trace<'js> for World {
+    fn trace<'a>(&self, _tracer: Tracer<'a, 'js>) {}
+}
+
 impl World {
     /// The canvas, as long as this handle's generation is the one running.
-    fn canvas<'a>(&self, shared: &'a mut Shared) -> mlua::Result<&'a mut Canvas> {
+    fn canvas<'a>(
+        &self,
+        ctx: &Ctx<'_>,
+        shared: &'a mut Shared,
+    ) -> rquickjs::Result<&'a mut Canvas> {
         if shared.generation != self.generation {
-            return Err(runtime("this world has already been built"));
+            return Err(fail(ctx, "this world has already been built"));
         }
         shared
             .canvas
             .as_mut()
-            .ok_or_else(|| runtime("this world has already been built"))
+            .ok_or_else(|| fail(ctx, "this world has already been built"))
     }
 
     /// Run `f` on the canvas, with a material a script named resolved to its
     /// id first, since both live in the same borrow.
-    fn paint(&self, material: &Value, f: impl FnOnce(&mut Canvas, MaterialId)) -> mlua::Result<()> {
+    fn paint(
+        &self,
+        ctx: &Ctx<'_>,
+        material: &Value<'_>,
+        f: impl FnOnce(&mut Canvas, MaterialId),
+    ) -> rquickjs::Result<()> {
         let shared = &mut *self.shared.borrow_mut();
-        let material = resolve(&shared.registry, material, "material")?;
-        let canvas = self.canvas(shared)?;
+        let material = resolve(ctx, &shared.registry, material, "material")?;
+        let canvas = self.canvas(ctx, shared)?;
         f(canvas, material);
         Ok(())
     }
@@ -373,46 +426,79 @@ fn cell(v: f64) -> i64 {
     }
 }
 
-impl UserData for World {
-    fn add_fields<F: UserDataFields<Self>>(fields: &mut F) {
-        fields.add_field_method_get("seed", |_, w| Ok(w.seed));
-        fields.add_field_method_get("width", |_, _| Ok(GRID_W));
-        fields.add_field_method_get("height", |_, _| Ok(GRID_H));
+#[rquickjs::methods]
+impl World {
+    #[qjs(get)]
+    fn seed(&self) -> u32 {
+        self.seed
     }
 
-    fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
-        methods.add_method("set", |_, w, (x, y, material): (f64, f64, Value)| {
-            w.paint(&material, |canvas, m| canvas.set(cell(x), cell(y), m))
-        });
-        methods.add_method("get", |_, w, (x, y): (f64, f64)| {
-            let shared = &mut *w.shared.borrow_mut();
-            Ok(w.canvas(shared)?.get(cell(x), cell(y)))
-        });
-        methods.add_method(
-            "fill",
-            |_, w, (x0, y0, x1, y1, material): (f64, f64, f64, f64, Value)| {
-                w.paint(&material, |canvas, m| {
-                    canvas.fill(cell(x0), cell(y0), cell(x1), cell(y1), m)
-                })
-            },
-        );
-        methods.add_method(
-            "disk",
-            |_, w, (x, y, radius, material): (f64, f64, f64, Value)| {
-                let radius = clamp_radius(radius) as i64;
-                w.paint(&material, |canvas, m| {
-                    canvas.disk(cell(x), cell(y), radius, m)
-                })
-            },
-        );
+    #[qjs(get)]
+    fn width(&self) -> u32 {
+        GRID_W
+    }
+
+    #[qjs(get)]
+    fn height(&self) -> u32 {
+        GRID_H
+    }
+
+    /// Put a material in one cell.
+    fn set<'js>(
+        &self,
+        ctx: Ctx<'js>,
+        x: f64,
+        y: f64,
+        material: Value<'js>,
+    ) -> rquickjs::Result<()> {
+        self.paint(&ctx, &material, |canvas, m| canvas.set(cell(x), cell(y), m))
+    }
+
+    /// The material at a cell, or undefined off the grid.
+    fn get(&self, ctx: Ctx<'_>, x: f64, y: f64) -> rquickjs::Result<Option<MaterialId>> {
+        let shared = &mut *self.shared.borrow_mut();
+        Ok(self.canvas(&ctx, shared)?.get(cell(x), cell(y)))
+    }
+
+    /// Fill a rectangle, both corners included.
+    fn fill<'js>(
+        &self,
+        ctx: Ctx<'js>,
+        x0: f64,
+        y0: f64,
+        x1: f64,
+        y1: f64,
+        material: Value<'js>,
+    ) -> rquickjs::Result<()> {
+        self.paint(&ctx, &material, |canvas, m| {
+            canvas.fill(cell(x0), cell(y0), cell(x1), cell(y1), m)
+        })
+    }
+
+    /// Fill a circle, the way the plain brush does.
+    fn disk<'js>(
+        &self,
+        ctx: Ctx<'js>,
+        x: f64,
+        y: f64,
+        radius: f64,
+        material: Value<'js>,
+    ) -> rquickjs::Result<()> {
+        let radius = clamp_radius(radius) as i64;
+        self.paint(&ctx, &material, |canvas, m| {
+            canvas.disk(cell(x), cell(y), radius, m)
+        })
     }
 }
 
-/// The Lua interpreter, the materials, brushes and tools the scripts have
+/// The JavaScript engine, the materials, brushes and tools the scripts have
 /// registered, and the commands they have queued.
 pub struct Plugins {
-    lua: Lua,
+    // Declared before the context so it is dropped first: what it holds are
+    // handles into the engine, and the engine has to still be there to give
+    // them back.
     shared: Rc<RefCell<Shared>>,
+    context: Context,
 }
 
 impl Default for Plugins {
@@ -421,18 +507,29 @@ impl Default for Plugins {
     }
 }
 
+impl Drop for Plugins {
+    fn drop(&mut self) {
+        // The closures behind the `sandy` functions hold the shared state,
+        // and the shared state holds functions the engine owns. The engine
+        // only goes away once nothing points into it, so the cycle is cut
+        // here, from this side.
+        let mut shared = self.shared.borrow_mut();
+        shared.brushes.clear();
+        shared.tools.clear();
+        shared.worlds.clear();
+    }
+}
+
 impl Plugins {
-    /// An interpreter with the `sandy` table in it and the built-in materials
-    /// in its registry, and no scripts loaded yet.
+    /// An engine with the `sandy` object in it and the built-in materials in
+    /// its registry, and no scripts loaded yet.
     pub fn new() -> Self {
-        Self::build().expect("build the Lua interpreter")
+        Self::build().expect("build the JavaScript engine")
     }
 
-    fn build() -> mlua::Result<Self> {
-        let lua = Lua::new_with(
-            StdLib::COROUTINE | StdLib::TABLE | StdLib::STRING | StdLib::UTF8 | StdLib::MATH,
-            LuaOptions::default(),
-        )?;
+    fn build() -> rquickjs::Result<Self> {
+        let runtime = Runtime::new()?;
+        let context = Context::full(&runtime)?;
         let shared = Rc::new(RefCell::new(Shared {
             registry: Registry::builtin(),
             brushes: Vec::new(),
@@ -442,124 +539,13 @@ impl Plugins {
             canvas: None,
             generation: 0,
             report: Report::default(),
+            rng: fastrand::Rng::with_seed(0),
         }));
-
-        // `print` would otherwise go to stdout, which nobody is watching.
-        lua.globals().set(
-            "print",
-            lua.create_function(|_, args: Variadic<Value>| {
-                let parts: mlua::Result<Vec<String>> = args.iter().map(|v| v.to_string()).collect();
-                log::info!(target: "plugin", "{}", parts?.join("\t"));
-                Ok(())
-            })?,
-        )?;
-
-        let sandy = lua.create_table()?;
-        sandy.set("width", GRID_W)?;
-        sandy.set("height", GRID_H)?;
-
-        let s = shared.clone();
-        sandy.set(
-            "material",
-            lua.create_function(move |_, spec: Table| {
-                let info = material_from(&spec)?;
-                let mut shared = s.borrow_mut();
-                let id = shared
-                    .registry
-                    .add_material(info)
-                    .map_err(mlua::Error::runtime)?;
-                shared.report.materials += 1;
-                Ok(id)
-            })?,
-        )?;
-
-        let s = shared.clone();
-        sandy.set(
-            "rule",
-            lua.create_function(move |_, spec: Table| {
-                let shared = &mut *s.borrow_mut();
-                let actor = resolve(&shared.registry, &spec.get("actor")?, "actor")?;
-                let trigger = resolve(&shared.registry, &spec.get("trigger")?, "trigger")?;
-                let product = resolve(&shared.registry, &spec.get("product")?, "product")?;
-                let look = look_from(optional(&spec, "look", None)?)?;
-                let chance: u32 = optional(&spec, "chance", 1)?;
-                if chance == 0 {
-                    return Err(runtime(
-                        "chance is one in how many ticks, so it cannot be 0",
-                    ));
-                }
-                shared.registry.add_rule(Rule {
-                    actor,
-                    trigger,
-                    product,
-                    look,
-                    chance,
-                });
-                shared.report.rules += 1;
-                Ok(())
-            })?,
-        )?;
-
-        for (key, kind) in [("brush", Kind::Brush), ("tool", Kind::Tool)] {
-            let s = shared.clone();
-            sandy.set(
-                key,
-                lua.create_function(move |_, spec: Table| register(&s, kind, spec))?,
-            )?;
-        }
-
-        let s = shared.clone();
-        sandy.set(
-            "world",
-            lua.create_function(move |_, spec: Table| register_world(&s, spec))?,
-        )?;
-
-        sandy.set(
-            "noise",
-            lua.create_function(|_, spec: Table| Noise::from_spec(&spec))?,
-        )?;
-
-        let s = shared.clone();
-        sandy.set(
-            "find",
-            lua.create_function(move |_, name: String| Ok(s.borrow().registry.find(&name)))?,
-        )?;
-
-        let s = shared.clone();
-        sandy.set(
-            "paint",
-            lua.create_function(move |_, (x, y, radius, material): (f64, f64, f64, Value)| {
-                let mut shared = s.borrow_mut();
-                let material = resolve(&shared.registry, &material, "material")?;
-                shared.commands.push(Command::Paint {
-                    x: x.round() as i32,
-                    y: y.round() as i32,
-                    radius: clamp_radius(radius),
-                    material,
-                });
-                Ok(())
-            })?,
-        )?;
-
-        let s = shared.clone();
-        sandy.set(
-            "wind",
-            lua.create_function(
-                move |_, (x, y, radius, dvx, dvy): (f64, f64, f64, f64, f64)| {
-                    s.borrow_mut().commands.push(Command::Wind {
-                        x: x.round() as i32,
-                        y: y.round() as i32,
-                        radius: clamp_radius(radius),
-                        dvx: dvx as f32,
-                        dvy: dvy as f32,
-                    });
-                    Ok(())
-                },
-            )?,
-        )?;
-
-        lua.globals().set("sandy", sandy)?;
-        Ok(Plugins { lua, shared })
+        context.with(|ctx| {
+            install_globals(&ctx, Sink::Log)?;
+            install_sandy(&ctx, &shared)
+        })?;
+        Ok(Plugins { shared, context })
     }
 
     /// Run every script in [`BUILTIN`]. One failing is a bug in the repo rather
@@ -573,7 +559,7 @@ impl Plugins {
         }
     }
 
-    /// Load every `.lua` file in [`PLUGIN_DIR`], in name order, and say how
+    /// Load every `.js` file in [`PLUGIN_DIR`], in name order, and say how
     /// each went: its file name, and the report or the error. No folder is
     /// simply no plugins; a script that fails does not stop the rest loading.
     pub fn load_dir(&mut self) -> Vec<(String, Result<Report, String>)> {
@@ -582,7 +568,7 @@ impl Plugins {
         };
         let mut paths: Vec<_> = entries
             .filter_map(|entry| entry.ok().map(|entry| entry.path()))
-            .filter(|path| path.extension().is_some_and(|ext| ext == "lua"))
+            .filter(|path| path.extension().is_some_and(|ext| ext == "js"))
             .collect();
         paths.sort();
         paths
@@ -606,45 +592,57 @@ impl Plugins {
     /// then fails partway through, so a script that got as far as adding a
     /// material has added it.
     pub fn load_file(&mut self, path: &Path) -> Result<Report, String> {
+        self.context.with(|ctx| self.load_file_in(&ctx, path))
+    }
+
+    /// [`Plugins::load_file`], from inside the engine.
+    pub(crate) fn load_file_in(&self, ctx: &Ctx<'_>, path: &Path) -> Result<Report, String> {
         let source =
             std::fs::read_to_string(path).map_err(|err| format!("could not read it: {err}"))?;
         let name = path
             .file_name()
             .map(|name| name.to_string_lossy().into_owned())
             .unwrap_or_else(|| path.display().to_string());
-        self.load(&name, &source)
+        self.load_in(ctx, &name, &source)
     }
 
-    /// Run `source` as a script. `name` is what Lua puts in front of the line
-    /// number in an error message.
+    /// Run `source` as a script. `name` is what the engine puts in front of
+    /// the line number in an error message.
     pub fn load(&mut self, name: &str, source: &str) -> Result<Report, String> {
+        self.context.with(|ctx| self.load_in(&ctx, name, source))
+    }
+
+    /// [`Plugins::load`], from inside the engine.
+    pub(crate) fn load_in(
+        &self,
+        ctx: &Ctx<'_>,
+        name: &str,
+        source: &str,
+    ) -> Result<Report, String> {
         self.shared.borrow_mut().report = Report::default();
-        // The `=` tells Lua to use the name as it is. Without it the name is
-        // taken for source text and shows up as `[string "acid.lua"]`.
-        let result = self.lua.load(source).set_name(format!("={name}")).exec();
+        let result = (|| -> rquickjs::Result<()> {
+            let module = Module::declare(ctx.clone(), name, source)?;
+            let (_, finished) = module.eval()?;
+            // A plugin runs to the end as it is loaded. Awaiting something
+            // that resolves on its own is fine; awaiting something that
+            // never comes is the one way to get here with the promise still
+            // pending.
+            finished.finish::<()>().map_err(|err| match err {
+                Error::WouldBlock => fail(
+                    ctx,
+                    "the plugin is waiting on something that never comes; a plugin has to finish as it is loaded",
+                ),
+                other => other,
+            })
+        })();
         let report = self.shared.borrow().report;
-        result.map(|()| report).map_err(|err| describe(&err))
+        result.map(|()| report).map_err(|err| describe(ctx, err))
     }
 
-    /// The interpreter itself, for the control script in [`crate::scripting`],
+    /// The engine's context, for the control script in [`crate::scripting`],
     /// which runs in it alongside the plugins.
-    pub(crate) fn lua(&self) -> &Lua {
-        &self.lua
-    }
-
-    /// `source` compiled as a coroutine, not yet started, named `name` in
-    /// error messages the way [`Plugins::load`] names a plugin. A syntax
-    /// error shows up here rather than on the first resume.
-    pub(crate) fn thread(&self, name: &str, source: &str) -> Result<Thread, String> {
-        let function = self
-            .lua
-            .load(source)
-            .set_name(format!("={name}"))
-            .into_function()
-            .map_err(|err| describe(&err))?;
-        self.lua
-            .create_thread(function)
-            .map_err(|err| describe(&err))
+    pub(crate) fn context(&self) -> &Context {
+        &self.context
     }
 
     /// The names of the brushes or tools scripts have registered, in the order
@@ -682,6 +680,18 @@ impl Plugins {
     /// Give a brush or a tool one frame of a stroke. Whatever it asks for lands
     /// in the command queue; see [`Plugins::take_commands`].
     pub fn run(&mut self, kind: Kind, index: usize, stroke: Stroke) -> Result<(), String> {
+        self.context
+            .with(|ctx| self.run_in(&ctx, kind, index, stroke))
+    }
+
+    /// [`Plugins::run`], from inside the engine.
+    pub(crate) fn run_in(
+        &self,
+        ctx: &Ctx<'_>,
+        kind: Kind,
+        index: usize,
+        stroke: Stroke,
+    ) -> Result<(), String> {
         // The function is cloned out so the borrow is released before the
         // call, since the script will want to borrow the queue itself.
         let on_drag = self
@@ -691,8 +701,9 @@ impl Plugins {
             .get(index)
             .map(|entry| entry.on_drag.clone())
             .ok_or_else(|| format!("there is no {} number {index}", kind.word()))?;
-        let frame = (|| {
-            let t = self.lua.create_table()?;
+        (|| -> rquickjs::Result<()> {
+            let on_drag = on_drag.restore(ctx)?;
+            let t = Object::new(ctx.clone())?;
             t.set("x", stroke.x)?;
             t.set("y", stroke.y)?;
             t.set("px", stroke.px)?;
@@ -700,10 +711,9 @@ impl Plugins {
             t.set("first", stroke.first)?;
             t.set("radius", stroke.radius)?;
             t.set("material", stroke.material)?;
-            Ok(t)
+            on_drag.call::<_, ()>((t,))
         })()
-        .map_err(|err: mlua::Error| describe(&err))?;
-        on_drag.call::<()>(frame).map_err(|err| describe(&err))
+        .map_err(|err| describe(ctx, err))
     }
 
     /// The names of the worlds scripts have registered, in the order they were
@@ -721,10 +731,20 @@ impl Plugins {
     /// over a fresh canvas and hand back the grid it painted, one material
     /// per cell from the top left, for [`crate::sim::Simulation::load`].
     ///
-    /// The same world and seed always give the same grid. Lua's `math.random`
-    /// is reseeded from `seed` first, so a script can scatter trees with it
+    /// The same world and seed always give the same grid. `Math.random` is
+    /// reseeded from `seed` first, so a script can scatter trees with it
     /// and still be reproducible; the noise it makes carries its own seed.
     pub fn generate(&mut self, index: usize, seed: u32) -> Result<Vec<MaterialId>, String> {
+        self.context.with(|ctx| self.generate_in(&ctx, index, seed))
+    }
+
+    /// [`Plugins::generate`], from inside the engine.
+    pub(crate) fn generate_in(
+        &self,
+        ctx: &Ctx<'_>,
+        index: usize,
+        seed: u32,
+    ) -> Result<Vec<MaterialId>, String> {
         let generate = self
             .shared
             .borrow()
@@ -736,23 +756,26 @@ impl Plugins {
             let mut shared = self.shared.borrow_mut();
             shared.canvas = Some(Canvas::new(GRID_W, GRID_H));
             shared.generation += 1;
+            shared.rng.seed(u64::from(seed));
             shared.generation
         };
 
-        let result = (|| {
-            let math: Table = self.lua.globals().get("math")?;
-            math.get::<Function>("randomseed")?.call::<()>(seed)?;
-            let world = World {
-                shared: self.shared.clone(),
-                seed,
-                generation,
-            };
-            generate.call::<()>(world)
+        let result = (|| -> rquickjs::Result<()> {
+            let generate = generate.restore(ctx)?;
+            let world = Class::instance(
+                ctx.clone(),
+                World {
+                    shared: self.shared.clone(),
+                    seed,
+                    generation,
+                },
+            )?;
+            generate.call::<_, ()>((world,))
         })();
         // The canvas comes out whatever happened, so a script that failed
         // halfway leaves nothing behind for the next one to paint over.
         let canvas = self.shared.borrow_mut().canvas.take();
-        result.map_err(|err| describe(&err))?;
+        result.map_err(|err| describe(ctx, err))?;
         Ok(canvas.expect("the canvas is only taken here").into_cells())
     }
 
@@ -768,32 +791,311 @@ impl Plugins {
     }
 }
 
-pub(crate) fn runtime(message: impl fmt::Display) -> mlua::Error {
-    mlua::Error::runtime(message.to_string())
+/// Put the `sandy` object in the globals, with every function on it holding
+/// a handle to `shared`.
+fn install_sandy<'js>(ctx: &Ctx<'js>, shared: &Rc<RefCell<Shared>>) -> rquickjs::Result<()> {
+    let sandy = Object::new(ctx.clone())?;
+    sandy.set("width", GRID_W)?;
+    sandy.set("height", GRID_H)?;
+
+    let s = shared.clone();
+    sandy.set(
+        "material",
+        Function::new(
+            ctx.clone(),
+            move |ctx: Ctx<'js>, spec: Object<'js>| -> rquickjs::Result<MaterialId> {
+                let info = material_from(&ctx, &spec)?;
+                let mut shared = s.borrow_mut();
+                let id = shared
+                    .registry
+                    .add_material(info)
+                    .map_err(|message| fail(&ctx, message))?;
+                shared.report.materials += 1;
+                Ok(id)
+            },
+        )?,
+    )?;
+
+    let s = shared.clone();
+    sandy.set(
+        "rule",
+        Function::new(
+            ctx.clone(),
+            move |ctx: Ctx<'js>, spec: Object<'js>| -> rquickjs::Result<()> {
+                let shared = &mut *s.borrow_mut();
+                let actor = resolve(&ctx, &shared.registry, &spec.get("actor")?, "actor")?;
+                let trigger = resolve(&ctx, &shared.registry, &spec.get("trigger")?, "trigger")?;
+                let product = resolve(&ctx, &shared.registry, &spec.get("product")?, "product")?;
+                let look = look_from(&ctx, optional(&ctx, &spec, "look", None)?)?;
+                let chance: u32 = optional(&ctx, &spec, "chance", 1)?;
+                if chance == 0 {
+                    return Err(fail(
+                        &ctx,
+                        "chance is one in how many ticks, so it cannot be 0",
+                    ));
+                }
+                shared.registry.add_rule(Rule {
+                    actor,
+                    trigger,
+                    product,
+                    look,
+                    chance,
+                });
+                shared.report.rules += 1;
+                Ok(())
+            },
+        )?,
+    )?;
+
+    for (key, kind) in [("brush", Kind::Brush), ("tool", Kind::Tool)] {
+        let s = shared.clone();
+        sandy.set(
+            key,
+            Function::new(ctx.clone(), move |ctx: Ctx<'js>, spec: Object<'js>| {
+                register(&ctx, &s, kind, &spec)
+            })?,
+        )?;
+    }
+
+    let s = shared.clone();
+    sandy.set(
+        "world",
+        Function::new(ctx.clone(), move |ctx: Ctx<'js>, spec: Object<'js>| {
+            register_world(&ctx, &s, &spec)
+        })?,
+    )?;
+
+    sandy.set(
+        "noise",
+        Function::new(
+            ctx.clone(),
+            |ctx: Ctx<'js>, spec: Object<'js>| -> rquickjs::Result<Class<'js, Noise>> {
+                let noise = Noise::from_spec(&ctx, &spec)?;
+                Class::instance(ctx, noise)
+            },
+        )?,
+    )?;
+
+    let s = shared.clone();
+    sandy.set(
+        "find",
+        Function::new(ctx.clone(), move |name: String| -> Option<MaterialId> {
+            s.borrow().registry.find(&name)
+        })?,
+    )?;
+
+    let s = shared.clone();
+    sandy.set(
+        "paint",
+        Function::new(
+            ctx.clone(),
+            move |ctx: Ctx<'js>, x: f64, y: f64, radius: f64, material: Value<'js>| {
+                let mut shared = s.borrow_mut();
+                let material = resolve(&ctx, &shared.registry, &material, "material")?;
+                shared.commands.push(Command::Paint {
+                    x: x.round() as i32,
+                    y: y.round() as i32,
+                    radius: clamp_radius(radius),
+                    material,
+                });
+                Ok::<(), Error>(())
+            },
+        )?,
+    )?;
+
+    let s = shared.clone();
+    sandy.set(
+        "wind",
+        Function::new(
+            ctx.clone(),
+            move |x: f64, y: f64, radius: f64, dvx: f64, dvy: f64| {
+                s.borrow_mut().commands.push(Command::Wind {
+                    x: x.round() as i32,
+                    y: y.round() as i32,
+                    radius: clamp_radius(radius),
+                    dvx: dvx as f32,
+                    dvy: dvy as f32,
+                });
+            },
+        )?,
+    )?;
+
+    ctx.globals().set("sandy", sandy)?;
+
+    // `Math.random` is replaced with the game's own generator, which is what
+    // lets a world be reseeded (see `Plugins::generate`).
+    let s = shared.clone();
+    let math: Object = ctx.globals().get("Math")?;
+    math.set(
+        "random",
+        Function::new(ctx.clone(), move || -> f64 { s.borrow_mut().rng.f64() })?,
+    )?;
+    Ok(())
+}
+
+/// Where `console` writes.
+#[derive(Clone, Copy)]
+pub(crate) enum Sink {
+    /// The log, which is where a plugin's output belongs: nobody is watching
+    /// stdout while the window is up.
+    Log,
+    /// Standard output, for a control script run from a terminal, whose
+    /// output is the point.
+    Stdout,
+}
+
+/// Put `console`, `print` and `assert` in the globals. QuickJS has none of
+/// them of its own; `console` is a host's to provide.
+pub(crate) fn install_globals<'js>(ctx: &Ctx<'js>, sink: Sink) -> rquickjs::Result<()> {
+    let console = Object::new(ctx.clone())?;
+    for (name, level) in [
+        ("log", log::Level::Info),
+        ("info", log::Level::Info),
+        ("debug", log::Level::Debug),
+        ("warn", log::Level::Warn),
+        ("error", log::Level::Error),
+    ] {
+        let function = Function::new(ctx.clone(), move |ctx: Ctx<'js>, args: Rest<Value<'js>>| {
+            let text = args
+                .0
+                .iter()
+                .map(|value| show(&ctx, value))
+                .collect::<Vec<_>>()
+                .join(" ");
+            match sink {
+                Sink::Log => log::log!(target: "plugin", level, "{text}"),
+                // Warnings and errors go to stderr, as they do in a
+                // browser or Node. `log::Level` counts errors lowest.
+                Sink::Stdout if level <= log::Level::Warn => eprintln!("{text}"),
+                Sink::Stdout => {
+                    use std::io::Write as _;
+                    let mut out = std::io::stdout().lock();
+                    let _ = writeln!(out, "{text}");
+                    let _ = out.flush();
+                }
+            }
+        })?;
+        if name == "log" {
+            ctx.globals().set("print", function.clone())?;
+        }
+        console.set(name, function)?;
+    }
+    ctx.globals().set("console", console)?;
+
+    ctx.globals().set(
+        "assert",
+        Function::new(
+            ctx.clone(),
+            |ctx: Ctx<'js>, condition: Coerced<bool>, message: Opt<Value<'js>>| {
+                if condition.0 {
+                    Ok(())
+                } else {
+                    let message = message
+                        .0
+                        .map(|value| show(&ctx, &value))
+                        .unwrap_or_else(|| "assertion failed".to_string());
+                    Err(fail(&ctx, message))
+                }
+            },
+        )?,
+    )?;
+    Ok(())
+}
+
+/// A value as `console.log` shows it: a string as it is, an object as JSON,
+/// and anything else the way JavaScript would turn it into a string.
+fn show<'js>(ctx: &Ctx<'js>, value: &Value<'js>) -> String {
+    if let Some(string) = value.as_string() {
+        return string.to_string().unwrap_or_default();
+    }
+    if value.is_object()
+        && !value.is_function()
+        && !value.is_error()
+        && let Ok(Some(json)) = ctx.json_stringify(value.clone())
+        && let Ok(text) = json.to_string()
+    {
+        return text;
+    }
+    Coerced::<String>::from_js(ctx, value.clone())
+        .map(|text| text.0)
+        .unwrap_or_else(|_| value.type_name().to_string())
+}
+
+/// An error for the script, raised where it made the call.
+pub(crate) fn fail(ctx: &Ctx<'_>, message: impl fmt::Display) -> Error {
+    Exception::throw_message(ctx, &message.to_string())
+}
+
+/// A field of a spec object, or nothing if it is missing, null or undefined.
+/// A field of the wrong type is an error naming the field.
+pub(crate) fn field<'js, T: FromJs<'js>>(
+    ctx: &Ctx<'js>,
+    spec: &Object<'js>,
+    key: &str,
+) -> rquickjs::Result<Option<T>> {
+    let value: Value<'js> = spec.get(key)?;
+    if value.type_of().is_void() {
+        return Ok(None);
+    }
+    let found = value.type_name();
+    T::from_js(ctx, value).map(Some).map_err(|err| match err {
+        Error::Exception => Error::Exception,
+        Error::FromJs { to, message, .. } => {
+            let mut text = format!("'{key}' should be {}, not a {found}", kind_of(to));
+            if let Some(message) = message.filter(|message| !message.is_empty()) {
+                text.push_str(&format!(" ({message})"));
+            }
+            fail(ctx, text)
+        }
+        other => fail(ctx, format!("'{key}': {other}")),
+    })
+}
+
+/// The Rust type a conversion wanted, said the way a script would put it.
+fn kind_of(to: &str) -> &str {
+    match to {
+        "i8" | "u8" | "i16" | "u16" | "i32" | "u32" | "i64" | "u64" | "f32" | "f64" | "usize"
+        | "isize" | "int" | "float" | "number" => "a number",
+        "bool" => "a boolean",
+        _ if to.eq_ignore_ascii_case("string") => "a string",
+        _ if to.eq_ignore_ascii_case("function") => "a function",
+        _ if to.eq_ignore_ascii_case("array") || to.starts_with("Vec") => "an array",
+        _ if to.eq_ignore_ascii_case("object") => "an object",
+        other => other,
+    }
 }
 
 /// A field that has to be there.
-fn required<T: FromLua>(spec: &Table, key: &str) -> mlua::Result<T> {
-    optional(spec, key, None)?.ok_or_else(|| runtime(format!("'{key}' is required")))
+fn required<'js, T: FromJs<'js>>(
+    ctx: &Ctx<'js>,
+    spec: &Object<'js>,
+    key: &str,
+) -> rquickjs::Result<T> {
+    field(ctx, spec, key)?.ok_or_else(|| fail(ctx, format!("'{key}' is required")))
 }
 
 /// A field that may be missing, in which case `default` stands in.
-pub(crate) fn optional<T: FromLua>(spec: &Table, key: &str, default: T) -> mlua::Result<T> {
-    let value: Option<T> = spec
-        .get(key)
-        .map_err(|err| runtime(format!("'{key}': {}", plain(&err))))?;
-    Ok(value.unwrap_or(default))
+pub(crate) fn optional<'js, T: FromJs<'js>>(
+    ctx: &Ctx<'js>,
+    spec: &Object<'js>,
+    key: &str,
+    default: T,
+) -> rquickjs::Result<T> {
+    Ok(field(ctx, spec, key)?.unwrap_or(default))
 }
 
-fn material_from(spec: &Table) -> mlua::Result<MaterialInfo> {
-    let name: String = required(spec, "name")?;
+fn material_from<'js>(ctx: &Ctx<'js>, spec: &Object<'js>) -> rquickjs::Result<MaterialInfo> {
+    let name: String = required(ctx, spec, "name")?;
     if name.trim().is_empty() {
-        return Err(runtime("a material needs a name"));
+        return Err(fail(ctx, "a material needs a name"));
     }
-    let color: Vec<u8> = required(spec, "color")?;
-    let [r, g, b] = color[..] else {
-        return Err(runtime(
-            "'color' should be three numbers from 0 to 255, like {200, 120, 40}",
+    let color: Vec<f64> = required(ctx, spec, "color")?;
+    let channel = |v: f64| (v.is_finite() && (0.0..=255.0).contains(&v)).then_some(v as u8);
+    let [Some(r), Some(g), Some(b)] = color.iter().map(|&v| channel(v)).collect::<Vec<_>>()[..]
+    else {
+        return Err(fail(
+            ctx,
+            "'color' should be three numbers from 0 to 255, like [200, 120, 40]",
         ));
     };
     Ok(MaterialInfo {
@@ -803,97 +1105,124 @@ fn material_from(spec: &Table) -> mlua::Result<MaterialInfo> {
         // bytes of the old name, which is nothing.
         name: name.leak(),
         color: [r, g, b],
-        jitter: optional(spec, "jitter", 0)?,
-        density: required(spec, "density")?,
-        mobile: optional(spec, "mobile", false)?,
-        passable: optional(spec, "passable", true)?,
-        liquid: optional(spec, "liquid", false)?,
-        spread: optional(spec, "spread", 0)?,
-        windborne: optional(spec, "windborne", false)?,
-        glow: optional(spec, "glow", false)?,
-        draft: optional(spec, "draft", 0)?,
+        jitter: optional(ctx, spec, "jitter", 0)?,
+        density: required(ctx, spec, "density")?,
+        mobile: optional(ctx, spec, "mobile", false)?,
+        passable: optional(ctx, spec, "passable", true)?,
+        liquid: optional(ctx, spec, "liquid", false)?,
+        spread: optional(ctx, spec, "spread", 0)?,
+        windborne: optional(ctx, spec, "windborne", false)?,
+        glow: optional(ctx, spec, "glow", false)?,
+        draft: optional(ctx, spec, "draft", 0)?,
     })
 }
 
 /// A material named by a script: its id, or its name in any case.
-pub(crate) fn resolve(registry: &Registry, value: &Value, what: &str) -> mlua::Result<MaterialId> {
-    let by_id = |id: i64| {
-        if (0..registry.materials().len() as i64).contains(&id) {
+pub(crate) fn resolve(
+    ctx: &Ctx<'_>,
+    registry: &Registry,
+    value: &Value<'_>,
+    what: &str,
+) -> rquickjs::Result<MaterialId> {
+    let by_id = |id: f64| {
+        if id.fract() == 0.0 && (0.0..registry.materials().len() as f64).contains(&id) {
             Ok(id as MaterialId)
         } else {
-            Err(runtime(format!(
-                "{what}: there is no material with id {id}"
-            )))
+            Err(fail(
+                ctx,
+                format!("{what}: there is no material with id {id}"),
+            ))
         }
     };
-    match value {
-        Value::Integer(id) => by_id(*id),
-        Value::Number(n) if n.fract() == 0.0 => by_id(*n as i64),
-        Value::String(name) => {
-            let name = name.to_str()?;
+    match value.type_of() {
+        Type::Int | Type::Float => by_id(value.as_number().unwrap_or(f64::NAN)),
+        Type::String => {
+            let name = value.as_string().expect("a string value").to_string()?;
             registry
                 .find(&name)
-                .ok_or_else(|| runtime(format!("{what}: there is no material called '{}'", &*name)))
+                .ok_or_else(|| fail(ctx, format!("{what}: there is no material called '{name}'")))
         }
-        Value::Nil => Err(runtime(format!("'{what}' is required"))),
-        other => Err(runtime(format!(
-            "{what} should be a material name or id, not a {}",
-            other.type_name()
-        ))),
+        Type::Undefined | Type::Null | Type::Uninitialized => {
+            Err(fail(ctx, format!("'{what}' is required")))
+        }
+        other => Err(fail(
+            ctx,
+            format!("{what} should be a material name or id, not a {other}"),
+        )),
     }
 }
 
-fn look_from(name: Option<String>) -> mlua::Result<Look> {
+fn look_from(ctx: &Ctx<'_>, name: Option<String>) -> rquickjs::Result<Look> {
     match name.as_deref().map(str::to_ascii_lowercase).as_deref() {
         None | Some("ortho") => Ok(Look::Ortho),
         Some("around") => Ok(Look::Around),
         Some("above") => Ok(Look::Above),
         Some("below") => Ok(Look::Below),
-        Some(other) => Err(runtime(format!(
-            "look should be ortho, around, above or below, not '{other}'"
-        ))),
+        Some(other) => Err(fail(
+            ctx,
+            format!("look should be ortho, around, above or below, not '{other}'"),
+        )),
     }
 }
 
 pub(crate) fn clamp_radius(radius: f64) -> i32 {
-    (radius.round() as i32).clamp(0, MAX_RADIUS)
+    if radius.is_finite() {
+        (radius.round() as i32).clamp(0, MAX_RADIUS)
+    } else {
+        0
+    }
 }
 
 /// The one line of an error worth showing on the panel: what went wrong, and
-/// where in the script if that can be told. Lua's own errors say where on
-/// their first line; an error raised from the Rust side does not, but the
-/// traceback under it does, so that is looked for and added. Frames in C
-/// and in the control API's own Lua are passed over, since neither is
-/// anywhere the user wrote.
-pub(crate) fn describe(err: &mlua::Error) -> String {
-    let text = err.to_string();
-    let first = plain(err);
-    let prelude = format!("{}:", crate::scripting::PRELUDE_NAME);
-    let place = text
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.starts_with("[C]") && !line.starts_with(&prelude))
-        .find_map(|line| line.split_once(": in ").map(|(place, _)| place));
-    match place {
-        Some(place) if !first.starts_with(place) => format!("{first} (at {place})"),
-        _ => first,
+/// where in the script if that can be told. The engine keeps a stack with
+/// every error it throws, with the file and line of each frame, and the
+/// topmost frame that is in a script rather than in the host is the line
+/// worth pointing at. This takes the error out of the engine, so it has to
+/// be called from where the error was made.
+pub(crate) fn describe(ctx: &Ctx<'_>, err: Error) -> String {
+    match CaughtError::from_error(ctx, err) {
+        CaughtError::Exception(exception) => {
+            let name = exception
+                .get::<_, Option<Coerced<String>>>("name")
+                .ok()
+                .flatten()
+                .map(|name| name.0)
+                .unwrap_or_default();
+            let message = exception.message().unwrap_or_default();
+            let mut text = match (name.as_str(), message.as_str()) {
+                ("" | "Error", message) => message.to_string(),
+                (name, "") => name.to_string(),
+                (name, message) => format!("{name}: {message}"),
+            };
+            if text.is_empty() {
+                text = "an error with no message".to_string();
+            }
+            if let Some(place) = exception.stack().as_deref().and_then(place) {
+                text = format!("{text} (at {place})");
+            }
+            text
+        }
+        // `throw "a string"` is legal, and all there is to say is the string.
+        CaughtError::Value(value) => show(ctx, &value),
+        CaughtError::Error(err) => err.to_string(),
     }
 }
 
-/// An error's message with mlua's own framing taken off: the root cause of a
-/// callback error, and only the first line of it.
-pub(crate) fn plain(err: &mlua::Error) -> String {
-    let mut cause = err;
-    while let mlua::Error::CallbackError { cause: inner, .. } = cause {
-        cause = inner;
-    }
-    let text = cause.to_string();
-    let first = text.lines().next().unwrap_or("unknown error").trim();
-    first
-        .strip_prefix("runtime error: ")
-        .or_else(|| first.strip_prefix("syntax error: "))
-        .unwrap_or(first)
-        .to_string()
+/// The first frame of a stack that names a place in a script, as
+/// `file:line:column`. The engine writes a frame as `at name (file:line:col)`
+/// or, for a syntax error, `at file:line:col`, and a frame in the host as
+/// `at name (native)`, which is skipped.
+fn place(stack: &str) -> Option<String> {
+    stack.lines().find_map(|line| {
+        let line = line.trim().strip_prefix("at ")?;
+        let inner = match line.rsplit_once(" (") {
+            Some((_, rest)) => rest.strip_suffix(')').unwrap_or(rest),
+            None => line,
+        };
+        let (head, last) = inner.rsplit_once(':')?;
+        last.parse::<u32>().ok()?;
+        (!head.is_empty()).then(|| inner.to_string())
+    })
 }
 
 #[cfg(test)]
@@ -906,14 +1235,14 @@ mod tests {
         let mut plugins = Plugins::new();
         let report = plugins
             .load(
-                "acid.lua",
+                "acid.js",
                 r#"
-                local acid = sandy.material {
-                    name = "Acid", color = {1, 2, 3}, density = 120,
-                    mobile = true, liquid = true, spread = 200, glow = true,
-                }
-                sandy.rule { actor = "stone", trigger = acid, product = "Empty",
-                             look = "around", chance = 6 }
+                const acid = sandy.material({
+                    name: "Acid", color: [1, 2, 3], density: 120,
+                    mobile: true, liquid: true, spread: 200, glow: true,
+                });
+                sandy.rule({ actor: "stone", trigger: acid, product: "Empty",
+                             look: "around", chance: 6 });
                 "#,
             )
             .unwrap();
@@ -958,17 +1287,18 @@ mod tests {
     #[test]
     fn loading_a_script_again_replaces_rather_than_duplicates() {
         let mut plugins = Plugins::new();
+        // A `const` at the top level, which would be a redeclaration if the
+        // second load ran in the same scope as the first.
         let script = |color: &str| {
-            format!(
-                r#"sandy.material {{ name = "Ash", color = {color}, density = 100, mobile = true }}
-                   sandy.tool {{ name = "Puff", on_drag = function(t) end }}"#
-            )
+            r#"const ash = sandy.material({ name: "Ash", color: COLOR, density: 100, mobile: true });
+               sandy.tool({ name: "Puff", onDrag: (t) => {} });"#
+                .replace("COLOR", color)
         };
-        plugins.load("ash.lua", &script("{9, 9, 9}")).unwrap();
+        plugins.load("ash.js", &script("[9, 9, 9]")).unwrap();
         let count = plugins.registry().materials().len();
         let id = plugins.registry().find("Ash").unwrap();
 
-        plugins.load("ash.lua", &script("{4, 4, 4}")).unwrap();
+        plugins.load("ash.js", &script("[4, 4, 4]")).unwrap();
         let registry = plugins.registry();
         assert_eq!(registry.materials().len(), count);
         assert_eq!(registry.find("Ash"), Some(id));
@@ -981,13 +1311,13 @@ mod tests {
         let mut plugins = Plugins::new();
         plugins
             .load(
-                "fan.lua",
+                "fan.js",
                 r#"
-                sandy.tool { name = "Fan", on_drag = function(t)
-                    sandy.wind(t.x, t.y, t.radius * 3, 0, -4)
-                    if t.first then sandy.paint(t.x, t.y, 2.4, t.material) end
-                    if t.x ~= t.px then sandy.paint(t.px, t.py, 0, "water") end
-                end }
+                sandy.tool({ name: "Fan", onDrag: (t) => {
+                    sandy.wind(t.x, t.y, t.radius * 3, 0, -4);
+                    if (t.first) sandy.paint(t.x, t.y, 2.4, t.material);
+                    if (t.x !== t.px) sandy.paint(t.px, t.py, 0, "water");
+                } });
                 "#,
             )
             .unwrap();
@@ -1061,53 +1391,76 @@ mod tests {
     }
 
     #[test]
-    fn a_broken_script_reports_what_went_wrong_and_the_interpreter_carries_on() {
+    fn a_broken_script_reports_what_went_wrong_and_the_engine_carries_on() {
         let mut plugins = Plugins::new();
 
-        let err = plugins.load("bad.lua", "sandy.material {").unwrap_err();
-        assert!(err.contains("bad.lua"), "a syntax error says where: {err}");
+        let err = plugins.load("bad.js", "sandy.material({").unwrap_err();
+        assert!(err.contains("bad.js"), "a syntax error says where: {err}");
 
         let err = plugins
             .load(
-                "bad.lua",
-                r#"sandy.material { name = "Ash", color = {1, 2, 3} }"#,
+                "bad.js",
+                r#"sandy.material({ name: "Ash", color: [1, 2, 3] })"#,
             )
             .unwrap_err();
         assert!(err.contains("'density' is required"), "{err}");
         assert!(
-            err.contains("bad.lua:1"),
-            "a callback error says where: {err}"
+            err.contains("bad.js:1"),
+            "an error from the host says where: {err}"
         );
 
         let err = plugins
             .load(
-                "bad.lua",
-                r#"sandy.rule { actor = "Sand", trigger = "Unobtainium", product = 0 }"#,
+                "bad.js",
+                r#"sandy.rule({ actor: "Sand", trigger: "Unobtainium", product: 0 })"#,
             )
             .unwrap_err();
         assert!(err.contains("Unobtainium"), "{err}");
 
         let err = plugins
-            .load("bad.lua", r#"sandy.rule { actor = "Sand", trigger = "Water", product = 0, look = "sideways" }"#)
+            .load(
+                "bad.js",
+                r#"sandy.rule({ actor: "Sand", trigger: "Water", product: 0, look: "sideways" })"#,
+            )
             .unwrap_err();
         assert!(err.contains("sideways"), "{err}");
 
         let err = plugins
             .load(
-                "bad.lua",
-                r#"sandy.material { name = "Ash", color = {1, 2}, density = 5 }"#,
+                "bad.js",
+                r#"sandy.material({ name: "Ash", color: [1, 2], density: 5 })"#,
             )
             .unwrap_err();
         assert!(err.contains("color"), "{err}");
 
-        let err = plugins.load("bad.lua", "error('no thanks')").unwrap_err();
+        let err = plugins
+            .load(
+                "bad.js",
+                r#"sandy.material({ name: "Ash", color: [1, 2, 3], density: "lots" })"#,
+            )
+            .unwrap_err();
+        assert!(err.contains("'density' should be a number"), "{err}");
+
+        let err = plugins
+            .load("bad.js", "throw new Error('no thanks')")
+            .unwrap_err();
         assert!(err.contains("no thanks"), "{err}");
-        assert!(err.contains("bad.lua:1"), "{err}");
+        assert!(err.contains("bad.js:1"), "{err}");
+
+        let err = plugins
+            .load("bad.js", "\nassert(1 === 2, 'not so')")
+            .unwrap_err();
+        assert!(err.contains("not so") && err.contains("bad.js:2"), "{err}");
+
+        let err = plugins
+            .load("bad.js", "await new Promise(() => {})")
+            .unwrap_err();
+        assert!(err.contains("never comes"), "{err}");
 
         plugins
             .load(
-                "tool.lua",
-                "sandy.tool { name = 'Oops', on_drag = function(t) return t.nothing.here end }",
+                "tool.js",
+                "sandy.tool({ name: 'Oops', onDrag: (t) => t.nothing.here })",
             )
             .unwrap();
         let stroke = Stroke {
@@ -1120,20 +1473,20 @@ mod tests {
             material: SAND,
         };
         let err = plugins.run(Kind::Tool, 0, stroke).unwrap_err();
-        assert!(err.contains("tool.lua:1"), "{err}");
+        assert!(err.contains("tool.js:1"), "{err}");
         assert!(plugins.run(Kind::Tool, 1, stroke).is_err(), "no such tool");
         assert!(
             plugins.run(Kind::Brush, 0, stroke).is_err(),
             "no brushes at all"
         );
 
-        // None of that has hurt the interpreter or the registry.
+        // None of that has hurt the engine or the registry.
         let registry_size = plugins.registry().materials().len();
         assert_eq!(plugins.registry().find("Ash"), None);
         plugins
             .load(
-                "good.lua",
-                r#"sandy.material { name = "Ash", color = {1, 2, 3}, density = 5 }"#,
+                "good.js",
+                r#"sandy.material({ name: "Ash", color: [1, 2, 3], density: 5 })"#,
             )
             .unwrap();
         assert_eq!(plugins.registry().materials().len(), registry_size + 1);
@@ -1148,11 +1501,11 @@ mod tests {
                 .unwrap_or_else(|err| panic!("{name}: {err}"));
         }
         let registry = plugins.registry();
-        let acid = registry.find("Acid").expect("acid.lua adds Acid");
+        let acid = registry.find("Acid").expect("acid.js adds Acid");
         assert!(registry.materials()[acid as usize].liquid);
         assert!(
             registry.rules().iter().any(|rule| rule.trigger == acid),
-            "acid.lua adds rules that fire next to acid"
+            "acid.js adds rules that fire next to acid"
         );
         drop(registry);
         assert_eq!(plugins.names(Kind::Brush), ["Disk", "Spray"]);
@@ -1216,20 +1569,20 @@ mod tests {
         let mut plugins = Plugins::new();
         let report = plugins
             .load(
-                "flat.lua",
+                "flat.js",
                 r#"
-                sandy.world { name = "Flat", generate = function(w)
-                    assert(w.width == sandy.width and w.height == sandy.height)
-                    assert(w:get(0, 0) == 0, "a fresh canvas is air")
-                    assert(w:get(-1, 0) == nil, "off the grid is nil")
-                    -- A floor, a pond in it, a boulder, and one grain of sand
-                    -- off the edge that goes nowhere.
-                    w:fill(0, w.height - 10, w.width - 1, w.height - 1, "Stone")
-                    w:fill(100, w.height - 10, 199, w.height - 6, "water")
-                    w:disk(500, 100, 3, sandy.find("Soil"))
-                    w:set(w.width, 5, "Sand")
-                    assert(w:get(500, 100) == sandy.find("Soil"))
-                end }
+                sandy.world({ name: "Flat", generate: (w) => {
+                    assert(w.width === sandy.width && w.height === sandy.height);
+                    assert(w.get(0, 0) === 0, "a fresh canvas is air");
+                    assert(w.get(-1, 0) === undefined, "off the grid is undefined");
+                    // A floor, a pond in it, a boulder, and one grain of sand
+                    // off the edge that goes nowhere.
+                    w.fill(0, w.height - 10, w.width - 1, w.height - 1, "Stone");
+                    w.fill(100, w.height - 10, 199, w.height - 6, "water");
+                    w.disk(500, 100, 3, sandy.find("Soil"));
+                    w.set(w.width, 5, "Sand");
+                    assert(w.get(500, 100) === sandy.find("Soil"));
+                } });
                 "#,
             )
             .unwrap();
@@ -1248,8 +1601,8 @@ mod tests {
         // Registering the same name again replaces the world in place.
         plugins
             .load(
-                "flat.lua",
-                r#"sandy.world { name = "flat", generate = function(w) end }"#,
+                "flat.js",
+                r#"sandy.world({ name: "flat", generate: (w) => {} })"#,
             )
             .unwrap();
         assert_eq!(plugins.world_names(), ["Flat"]);
@@ -1334,23 +1687,20 @@ mod tests {
         let mut plugins = Plugins::new();
         plugins
             .load(
-                "bad.lua",
-                r#"
-                stash = nil
-                sandy.world { name = "Half", generate = function(w)
-                    stash = w
-                    w:fill(0, 0, 10, 10, "Stone")
-                    w:set(0, 0, "Unobtainium")
-                end }
-                sandy.world { name = "Late", generate = function(w)
-                    return stash:get(0, 0)
-                end }
-                "#,
+                "bad.js",
+                r#"globalThis.stash = null;
+sandy.world({ name: "Half", generate: (w) => {
+    globalThis.stash = w;
+    w.fill(0, 0, 10, 10, "Stone");
+    w.set(0, 0, "Unobtainium");
+} });
+sandy.world({ name: "Late", generate: (w) => stash.get(0, 0) });
+"#,
             )
             .unwrap();
         let err = plugins.generate(0, 1).unwrap_err();
         assert!(err.contains("Unobtainium"), "{err}");
-        assert!(err.contains("bad.lua:6"), "{err}");
+        assert!(err.contains("bad.js:5"), "{err}");
 
         // The canvas the failed script painted on is gone, and so a handle to
         // it kept from that run is no use to a later one.
@@ -1359,7 +1709,7 @@ mod tests {
 
         // A world with no generate function is refused at registration.
         let err = plugins
-            .load("bad.lua", r#"sandy.world { name = "Nothing" }"#)
+            .load("bad.js", r#"sandy.world({ name: "Nothing" })"#)
             .unwrap_err();
         assert!(err.contains("generate"), "{err}");
     }
@@ -1369,40 +1719,69 @@ mod tests {
         let mut plugins = Plugins::new();
         plugins
             .load(
-                "noise.lua",
+                "noise.js",
                 r#"
-                local a = sandy.noise { seed = 3, frequency = 0.05, octaves = 2 }
-                local b = sandy.noise { seed = 3, frequency = 0.05, octaves = 2 }
-                local c = sandy.noise { seed = 4, frequency = 0.05, octaves = 2 }
-                assert(a:at(10, 20) == b:at(10, 20), "same seed, same noise")
-                assert(a:at(10, 20) ~= c:at(10, 20), "another seed, other noise")
-                local g = a:grid(30, 25)
-                assert(math.abs(g[20][10] - a:at(10, 20)) < 1e-4, "rows then columns")
-                assert(g[24][29] ~= nil and g[25] == nil and g[0][30] == nil)
+                const a = sandy.noise({ seed: 3, frequency: 0.05, octaves: 2 });
+                const b = sandy.noise({ seed: 3, frequency: 0.05, octaves: 2 });
+                const c = sandy.noise({ seed: 4, frequency: 0.05, octaves: 2 });
+                assert(a.at(10, 20) === b.at(10, 20), "same seed, same noise");
+                assert(a.at(10, 20) !== c.at(10, 20), "another seed, other noise");
+                const g = a.grid(30, 25);
+                assert(Math.abs(g[20][10] - a.at(10, 20)) < 1e-4, "rows then columns");
+                assert(g[24][29] !== undefined && g[25] === undefined && g[0][30] === undefined);
                 "#,
             )
             .unwrap();
         let err = plugins
-            .load("noise.lua", r#"sandy.noise { kind = "static" }"#)
+            .load("noise.js", r#"sandy.noise({ kind: "static" })"#)
             .unwrap_err();
         assert!(err.contains("static"), "{err}");
     }
 
     #[test]
-    fn the_sandbox_reaches_nothing_outside_the_interpreter() {
+    fn math_random_is_the_games_own_and_follows_the_world_seed() {
         let mut plugins = Plugins::new();
         plugins
             .load(
-                "probe.lua",
+                "dice.js",
                 r#"
-                assert(io == nil, "io")
-                assert(os == nil, "os")
-                assert(require == nil, "require")
-                assert(debug == nil, "debug")
-                assert(math.sqrt(16) == 4, "math is still there")
-                assert(sandy.width > 0 and sandy.height > 0, "the grid size is known")
-                assert(sandy.find("water") == 3, "built-in materials can be found")
-                print("this goes to the log, not stdout")
+                sandy.world({ name: "Dice", generate: (w) => {
+                    globalThis.rolls = [Math.random(), Math.random()];
+                } });
+                "#,
+            )
+            .unwrap();
+        let rolls = |plugins: &mut Plugins, seed: u32| -> Vec<f64> {
+            plugins.generate(0, seed).unwrap();
+            plugins
+                .context()
+                .with(|ctx| ctx.globals().get::<_, Vec<f64>>("rolls").unwrap())
+        };
+        let a = rolls(&mut plugins, 7);
+        let b = rolls(&mut plugins, 7);
+        let c = rolls(&mut plugins, 8);
+        assert_eq!(a.len(), 2);
+        assert!(a.iter().all(|v| (0.0..1.0).contains(v)));
+        assert_eq!(a, b, "the same seed rolls the same");
+        assert_ne!(a, c);
+    }
+
+    #[test]
+    fn the_sandbox_reaches_nothing_outside_the_engine() {
+        let mut plugins = Plugins::new();
+        plugins
+            .load(
+                "probe.js",
+                r#"
+                assert(typeof require === "undefined", "require");
+                assert(typeof process === "undefined", "process");
+                assert(typeof fetch === "undefined", "fetch");
+                assert(typeof os === "undefined" && typeof std === "undefined", "quickjs-libc");
+                assert(Math.sqrt(16) === 4, "Math is still there");
+                assert(sandy.width > 0 && sandy.height > 0, "the grid size is known");
+                assert(sandy.find("water") === 3, "built-in materials can be found");
+                console.log("this goes to the log, not stdout", { and: "objects" }, [1, 2]);
+                print("so does this");
                 "#,
             )
             .unwrap();

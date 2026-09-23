@@ -7,11 +7,11 @@ use std::path::PathBuf;
 use crate::scripting::Source;
 
 pub const USAGE: &str = "\
-Usage: sandy-3 [--headless] [SCRIPT.lua | -e CODE | -]
+Usage: sandy-3 [--headless] [SCRIPT.js | -e CODE | -]
 
 With no arguments, opens the window.
 
-  SCRIPT.lua    run this control script, in the window unless --headless
+  SCRIPT.js    run this control script, in the window unless --headless
   -e CODE       run CODE as the script
   -             read the script from standard input
   --headless    no window: run the script and exit, 1 if it failed
@@ -75,15 +75,15 @@ mod tests {
     fn the_arguments_say_what_to_run_and_where() {
         assert_eq!(parse_all(&[]).unwrap(), Command::Window { script: None });
         assert_eq!(
-            parse_all(&["demo.lua"]).unwrap(),
+            parse_all(&["demo.js"]).unwrap(),
             Command::Window {
-                script: Some(Source::File(PathBuf::from("demo.lua")))
+                script: Some(Source::File(PathBuf::from("demo.js")))
             }
         );
         assert_eq!(
-            parse_all(&["--headless", "demo.lua"]).unwrap(),
+            parse_all(&["--headless", "demo.js"]).unwrap(),
             Command::Headless {
-                script: Source::File(PathBuf::from("demo.lua"))
+                script: Source::File(PathBuf::from("demo.js"))
             }
         );
         assert_eq!(
@@ -99,7 +99,7 @@ mod tests {
             }
         );
         assert_eq!(parse_all(&["-h"]).unwrap(), Command::Help);
-        assert_eq!(parse_all(&["demo.lua", "--help"]).unwrap(), Command::Help);
+        assert_eq!(parse_all(&["demo.js", "--help"]).unwrap(), Command::Help);
     }
 
     #[test]
@@ -107,7 +107,7 @@ mod tests {
         assert!(parse_all(&["--headless"]).unwrap_err().contains("script"));
         assert!(parse_all(&["-e"]).unwrap_err().contains("-e"));
         assert!(parse_all(&["--wat"]).unwrap_err().contains("--wat"));
-        assert!(parse_all(&["a.lua", "b.lua"]).unwrap_err().contains("one"));
+        assert!(parse_all(&["a.js", "b.js"]).unwrap_err().contains("one"));
         assert!(parse_all(&["-e", "x", "-"]).unwrap_err().contains("one"));
     }
 }

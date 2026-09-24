@@ -10,30 +10,40 @@
 //!
 //! # What runs when
 //!
-//! One tick is the wind first ([`curl`], [`swirl`], [`flow`], [`divergence`],
-//! [`pressure`] a few times over, [`project`]), then [`react`] once, then
-//! [`movement`] [`MOVE_PASSES`] times. Reacting and moving are separate because they need
-//! the grid in different shapes: a reaction reads a neighbourhood and rewrites a
-//! single cell, while a move has to pick two cells up and put them down
-//! somewhere else. Splitting them keeps each kernel to one job.
+//! One tick is the wind first ([`swirl`], [`flow`], [`pressure`] a few times
+//! over, [`project`]), then [`react`] once, then [`movement`] [`MOVE_PASSES`]
+//! times. Reacting and moving are separate because they need the grid in
+//! different shapes: a reaction reads a neighbourhood and rewrites a single
+//! cell, while a move has to pick two cells up and put them down somewhere
+//! else. Splitting them keeps each kernel to one job.
 //!
 //! # The wind is a fluid
 //!
-//! The wind is a velocity field with one vector per cell, in cells per tick.
-//! The wind tool stamps velocity into it, and every tick it is moved along by
-//! itself and squeezed until it is incompressible, which is what turns a
-//! stamped puff into a gust that travels across the world, spreads out where it
-//! meets a wall, and curls into eddies at its edges. That is the same scheme
-//! sandspiel's wind uses, in six small kernels: [`curl`] and [`swirl`] keep
-//! the eddies wound up, [`flow`] carries the field along and lets it fade,
-//! [`divergence`] measures where it is piling up, [`pressure`] solves for the
-//! push that would stop that, and [`project`] applies it. [`movement`] then
-//! reads the finished field to decide what gets shoved.
+//! The wind is a velocity field, in grid cells per tick. The wind tool stamps
+//! velocity into it, and every tick it is moved along by itself and squeezed
+//! until it is incompressible, which is what turns a stamped puff into a gust
+//! that travels across the world, spreads out where it meets a wall, and curls
+//! into eddies at its edges. That is the same scheme sandspiel's wind uses, in
+//! four small kernels: [`swirl`] keeps the eddies wound up, [`flow`] carries
+//! the field along and lets it fade, [`pressure`] measures where it is piling
+//! up and solves for the push that would stop that, and [`project`] applies
+//! it. [`movement`] then reads the finished field to decide what gets shoved.
 //!
-//! Both read one buffer and write another, never the same one, which is what
-//! makes them safe to run over the whole grid at once: no invocation can see a
+//! The wind lives on its own grid, half the world's size each way, so one
+//! wind cell covers a two-by-two block of grid cells. Air is smooth at that
+//! scale and nothing is lost by it, and every pass over the wind is then a
+//! quarter of the work it would be over the grid, which is most of what makes
+//! a world of several million cells tick in time. A velocity is still measured
+//! in grid cells per tick wherever it is read, so the numbers in the props
+//! table and the constants below mean what they say.
+//!
+//! [`swirl`] and [`flow`] each read one buffer and write another, never the
+//! same one, since each reads its neighbours: no invocation can see a
 //! half-finished neighbour, so the result does not depend on the order the GPU
-//! happens to schedule them in. The host bounces the two buffers back and forth.
+//! happens to schedule them in. The host bounces the two buffers back and
+//! forth. [`pressure`] works in place instead, by only ever writing cells whose
+//! neighbours it is not writing on the same pass, and [`project`] only reads
+//! the cell it writes.
 //!
 //! # How movement avoids fighting itself
 //!
@@ -57,10 +67,15 @@
 //! tables the host uploads from [`crate::materials`]:
 //!
 //! - **props**, [`PROPS_STRIDE`] words per material: density, flags, packed
-//!   colour, spread, draft. [`movement`] reads it to decide what sinks through
-//!   what, and [`flow`] reads the draft to let a hot material push the air up.
+//!   colour, spread, draft, and where the material's rules start in the rules
+//!   table and how many there are. [`movement`] reads it to decide what sinks
+//!   through what, [`flow`] reads the draft to let a hot material push the air
+//!   up, and [`react`] reads it to find the rules.
 //! - **rules**, [`RULE_STRIDE`] words per rule: actor, trigger, product, look,
-//!   chance. [`react`] walks it.
+//!   chance, grouped by actor so that one material's rules are one run of
+//!   rows. [`react`] walks its material's run and no other, so a cell of a
+//!   material with no rules, which is most of the world, is done after one
+//!   read.
 //!
 //! So a new material is a new row in each table, and neither kernel changes.
 
@@ -92,11 +107,14 @@ pub const FLAG_GLOW: u32 = 16;
 /// between ticks.
 pub const MOVE_PASSES: usize = 3;
 
-/// How many [`pressure`] passes go into making the wind incompressible each
-/// tick. More is more exact; the solve starts from the previous tick's answer,
-/// so a few passes a tick catch up over a handful of ticks. Even, so the answer
-/// ends up back in the buffer it started in.
-pub const PRESSURE_ITERATIONS: usize = 20;
+/// How many sweeps of [`pressure`] go into making the wind incompressible each
+/// tick, each sweep being a pass over the red cells and then one over the
+/// black. More is more exact; the solve starts from the previous tick's answer,
+/// so a few sweeps a tick catch up over a handful of ticks. One sweep is worth
+/// about two of the plain Jacobi steps it replaced, and each half of it is
+/// over half the cells, so ten sweeps converge like twenty of those at half
+/// the cost.
+pub const PRESSURE_SWEEPS: usize = 10;
 
 /// How much of the last tick's pressure the solve starts from. All of it would
 /// be the best guess while a gust blows, but the solve is far too slow to
@@ -146,9 +164,13 @@ pub const AMBIENT_RATE: f32 = 0.0026;
 /// moves into it and nothing moves out, which is how the edge of the world holds
 /// without either kernel checking for it.
 pub fn props_table(registry: &Registry) -> Vec<u32> {
+    let rules = sorted_rules(registry);
     let mut words = Vec::with_capacity((MAX_MATERIALS + 1) * PROPS_STRIDE);
-    for info in registry.materials() {
-        words.extend_from_slice(&props_row(info));
+    for (id, info) in registry.materials().iter().enumerate() {
+        let mine = |rule: &&Rule| rule.actor as usize == id;
+        let start = rules.iter().position(|rule| mine(&rule)).unwrap_or(0);
+        let count = rules.iter().filter(mine).count();
+        words.extend_from_slice(&props_row(info, start as u32, count as u32));
     }
     words.resize(MAX_MATERIALS * PROPS_STRIDE, 0);
     // The out-of-world wall. Heavy, and with no flags at all.
@@ -158,7 +180,19 @@ pub fn props_table(registry: &Registry) -> Vec<u32> {
     words
 }
 
-fn props_row(info: &MaterialInfo) -> [u32; PROPS_STRIDE] {
+/// The rules in the order the rules table lays them out: grouped by actor, so
+/// that a material's rules are one run of rows and its props row can say
+/// where the run starts and how long it is. The sort is stable, so two rules
+/// for one actor keep the order they were added in.
+fn sorted_rules(registry: &Registry) -> Vec<Rule> {
+    let mut rules = registry.rules().to_vec();
+    rules.sort_by_key(|rule| rule.actor);
+    rules
+}
+
+/// A material's row: its properties, and where its `count` rules start in
+/// the rules table.
+fn props_row(info: &MaterialInfo, start: u32, count: u32) -> [u32; PROPS_STRIDE] {
     let mut flags = 0;
     if info.mobile {
         flags |= FLAG_MOBILE;
@@ -183,22 +217,25 @@ fn props_row(info: &MaterialInfo) -> [u32; PROPS_STRIDE] {
     row[2] = color;
     row[3] = info.spread as u32;
     row[4] = info.draft as u32;
+    row[5] = start;
+    row[6] = count;
     row
 }
 
-/// The reaction table [`react`] walks.
+/// The reaction table [`react`] walks, grouped by actor as
+/// [`props_table`] expects.
 ///
 /// A world with no reactions in it would leave the buffer empty, which wgpu will
-/// not bind, so an unreachable row is added in that case. It costs one comparison
-/// a tick and saves the kernel a special case.
+/// not bind, so a row is added in that case. No material's props point at it,
+/// so it is never read.
 pub fn rules_table(registry: &Registry) -> Vec<u32> {
-    let rules = registry.rules();
+    let rules = sorted_rules(registry);
     let mut words = Vec::new();
-    for rule in rules {
+    for rule in &rules {
         words.extend_from_slice(&rule_row(rule));
     }
     if rules.is_empty() {
-        // An actor id no material has, so the row never matches.
+        // An actor id no material has, for good measure.
         let mut dead = [0u32; RULE_STRIDE];
         dead[0] = u32::MAX;
         words.extend_from_slice(&dead);
@@ -249,9 +286,14 @@ pub fn hash(seed: u32) -> u32 {
 /// two-sided reaction, like water and lava both turning to stone where they
 /// meet, is two rules that happen to fire on the same tick.
 ///
+/// The rules are grouped by actor and a material's row in `props` says where
+/// its run of them starts and how long it is, so a cell only ever looks at
+/// the rules for what it is. Most of the world is air, sand and stone, which
+/// have none, and those cells are done after one read of their props row.
+///
 /// `world` is the width, the height, the tick counter, and a spare.
 #[kernel(workgroup_size(16, 16))]
-pub fn react(src: &[u32], dst: &mut [u32], rules: &[u32], world: &Vec4<u32>) {
+pub fn react(src: &[u32], dst: &mut [u32], rules: &[u32], props: &[u32], world: &Vec4<u32>) {
     /// A cheap integer hash. Two cells that differ anywhere, including in the
     /// tick they are being asked about, come out uncorrelated.
     fn hash(seed: u32) -> u32 {
@@ -284,63 +326,62 @@ pub fn react(src: &[u32], dst: &mut [u32], rules: &[u32], world: &Vec4<u32>) {
     // overwrite it if a rule fires.
     dst[index] = cell;
 
-    let count = rules.len() / 8u32;
-    let mut rule = 0u32;
-    while rule < count {
+    let start = props[material * 8u32 + 5u32];
+    let end = start + props[material * 8u32 + 6u32];
+    let mut rule = start;
+    while rule < end {
         let row = rule * 8u32;
-        if rules[row] == material {
-            // Roll the dice before looking around. A rule that has lost its roll
-            // cannot fire whatever the neighbours say, so this skips the reads.
-            let chance = rules[row + 4u32];
-            let roll = hash(index * 2654435761u32 + frame * 374761393u32 + rule);
-            if roll % chance == 0u32 {
-                let trigger = rules[row + 1u32];
-                let look = rules[row + 3u32];
-                let mut found = 0u32;
+        // Roll the dice before looking around. A rule that has lost its roll
+        // cannot fire whatever the neighbours say, so this skips the reads.
+        let chance = rules[row + 4u32];
+        let roll = hash(index * 2654435761u32 + frame * 374761393u32 + rule);
+        if roll % chance == 0u32 {
+            let trigger = rules[row + 1u32];
+            let look = rules[row + 3u32];
+            let mut found = 0u32;
 
-                for oy in 0..3u32 {
-                    for ox in 0..3u32 {
-                        // A cell is not its own neighbour.
-                        if ox == 1u32 && oy == 1u32 {
-                            continue;
-                        }
-                        // Does this offset count, for the way this rule looks?
-                        let mut counts = 0u32;
-                        if look == 1u32 {
-                            // Around: all eight.
-                            counts = 1u32;
-                        }
-                        if look == 0u32 && (ox == 1u32 || oy == 1u32) {
-                            // Ortho: shares a row or a column with us.
-                            counts = 1u32;
-                        }
-                        if look == 2u32 && ox == 1u32 && oy == 0u32 {
-                            // Above.
-                            counts = 1u32;
-                        }
-                        if look == 3u32 && ox == 1u32 && oy == 2u32 {
-                            // Below.
-                            counts = 1u32;
-                        }
+            for oy in 0..3u32 {
+                for ox in 0..3u32 {
+                    // A cell is not its own neighbour.
+                    if ox == 1u32 && oy == 1u32 {
+                        continue;
+                    }
+                    // Does this offset count, for the way this rule looks?
+                    let mut counts = 0u32;
+                    if look == 1u32 {
+                        // Around: all eight.
+                        counts = 1u32;
+                    }
+                    if look == 0u32 && (ox == 1u32 || oy == 1u32) {
+                        // Ortho: shares a row or a column with us.
+                        counts = 1u32;
+                    }
+                    if look == 2u32 && ox == 1u32 && oy == 0u32 {
+                        // Above.
+                        counts = 1u32;
+                    }
+                    if look == 3u32 && ox == 1u32 && oy == 2u32 {
+                        // Below.
+                        counts = 1u32;
+                    }
 
-                        if counts == 1u32 {
-                            let nx = x as i32 + ox as i32 - 1;
-                            let ny = y as i32 + oy as i32 - 1;
-                            if nx >= 0 && ny >= 0 && nx < width as i32 && ny < height as i32 {
-                                let neighbour = src[ny as u32 * width + nx as u32];
-                                if (neighbour & 255u32) == trigger {
-                                    found = 1u32;
-                                }
+                    if counts == 1u32 {
+                        let nx = x as i32 + ox as i32 - 1;
+                        let ny = y as i32 + oy as i32 - 1;
+                        if nx >= 0 && ny >= 0 && nx < width as i32 && ny < height as i32 {
+                            let neighbour = src[ny as u32 * width + nx as u32];
+                            if (neighbour & 255u32) == trigger {
+                                found = 1u32;
                             }
                         }
                     }
                 }
+            }
 
-                if found == 1u32 {
-                    let variant = hash(index + frame * 747796405u32) & 255u32;
-                    dst[index] = rules[row + 2u32] | (variant << 8u32);
-                    return;
-                }
+            if found == 1u32 {
+                let variant = hash(index + frame * 747796405u32) & 255u32;
+                dst[index] = rules[row + 2u32] | (variant << 8u32);
+                return;
             }
         }
         rule += 1u32;
@@ -367,8 +408,8 @@ pub fn react(src: &[u32], dst: &mut [u32], rules: &[u32], world: &Vec4<u32>) {
 /// what stops a liquid from spreading sideways while it is still in mid air.
 ///
 /// `wind` is the velocity field the fluid kernels leave behind, one vector per
-/// cell in cells per tick, and `breeze` is the prevailing wind added to every
-/// cell's sideways component on top of it.
+/// two-by-two block of cells in cells per tick, and `breeze` is the prevailing
+/// wind added to every cell's sideways component on top of it.
 #[kernel(workgroup_size(8, 8))]
 pub fn movement(
     src: &[u32],
@@ -660,21 +701,26 @@ pub fn movement(
     // blowing over it rather than the calm inside the pile it sits on. Up is
     // negative, since rows count downwards, so the lift is the vertical
     // component the other way up.
-    let mut air = wind[index_a];
+    //
+    // The wind grid is half the world's size each way, so a corner's wind is
+    // the wind cell over the two-by-two block it sits in. An unshifted block
+    // sits in exactly one; a shifted one straddles up to four.
+    let wind_w = (width + 1u32) / 2u32;
+    let mut air = wind[(ty / 2u32) * wind_w + lx / 2u32];
     let mut strongest = air.x * air.x + air.y * air.y;
-    let corner_b = wind[index_b];
+    let corner_b = wind[(ty / 2u32) * wind_w + rx / 2u32];
     let speed_b = corner_b.x * corner_b.x + corner_b.y * corner_b.y;
     if speed_b > strongest {
         air = corner_b;
         strongest = speed_b;
     }
-    let corner_c = wind[index_c];
+    let corner_c = wind[(by / 2u32) * wind_w + lx / 2u32];
     let speed_c = corner_c.x * corner_c.x + corner_c.y * corner_c.y;
     if speed_c > strongest {
         air = corner_c;
         strongest = speed_c;
     }
-    let corner_d = wind[index_d];
+    let corner_d = wind[(by / 2u32) * wind_w + rx / 2u32];
     let speed_d = corner_d.x * corner_d.x + corner_d.y * corner_d.y;
     if speed_d > strongest {
         air = corner_d;
@@ -1028,16 +1074,20 @@ pub fn paint(cells: &mut [u32], world: &Vec4<u32>, brush: &Vec4<i32>) {
 /// moving air rather than a hard-edged disc of it, and the result is clamped to
 /// the top speed in `weather` (see [`weather`]) so holding the tool still does
 /// not wind the field up for ever.
+///
+/// `shape` is the wind grid's width and height, and `brush` is the centre and
+/// the radius in wind cells, which the host has already halved from the
+/// brush's place in the world.
 #[kernel(workgroup_size(8, 8))]
 pub fn gust(
     wind: &mut [Vec2<f32>],
-    world: &Vec4<u32>,
+    shape: &Vec4<u32>,
     brush: &Vec4<i32>,
     push: &Vec4<f32>,
     weather: &Vec4<f32>,
 ) {
-    let width = world.x;
-    let height = world.y;
+    let width = shape.x;
+    let height = shape.y;
     let radius = brush.z;
     let top = weather.x;
 
@@ -1075,28 +1125,39 @@ pub fn gust(
 /// by blending the four around it. What comes out is scaled by the decay in
 /// `weather` (see [`weather`]), so a gust dies away on its own.
 ///
-/// A cell that is solid has no wind in it, and one that is sand or water loses
-/// a fifth of it a tick. Damping it here is what makes the pressure solve
-/// see a wall as something the air has to go round, and a heap as something it
-/// mostly goes over, which is what gives the windward face of a dune its
-/// updraft. The result is also held under the top speed in `weather`, since the
-/// swirl can otherwise wind an eddy up without limit.
+/// A wind cell covers a two-by-two block of the grid, and is as open as the
+/// most open of those four: if all of them are solid the cell has no wind in
+/// it, if none is air but some are sand or water it loses a fifth of it a
+/// tick, and if any is air the wind blows through it whole. Taking the most
+/// open is what keeps the air over the surface of a heap or a floor as brisk
+/// as it was when the wind was kept per cell, since a block on the surface
+/// always has some air in it; a wall thinner than a wind cell can let some
+/// wind through, but the brush never draws one. Damping it here is what makes
+/// the pressure solve see a wall as something the air has to go round, and a
+/// heap as something it mostly goes over, which is what gives the windward
+/// face of a dune its updraft. The result is also held under the top speed in
+/// `weather`, since the swirl can otherwise wind an eddy up without limit.
 ///
 /// A material with a draft in the props table warms the air: every tick, a
-/// cell of it pushes the air in it upwards by that much. Fire and steam do.
-/// The pressure solve then has to make room for that air above, so a plume
-/// stands in a column of updraft that reaches well past the plume itself.
+/// cell of it pushes the air over it upwards by that much, and a block takes
+/// the strongest draft of its four. Fire and steam do. The pressure solve then
+/// has to make room for that air above, so a plume stands in a column of
+/// updraft that reaches well past the plume itself.
+///
+/// `shape` is the wind grid's width and height, then the world's.
 #[kernel(workgroup_size(16, 16))]
 pub fn flow(
     src: &[Vec2<f32>],
     dst: &mut [Vec2<f32>],
     cells: &[u32],
     props: &[u32],
-    world: &Vec4<u32>,
+    shape: &Vec4<u32>,
     weather: &Vec4<f32>,
 ) {
-    let width = world.x;
-    let height = world.y;
+    let width = shape.x;
+    let height = shape.y;
+    let grid_w = shape.z;
+    let grid_h = shape.w;
     let top = weather.x;
     let decay = weather.y;
 
@@ -1110,22 +1171,49 @@ pub fn flow(
     }
     let index = y * width + x;
 
-    let material = cells[index] & 255u32;
-    let flags = props[material * 8u32 + 1u32];
-    if (flags & 2u32) == 0u32 {
+    // The block of the grid under this wind cell. The far column and row are
+    // clamped, so a grid with an odd side reads its last cell twice rather
+    // than reading past the edge.
+    let gx0 = x * 2u32;
+    let gy0 = y * 2u32;
+    let gx1 = min(gx0 + 1u32, grid_w - 1u32);
+    let gy1 = min(gy0 + 1u32, grid_h - 1u32);
+    // How open the block is: nothing, a fifth less than air, or air, whichever
+    // is the most of its four.
+    let mut porosity = 0.0;
+    let mut draft = 0u32;
+    for corner in 0..4u32 {
+        let mut cx = gx0;
+        if (corner & 1u32) != 0u32 {
+            cx = gx1;
+        }
+        let mut cy = gy0;
+        if (corner & 2u32) != 0u32 {
+            cy = gy1;
+        }
+        let material = cells[cy * grid_w + cx] & 255u32;
+        let flags = props[material * 8u32 + 1u32];
+        if (flags & 2u32) != 0u32 {
+            if (flags & 1u32) != 0u32 {
+                porosity = max(porosity, 0.8);
+            } else {
+                porosity = 1.0;
+            }
+        }
+        draft = max(draft, props[material * 8u32 + 4u32]);
+    }
+    if porosity == 0.0 {
         dst[index] = vec2(0.0, 0.0);
         return;
     }
-    let mut porosity = 1.0;
-    if (flags & 1u32) != 0u32 {
-        porosity = 0.8;
-    }
 
-    // Where this cell's air was a tick ago, in cell units from the corner of
+    // Where this cell's air was a tick ago, in wind cells from the corner of
     // the world, then in index units where the centre of cell `i` sits at `i`.
+    // The velocity is in grid cells per tick and a wind cell is two of those
+    // across, so it is halved on the way.
     let here = src[index];
-    let sx = clamp(x as f32 - here.x, 0.0, width as f32 - 1.0);
-    let sy = clamp(y as f32 - here.y, 0.0, height as f32 - 1.0);
+    let sx = clamp(x as f32 - here.x * 0.5, 0.0, width as f32 - 1.0);
+    let sy = clamp(y as f32 - here.y * 0.5, 0.0, height as f32 - 1.0);
     let fx = floor(sx);
     let fy = floor(sy);
     let tx = sx - fx;
@@ -1147,8 +1235,7 @@ pub fn flow(
     let mut vx = (top_x + (low_x - top_x) * ty) * scale;
     let mut vy = (top_y + (low_y - top_y) * ty) * scale;
     // Hot air rises: up is negative, since rows count downwards.
-    let draft = props[material * 8u32 + 4u32] as f32 * 0.01;
-    vy = vy - draft;
+    vy = vy - draft as f32 * 0.01;
     let speed = sqrt(vx * vx + vy * vy);
     if speed > top {
         vx = vx * top / speed;
@@ -1158,132 +1245,84 @@ pub fn flow(
     dst[index] = vec2(vx, vy);
 }
 
-/// Measure how much air each cell is gaining or losing: the divergence of the
-/// wind. Positive means more is flowing out than in.
+/// Half a relaxation sweep towards the pressure that would make the wind
+/// incompressible: each cell of one colour takes the average of its
+/// neighbours, less the divergence measured there.
 ///
-/// Beyond the edge of the world the air stands still, so an edge cell sees zero
-/// on that side.
+/// The cells are coloured like a chessboard, and one dispatch does the red
+/// ones, the next the black. A cell's four neighbours are all the other
+/// colour, so a pass never reads a cell it is writing and the solve can work
+/// in one buffer, and each pass sees the fresh answers the pass before it
+/// left, which is what makes this Gauss-Seidel rather than Jacobi and gets it
+/// there in about half the passes. The host runs [`PRESSURE_SWEEPS`] sweeps of
+/// the pair a tick, starting from the last tick's answer, and the wind changes
+/// little between ticks, so it keeps up. Beyond the edge of the world the
+/// pressure is taken to match the edge cell, which is what stops air from being
+/// pushed out through it.
+///
+/// The divergence, how much air each cell is gaining or losing, is measured
+/// here as well rather than in a pass of its own: the first sweep of a tick
+/// works it out from the wind for the cells it visits and keeps it in `div`,
+/// and the sweeps after that read it back. Positive means more is flowing out
+/// than in; beyond the edge of the world the air stands still, so an edge cell
+/// sees zero on that side.
+///
+/// `shape` is the wind grid's width and height. `step` is the carry, then
+/// which colour this pass is, then whether it is one of the first sweep's two
+/// and so measures the divergence. The carry scales what is read, which is the
+/// same as scaling the guess the step starts from: the host passes
+/// [`PRESSURE_CARRY`] for the first pass of a tick and one for the rest, so the
+/// previous tick's answer is leant on but not for ever.
+///
+/// The dispatch is half a row wide, since each pass touches every other cell.
 #[kernel(workgroup_size(16, 16))]
-pub fn divergence(wind: &[Vec2<f32>], div: &mut [f32], world: &Vec4<u32>) {
-    let width = world.x;
-    let height = world.y;
-
-    let x = global_id().x;
-    let y = global_id().y;
-    if x >= width {
-        return;
-    }
-    if y >= height {
-        return;
-    }
-    let index = y * width + x;
-
-    let mut left = 0.0;
-    if x > 0u32 {
-        left = wind[index - 1u32].x;
-    }
-    let mut right = 0.0;
-    if x + 1u32 < width {
-        right = wind[index + 1u32].x;
-    }
-    let mut up = 0.0;
-    if y > 0u32 {
-        up = wind[index - width].y;
-    }
-    let mut down = 0.0;
-    if y + 1u32 < height {
-        down = wind[index + width].y;
-    }
-    div[index] = 0.5 * (right - left + down - up);
-}
-
-/// One relaxation step towards the pressure that would make the wind
-/// incompressible: each cell takes the average of its neighbours, less the
-/// divergence measured there.
-///
-/// This is Jacobi iteration, the simplest solver there is. It converges slowly,
-/// but the host runs it [`PRESSURE_ITERATIONS`] times a tick starting from the
-/// last tick's answer, and the wind changes little between ticks, so it keeps
-/// up. Beyond the edge of the world the pressure is taken to match the edge
-/// cell, which is what stops air from being pushed out through it.
-///
-/// `carry` scales what is read, which is the same as scaling the guess the
-/// step starts from. The host passes [`PRESSURE_CARRY`] for the first step of a
-/// tick and one for the rest, so the previous tick's answer is leant on but
-/// not for ever.
-#[kernel(workgroup_size(16, 16))]
-pub fn pressure(src: &[f32], dst: &mut [f32], div: &[f32], world: &Vec4<u32>, carry: &f32) {
-    let width = world.x;
-    let height = world.y;
-
-    let x = global_id().x;
-    let y = global_id().y;
-    if x >= width {
-        return;
-    }
-    if y >= height {
-        return;
-    }
-    let index = y * width + x;
-
-    let here = src[index];
-    let mut left = here;
-    if x > 0u32 {
-        left = src[index - 1u32];
-    }
-    let mut right = here;
-    if x + 1u32 < width {
-        right = src[index + 1u32];
-    }
-    let mut up = here;
-    if y > 0u32 {
-        up = src[index - width];
-    }
-    let mut down = here;
-    if y + 1u32 < height {
-        down = src[index + width];
-    }
-    dst[index] = ((left + right + up + down) * carry - div[index]) * 0.25;
-}
-
-/// Take the pressure gradient out of the wind, which leaves it incompressible:
-/// air that was piling up somewhere now flows round instead. This is the step
-/// that turns a stamped puff into a gust with eddies at its edges.
-///
-/// Solid cells are zeroed again here, and sand and water damped again, since
-/// the gradient can point into one. The result goes to a fresh buffer so that
-/// the live wind is always in the same place, the way the live grid is.
-#[kernel(workgroup_size(16, 16))]
-pub fn project(
-    src: &[Vec2<f32>],
-    dst: &mut [Vec2<f32>],
-    pressure: &[f32],
-    cells: &[u32],
-    props: &[u32],
-    world: &Vec4<u32>,
+pub fn pressure(
+    pressure: &mut [f32],
+    div: &mut [f32],
+    wind: &[Vec2<f32>],
+    shape: &Vec4<u32>,
+    step: &Vec4<f32>,
 ) {
-    let width = world.x;
-    let height = world.y;
+    let width = shape.x;
+    let height = shape.y;
+    let carry = step.x;
+    let colour = step.y as u32;
+    let fresh = step.z as u32;
 
-    let x = global_id().x;
     let y = global_id().y;
-    if x >= width {
+    if y >= height {
         return;
     }
-    if y >= height {
+    // Every other cell along the row, starting one further in on the rows
+    // where this colour does.
+    let x = global_id().x * 2u32 + ((y + colour) & 1u32);
+    if x >= width {
         return;
     }
     let index = y * width + x;
 
-    let material = cells[index] & 255u32;
-    let flags = props[material * 8u32 + 1u32];
-    if (flags & 2u32) == 0u32 {
-        dst[index] = vec2(0.0, 0.0);
-        return;
-    }
-    let mut porosity = 1.0;
-    if (flags & 1u32) != 0u32 {
-        porosity = 0.8;
+    let mut divergence = 0.0;
+    if fresh == 1u32 {
+        let mut left = 0.0;
+        if x > 0u32 {
+            left = wind[index - 1u32].x;
+        }
+        let mut right = 0.0;
+        if x + 1u32 < width {
+            right = wind[index + 1u32].x;
+        }
+        let mut up = 0.0;
+        if y > 0u32 {
+            up = wind[index - width].y;
+        }
+        let mut down = 0.0;
+        if y + 1u32 < height {
+            down = wind[index + width].y;
+        }
+        divergence = 0.5 * (right - left + down - up);
+        div[index] = divergence;
+    } else {
+        divergence = div[index];
     }
 
     let here = pressure[index];
@@ -1303,19 +1342,31 @@ pub fn project(
     if y + 1u32 < height {
         down = pressure[index + width];
     }
-    let v = src[index];
-    dst[index] = vec2(
-        (v.x - 0.5 * (right - left)) * porosity,
-        (v.y - 0.5 * (down - up)) * porosity,
-    );
+    pressure[index] = ((left + right + up + down) * carry - divergence) * 0.25;
 }
 
-/// Measure how fast the air is spinning at each cell: the curl of the wind.
-/// Positive is clockwise on screen.
+/// Take the pressure gradient out of the wind, which leaves it incompressible:
+/// air that was piling up somewhere now flows round instead. This is the step
+/// that turns a stamped puff into a gust with eddies at its edges.
+///
+/// Solid blocks are zeroed again here, and sand and water damped again, since
+/// the gradient can point into one. It works in place: a cell only ever reads
+/// its own wind, so nothing can see a neighbour half done, and the live wind
+/// stays in the one buffer, the way the live grid does.
+///
+/// `shape` is the wind grid's width and height, then the world's.
 #[kernel(workgroup_size(16, 16))]
-pub fn curl(wind: &[Vec2<f32>], curl: &mut [f32], world: &Vec4<u32>) {
-    let width = world.x;
-    let height = world.y;
+pub fn project(
+    wind: &mut [Vec2<f32>],
+    pressure: &[f32],
+    cells: &[u32],
+    props: &[u32],
+    shape: &Vec4<u32>,
+) {
+    let width = shape.x;
+    let height = shape.y;
+    let grid_w = shape.z;
+    let grid_h = shape.w;
 
     let x = global_id().x;
     let y = global_id().y;
@@ -1327,23 +1378,59 @@ pub fn curl(wind: &[Vec2<f32>], curl: &mut [f32], world: &Vec4<u32>) {
     }
     let index = y * width + x;
 
-    let mut left = 0.0;
+    // The block of the grid under this wind cell, as open as its most open
+    // cell, the way `flow` reads it.
+    let gx0 = x * 2u32;
+    let gy0 = y * 2u32;
+    let gx1 = min(gx0 + 1u32, grid_w - 1u32);
+    let gy1 = min(gy0 + 1u32, grid_h - 1u32);
+    let mut porosity = 0.0;
+    for corner in 0..4u32 {
+        let mut cx = gx0;
+        if (corner & 1u32) != 0u32 {
+            cx = gx1;
+        }
+        let mut cy = gy0;
+        if (corner & 2u32) != 0u32 {
+            cy = gy1;
+        }
+        let material = cells[cy * grid_w + cx] & 255u32;
+        let flags = props[material * 8u32 + 1u32];
+        if (flags & 2u32) != 0u32 {
+            if (flags & 1u32) != 0u32 {
+                porosity = max(porosity, 0.8);
+            } else {
+                porosity = 1.0;
+            }
+        }
+    }
+    if porosity == 0.0 {
+        wind[index] = vec2(0.0, 0.0);
+        return;
+    }
+
+    let here = pressure[index];
+    let mut left = here;
     if x > 0u32 {
-        left = wind[index - 1u32].y;
+        left = pressure[index - 1u32];
     }
-    let mut right = 0.0;
+    let mut right = here;
     if x + 1u32 < width {
-        right = wind[index + 1u32].y;
+        right = pressure[index + 1u32];
     }
-    let mut up = 0.0;
+    let mut up = here;
     if y > 0u32 {
-        up = wind[index - width].x;
+        up = pressure[index - width];
     }
-    let mut down = 0.0;
+    let mut down = here;
     if y + 1u32 < height {
-        down = wind[index + width].x;
+        down = pressure[index + width];
     }
-    curl[index] = 0.5 * ((right - left) - (down - up));
+    let v = wind[index];
+    wind[index] = vec2(
+        (v.x - 0.5 * (right - left)) * porosity,
+        (v.y - 0.5 * (down - up)) * porosity,
+    );
 }
 
 /// Wind the eddies up: vorticity confinement.
@@ -1355,10 +1442,21 @@ pub fn curl(wind: &[Vec2<f32>], curl: &mut [f32], world: &Vec4<u32>) {
 /// the swirl strength in `weather` (see [`weather`]) times how hard it is
 /// spinning itself. It is the standard trick, and the one sandspiel's fluid
 /// leans on for its look.
+///
+/// How fast the air is spinning, the curl of the wind, is measured here too
+/// rather than in a pass of its own: it is the difference of the wind either
+/// side of a cell, and this needs it at the cell and its four neighbours,
+/// which is a handful of reads from cells that are in cache anyway against
+/// the buffer round trip a separate pass would cost. Positive is clockwise on
+/// screen, and beyond the edge of the world the air stands still.
+///
+/// Reads `src` and writes `dst`, since a cell looks at its neighbours' wind
+/// and could otherwise see one half-written. `shape` is the wind grid's width
+/// and height.
 #[kernel(workgroup_size(16, 16))]
-pub fn swirl(curl: &[f32], wind: &mut [Vec2<f32>], world: &Vec4<u32>, weather: &Vec4<f32>) {
-    let width = world.x;
-    let height = world.y;
+pub fn swirl(src: &[Vec2<f32>], dst: &mut [Vec2<f32>], shape: &Vec4<u32>, weather: &Vec4<f32>) {
+    let width = shape.x;
+    let height = shape.y;
     let strength = weather.z;
 
     let x = global_id().x;
@@ -1371,29 +1469,73 @@ pub fn swirl(curl: &[f32], wind: &mut [Vec2<f32>], world: &Vec4<u32>, weather: &
     }
     let index = y * width + x;
 
-    let here = curl[index];
+    // The spin here and at each neighbour: this cell first, then left, right,
+    // up and down. A neighbour outside the world is not spinning.
+    let mut here = 0.0;
     let mut left = 0.0;
-    if x > 0u32 {
-        left = abs(curl[index - 1u32]);
-    }
     let mut right = 0.0;
-    if x + 1u32 < width {
-        right = abs(curl[index + 1u32]);
-    }
     let mut up = 0.0;
-    if y > 0u32 {
-        up = abs(curl[index - width]);
-    }
     let mut down = 0.0;
-    if y + 1u32 < height {
-        down = abs(curl[index + width]);
+    for k in 0..5u32 {
+        let mut ox = 0;
+        let mut oy = 0;
+        if k == 1u32 {
+            ox = -1;
+        }
+        if k == 2u32 {
+            ox = 1;
+        }
+        if k == 3u32 {
+            oy = -1;
+        }
+        if k == 4u32 {
+            oy = 1;
+        }
+        let cx = x as i32 + ox;
+        let cy = y as i32 + oy;
+        let mut spin = 0.0;
+        if cx >= 0 && cy >= 0 && cx < width as i32 && cy < height as i32 {
+            let mut wl = 0.0;
+            if cx > 0 {
+                wl = src[cy as u32 * width + (cx - 1) as u32].y;
+            }
+            let mut wr = 0.0;
+            if cx + 1 < width as i32 {
+                wr = src[cy as u32 * width + (cx + 1) as u32].y;
+            }
+            let mut wu = 0.0;
+            if cy > 0 {
+                wu = src[(cy - 1) as u32 * width + cx as u32].x;
+            }
+            let mut wd = 0.0;
+            if cy + 1 < height as i32 {
+                wd = src[(cy + 1) as u32 * width + cx as u32].x;
+            }
+            spin = 0.5 * ((wr - wl) - (wd - wu));
+        }
+        if k == 0u32 {
+            here = spin;
+        }
+        if k == 1u32 {
+            left = abs(spin);
+        }
+        if k == 2u32 {
+            right = abs(spin);
+        }
+        if k == 3u32 {
+            up = abs(spin);
+        }
+        if k == 4u32 {
+            down = abs(spin);
+        }
     }
+
     // Which way the spin gets stronger, as a unit vector, then turned a
     // quarter turn so the push goes round the centre rather than into it.
     let gx = 0.5 * (right - left);
     let gy = 0.5 * (down - up);
     let size = sqrt(gx * gx + gy * gy) + 0.0001;
     let push = strength * here / size;
-    let v = wind[index];
-    wind[index] = vec2(v.x + push * gy, v.y - push * gx);
+    let v = src[index];
+    dst[index] = vec2(v.x + push * gy, v.y - push * gx);
 }

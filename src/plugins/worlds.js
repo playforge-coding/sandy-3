@@ -53,10 +53,17 @@ function plantTree(w, x, surface) {
 
 // A generator for a rolling landscape. Heights in `p` are fractions of the
 // world's height, from the top, so `base: 0.5` puts the ground band halfway
-// down and `seaLevel: 1` leaves the world dry.
+// down and `seaLevel: 1` leaves the world dry. `frequency` is how many hills
+// fit into one world's height of ground, so that a taller world gets hills
+// that are wider as well as higher and the landscape keeps its shape whatever
+// size the grid is.
 function landscape(p) {
     return (w) => {
-        const terrain = sandy.noise({ seed: w.seed, frequency: p.frequency, octaves: 4 });
+        const terrain = sandy.noise({
+            seed: w.seed,
+            frequency: p.frequency / w.height,
+            octaves: 4,
+        });
         const base = w.height * p.base;
         const amplitude = w.height * p.amplitude;
         const sea = Math.floor(w.height * p.seaLevel);
@@ -100,7 +107,7 @@ sandy.world({
     generate: landscape({
         base: 0.5,
         amplitude: 0.3,
-        frequency: 0.008,
+        frequency: 4,
         seaLevel: 0.55,
         surface: "Soil",
         subsurface: "Stone",
@@ -114,7 +121,7 @@ sandy.world({
     generate: landscape({
         base: 0.62,
         amplitude: 0.03,
-        frequency: 0.012,
+        frequency: 6,
         seaLevel: 1,
         surface: "Soil",
         subsurface: "Stone",
@@ -128,7 +135,7 @@ sandy.world({
     generate: landscape({
         base: 0.9,
         amplitude: 0.05,
-        frequency: 0.012,
+        frequency: 6,
         seaLevel: 0.12,
         surface: "Sand",
         subsurface: "Sand",
@@ -142,7 +149,7 @@ sandy.world({
     generate: landscape({
         base: 0.5,
         amplitude: 0.2,
-        frequency: 0.006,
+        frequency: 3,
         seaLevel: 1,
         surface: "Sand",
         subsurface: "Stone",

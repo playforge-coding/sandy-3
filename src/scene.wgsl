@@ -21,10 +21,11 @@ struct VsOut {
 // What each material looks like. Eight words per material; word 1 is the flags
 // and word 2 is the packed colour. Same table `movement` reads for densities.
 @group(0) @binding(1) var<storage, read> props: array<u32>;
-// Width and height, and two spares.
+// The grid's width and height, then the wind grid's.
 @group(0) @binding(2) var<uniform> world: vec4<u32>;
-// The wind, one velocity per cell in cells per tick, as the fluid kernels left
-// it. Only read for empty cells, to show where the air is moving.
+// The wind, one velocity per two-by-two block of cells in cells per tick, as
+// the fluid kernels left it. Only read for empty cells, to show where the air
+// is moving.
 @group(0) @binding(3) var<storage, read> wind: array<vec2<f32>>;
 
 // Words per material in the props table.
@@ -99,7 +100,7 @@ fn fs_scene(in: VsOut) -> @location(0) vec4<f32> {
     // Haze the sky where the wind blows. The blend is done in sRGB, where the
     // haze colour was chosen, and brought into linear light after.
     if material == 0u {
-        let air = wind[gy * width + gx];
+        let air = wind[(gy / 2u) * world.z + gx / 2u];
         let speed = length(air);
         let haze = smoothstep(0.0, HAZE_FULL_SPEED, speed) * HAZE_MAX;
         let sky = vec3<f32>(clamp(shade, vec3<i32>(0), vec3<i32>(255))) / 255.0;

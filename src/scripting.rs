@@ -803,6 +803,7 @@ impl Host<'_> {
         Ok(Snapshot {
             width: self.sim.width,
             height: self.sim.height,
+            wind_width: self.sim.wind_width,
             ticks: self.sim.ticks(),
             cells: cells
                 .iter()
@@ -862,8 +863,11 @@ fn coord(v: f64) -> i32 {
 pub struct Snapshot {
     width: u32,
     height: u32,
+    /// The wind grid is half the world each way; this is how far across.
+    wind_width: u32,
     ticks: u32,
     cells: Vec<MaterialId>,
+    /// One velocity per wind cell, laid out `wind_width` across.
     wind: Vec<[f32; 2]>,
     /// The materials as they were, so a name can still be looked up.
     registry: Registry,
@@ -967,17 +971,23 @@ impl Snapshot {
     }
 
     /// The wind at a cell, as `[vx, vy]` in cells per tick, or undefined off
-    /// the grid.
+    /// the grid. The wind is kept per two-by-two block of cells, so this is
+    /// the wind over the block the cell is in.
     fn wind(&self, x: f64, y: f64) -> Option<Vec<f64>> {
-        self.index(x, y)
-            .map(|i| vec![f64::from(self.wind[i][0]), f64::from(self.wind[i][1])])
+        self.index(x, y).map(|_| {
+            let (x, y) = (coord(x) as u32, coord(y) as u32);
+            let air = self.wind[((y / 2) * self.wind_width + x / 2) as usize];
+            vec![f64::from(air[0]), f64::from(air[1])]
+        })
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::gpu::{CAPTURE_H, CAPTURE_W};
     use crate::headless::Headless;
+    use crate::sim::GRID_W;
 
     /// Run `source` headless and say how it ended.
     fn run(source: &str) -> Result<(), String> {
@@ -987,13 +997,13 @@ mod tests {
     #[test]
     fn a_script_paints_steps_and_reads_the_world_back() {
         run(r#"
-            assert(sim.width === 1000 && sim.height === 500);
+            assert(sim.width === 3000 && sim.height === 1500);
             assert(sim.ticks() === 0);
             sim.fill(0, sim.height - 4, sim.width - 1, sim.height - 1, "Stone");
-            sim.paint(500, 60, 14, "sand");
+            sim.paint(500, sim.height - 440, 14, "sand");
             const painted = sim.count("Sand");
             assert(painted > 500, "the brush put sand down: " + painted);
-            assert(sim.get(500, 60) === sandy.find("Sand"));
+            assert(sim.get(500, sim.height - 440) === sandy.find("Sand"));
             assert(sim.get(-1, 60) === undefined, "off the grid is undefined");
 
             sim.step(400);
@@ -1188,16 +1198,18 @@ mod tests {
         let mut reader = ::png::Decoder::new(file).read_info().unwrap();
         let mut buf = vec![0; reader.output_buffer_size().unwrap()];
         let info = reader.next_frame(&mut buf).unwrap();
-        assert_eq!((info.width, info.height), (1000, 500));
-        // The bottom of the picture is lava coloured: much more red than blue.
+        // A capture is half the grid each way.
+        assert_eq!((info.width, info.height), (CAPTURE_W, CAPTURE_H));
+        // The lava at rows 400 to 499 of the world is at rows 200 to 249 of
+        // the picture, and lava coloured: much more red than blue.
         let px = |x: usize, y: usize| {
-            let i = (y * 1000 + x) * info.color_type.samples();
+            let i = (y * CAPTURE_W as usize + x) * info.color_type.samples();
             (buf[i], buf[i + 1], buf[i + 2])
         };
-        let (r, _, b) = px(500, 450);
-        assert!(r > 150 && r > b + 50, "lava is red, not {:?}", px(500, 450));
-        let (r, _, b) = px(500, 100);
-        assert!(b > r + 50, "the sky is blue, not {:?}", px(500, 100));
+        let (r, _, b) = px(250, 225);
+        assert!(r > 150 && r > b + 50, "lava is red, not {:?}", px(250, 225));
+        let (r, _, b) = px(250, 50);
+        assert!(b > r + 50, "the sky is blue, not {:?}", px(250, 50));
         std::fs::remove_dir_all(&dir).unwrap();
 
         let err = run("sim.screenshot('shot.bmp')").unwrap_err();
@@ -1305,7 +1317,10 @@ mod tests {
                 Status::Quit
             ]
         );
-        assert_eq!(headless.sim.read_cells().unwrap()[10 * 1000 + 20] & 0xff, 1);
+        assert_eq!(
+            headless.sim.read_cells().unwrap()[10 * GRID_W as usize + 20] & 0xff,
+            1
+        );
 
         // Once the script is gone, `sim` is still there but does nothing.
         drop(script);

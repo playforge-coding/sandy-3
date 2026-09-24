@@ -138,10 +138,12 @@ running pauses it first.
 The panel's Capture section, or the S and V keys, save what is on screen to a
 `captures` folder in the directory the game is run from, named after the
 time they were taken. A screenshot is the next frame; a recording runs from
-one press to the next. Both are the world alone, without the panel, at the
-grid's own resolution of 1000 by 500, one pixel per cell, whatever size or
-shape the window is. The line at the foot of the panel says where each one
-went.
+one press to the next. Both are the world alone, without the panel, at half
+the grid's resolution, 1500 by 750 with each pixel the average of a
+two-by-two block of cells, whatever size or shape the window is. The grid's
+own resolution would be four and a half million pixels a frame, more than a
+window shows and more than the encoders can keep up with at sixty frames a
+second. The line at the foot of the panel says where each one went.
 
 Each has a format box beside it. A screenshot is lossless WebP or PNG; a
 recording is lossless animated WebP, GIF, or animated PNG. WebP is the
@@ -490,7 +492,11 @@ times.
 cell's point of view: a water cell that can see lava next to it becomes stone.
 Lava says the mirror image of that, and between them the pair turns to rock
 wherever the two meet. Writing it that way means no cell ever writes to another
-one, so the whole grid can be decided at once from a single snapshot.
+one, so the whole grid can be decided at once from a single snapshot. The rules
+are grouped by the material they apply to, and each material's row in the
+props table says where its rules start and how many there are, so a cell only
+looks at the rules for what it is; most of the world is air, sand and stone,
+which have none, and those cells are done after one read.
 
 **`movement`** is where things fall. The usual CPU trick, scanning the grid
 bottom to top and moving one cell at a time, is exactly what a GPU cannot do, so
@@ -523,22 +529,29 @@ so the live world is back in the same buffer by the time the frame is drawn.
 
 ### The wind
 
-The wind is a second field over the same grid: one velocity per cell, in cells
-per tick. The wind tool stamps a soft blob of velocity into it, and every tick
-the field is run through the usual small fluid solver, the one sandspiel's wind
-also uses. `curl` and `swirl` measure how fast the air is spinning and wind the
+The wind is a second field, kept at half the grid's resolution: one velocity
+per two-by-two block of cells, in cells per tick. Air is smooth at that scale,
+and every pass over it is then a quarter of the work it would be over the
+grid, which is most of what lets a world this size keep time. The wind tool
+stamps a soft blob of velocity into it, and every tick the field is run
+through the usual small fluid solver, the one sandspiel's wind also uses, in
+four kernels. `swirl` measures how fast the air is spinning and winds the
 eddies back up, since carrying a field along on a grid smears its spin away
-first. `flow` moves the field along by itself, by asking each cell where its air
-was a tick ago and taking the velocity from there, and lets it fade a little.
-`divergence` measures where air is piling up, `pressure` relaxes towards the
-pressure that would stop that, twenty Jacobi steps a tick starting from most of
-the last tick's answer, and `project` subtracts that pressure's gradient, which
-leaves the air incompressible and is what turns a stamped puff into a travelling
-gust with eddies at its edges. Solid cells hold no wind at all, and sand and
-water drag on it, so a wall deflects a gust and a heap sends it up and over.
-Fire and steam feed it: `flow` also adds each material's draft, an upward push
-per cell per tick, so a plume of either is a source of wind, and the pressure
-solve turns that into a column of updraft above it.
+first. `flow` moves the field along by itself, by asking each cell where its
+air was a tick ago and taking the velocity from there, and lets it fade a
+little. `pressure` measures where air is piling up and relaxes towards the
+pressure that would stop that: ten sweeps a tick, each a pass over the red
+cells of a chessboard and then the black, so the solve works in one buffer
+and each pass sees the last one's answers, starting from most of the previous
+tick's. `project` subtracts that pressure's gradient, which leaves the air
+incompressible and is what turns a stamped puff into a travelling gust with
+eddies at its edges. A block is as open as the most open of its four cells:
+solid through, it holds no wind at all, and sand and water drag on it, so a
+wall deflects a gust and a heap sends it up and over, while the air over a
+surface blows as freely as it did with a wind cell per grid cell. Fire and
+steam feed it: `flow` also adds each material's draft,
+an upward push per cell per tick, so a plume of either is a source of wind,
+and the pressure solve turns that into a column of updraft above it.
 
 `movement` then reads the finished field. A block takes the strongest wind at
 any of its four corners, so a grain on the surface of a heap feels the air
@@ -555,9 +568,11 @@ buffer to a fragment shader, which reads the cell under each pixel and looks its
 colour up in the same table the kernels use, so the world never leaves the GPU
 between the tick that wrote it and the frame that shows it. That draws at the
 grid's own resolution; `bloom.wgsl` pulls out the cells flagged as emissive,
-blurs them twice, adds them back over the scene and blows the result up to the
-window with nearest-neighbour sampling, so grains stay crisp and lava keeps its
-halo.
+blurs them twice, adds them back over the scene and fits the result to the
+window, with nearest-neighbour sampling when the window is bigger than the
+grid so grains stay crisp, and linear when it is smaller, since dropping every
+few columns of a grid this size would make falling sand shimmer. Lava keeps
+its halo either way.
 
 A frame that a screenshot or a recording wants gets one more pass: the same
 composite drawn again into an offscreen image at the grid's resolution, which
@@ -568,11 +583,23 @@ the sRGB bytes the composite wrote, ready for a file.
 
 ### The world is bigger
 
-The grid is 1000 by 500, four times the area of Sandy 2's, which is most of the
-point. At sixty ticks a second, each one a reaction pass and three movement
-passes, that is about 120 million cell updates a second. The wind adds another
-twenty-odd passes over the same grid, though each is a few reads and a write,
-and between them it still does not trouble a laptop GPU.
+The grid is 3000 by 1500, four and a half million cells and thirty-six times
+the area of Sandy 2's, which is most of the point. At sixty ticks a second,
+each one a reaction pass and three movement passes, that is over a billion
+cell updates a second.
+
+The wind is what would make that too slow. It is a couple of dozen passes a
+tick, and at this size the buffers no longer fit in the GPU's cache, so every
+pass is paid for in memory traffic. Three things keep it in check: the wind
+runs on a grid half the size each way, its pressure solve works in place on
+every other cell rather than bouncing between two buffers, and the spin and
+the divergence are measured inside the kernels that need them rather than in
+passes of their own. The grid's own passes are trimmed too: a cell only
+walks the rules for its own material, and the kernels are handed to wgpu
+without the bounds and division checks it would otherwise add, since they
+check every index themselves. Headless on an Apple M4, a tick of a forest
+world takes about seven milliseconds, so the world runs at full speed with
+room to spare and at double speed too.
 
 ## Adding a material
 

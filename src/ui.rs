@@ -34,9 +34,11 @@ pub fn random_seed() -> u32 {
     fastrand::u32(..SEED_RANGE)
 }
 
-/// The smallest and largest brush the size slider offers, in cells.
+/// The smallest and largest brush the size slider offers, in cells. The
+/// world is three thousand cells across, so the largest is a twentieth of
+/// it: enough to pour a lake or wall off a valley in a stroke or two.
 pub const MIN_RADIUS: i32 = 1;
-pub const MAX_RADIUS: i32 = 60;
+pub const MAX_RADIUS: i32 = 150;
 
 /// The slowest the world can be run, as a multiple of real time. Below a
 /// quarter speed sand falls so slowly it looks stuck, and pausing does that job

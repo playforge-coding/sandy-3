@@ -54,7 +54,7 @@ const DROP_HINT: &str = "Drop a .js file on the window to load a plugin.";
 const WIND_DRAG_GAIN: f32 = 1.5;
 
 /// How much wider the gust is than the brush. A gust is a soft blob of moving
-/// air that fades to nothing at its rim, and the world is a thousand cells
+/// air that fades to nothing at its rim, and the world is three thousand cells
 /// across, so one the size of the paint brush would be a pinprick that dies
 /// before it has moved anything.
 const GUST_SCALE: i32 = 3;

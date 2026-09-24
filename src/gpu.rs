@@ -16,8 +16,8 @@
 //! soft anyway, so only the surface is reconfigured when the window changes size.
 //!
 //! A frame that is wanted for a screenshot or a recording gets a fifth pass:
-//! the composite drawn again, at the grid's resolution and without the panel,
-//! into an image that is then copied out to a buffer the CPU can map. The
+//! the composite drawn again, at half the grid's resolution and without the
+//! panel, into an image that is then copied out to a buffer the CPU can map. The
 //! mapping is left to complete on its own and collected by
 //! [`Renderer::take_frames`] a frame or two later, so a recording does not
 //! hold the frame up waiting on the GPU. A script wants its screenshot in hand
@@ -32,15 +32,24 @@ use winit::window::Window;
 
 use crate::capture::Frame;
 use crate::materials::Registry;
-use crate::sim::{GRID_H, GRID_W, Simulation};
+use crate::sim::{GRID_H, GRID_W, Simulation, WIND_H, WIND_W};
 
 /// How far the glow spreads, in grid cells per blur tap. Larger is a wider halo.
 const GLOW_SPREAD: f32 = 1.5;
 
+/// The size of a captured frame: half the grid each way. A screenshot or a
+/// recording at the grid's own resolution would be four and a half million
+/// pixels a frame, which is more than a window shows and more than the
+/// encoders can keep up with at sixty frames a second, so the composite is
+/// drawn into a smaller image and the scene sampler averages each two-by-two
+/// block of cells into a pixel on the way.
+pub const CAPTURE_W: u32 = GRID_W.div_ceil(2);
+pub const CAPTURE_H: u32 = GRID_H.div_ceil(2);
+
 /// Bytes per row of a captured frame in its staging buffer: four per pixel,
 /// rounded up to the alignment a texture-to-buffer copy demands.
-const CAPTURE_ROW_BYTES: u32 =
-    (GRID_W * 4).div_ceil(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT) * wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+const CAPTURE_ROW_BYTES: u32 = (CAPTURE_W * 4).div_ceil(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT)
+    * wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
 
 /// The format the offscreen images are drawn in. sRGB whatever the window
 /// turns out to be, so the blur adds light rather than adding byte values.
@@ -98,8 +107,8 @@ pub struct Renderer {
     glow_a_view: wgpu::TextureView,
     glow_b_view: wgpu::TextureView,
 
-    /// The capture image: the composite again, at the grid's resolution, in
-    /// a plain format whose bytes are the sRGB values a file wants.
+    /// The capture image: the composite again, at half the grid's resolution,
+    /// in a plain format whose bytes are the sRGB values a file wants.
     capture_texture: wgpu::Texture,
     capture_view: wgpu::TextureView,
     /// Captured frames the GPU is still copying out, oldest first, and the
@@ -244,14 +253,14 @@ impl Renderer {
         let glow_a_view = offscreen("glow a");
         let glow_b_view = offscreen("glow b");
 
-        // The capture image is the same size but not sRGB, so that what is
+        // The capture image is half the size and not sRGB, so that what is
         // copied out of it is exactly what the composite wrote, and it can be
         // copied out at all.
         let capture_texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("capture"),
             size: wgpu::Extent3d {
-                width: GRID_W,
-                height: GRID_H,
+                width: CAPTURE_W,
+                height: CAPTURE_H,
                 depth_or_array_layers: 1,
             },
             mip_level_count: 1,
@@ -263,22 +272,31 @@ impl Renderer {
         });
         let capture_view = capture_texture.create_view(&wgpu::TextureViewDescriptor::default());
 
-        // Nearest for the crisp grid, and for the glow mask so it stays exact;
-        // linear for the glow buffers so the halo scales up smoothly.
-        let sampler = |label: &str, filter| {
+        // Nearest for the glow mask so it stays exact; linear for the glow
+        // buffers so the halo scales up smoothly. The scene itself is nearest
+        // when it is blown up, so a grain stays a crisp square, and linear
+        // when it is shrunk, since the grid has more cells across than most
+        // windows have pixels and dropping every fourth column would make
+        // falling sand shimmer.
+        let sampler = |label: &str, mag, min| {
             device.create_sampler(&wgpu::SamplerDescriptor {
                 label: Some(label),
                 address_mode_u: wgpu::AddressMode::ClampToEdge,
                 address_mode_v: wgpu::AddressMode::ClampToEdge,
                 address_mode_w: wgpu::AddressMode::ClampToEdge,
-                mag_filter: filter,
-                min_filter: filter,
+                mag_filter: mag,
+                min_filter: min,
                 mipmap_filter: wgpu::MipmapFilterMode::Nearest,
                 ..Default::default()
             })
         };
-        let nearest = sampler("nearest", wgpu::FilterMode::Nearest);
-        let linear = sampler("linear", wgpu::FilterMode::Linear);
+        let nearest = sampler(
+            "nearest",
+            wgpu::FilterMode::Nearest,
+            wgpu::FilterMode::Nearest,
+        );
+        let linear = sampler("linear", wgpu::FilterMode::Linear, wgpu::FilterMode::Linear);
+        let scene = sampler("scene", wgpu::FilterMode::Nearest, wgpu::FilterMode::Linear);
 
         // ---- Uniforms ----
         let scene_world = device.create_buffer(&wgpu::BufferDescriptor {
@@ -290,7 +308,7 @@ impl Renderer {
         queue.write_buffer(
             &scene_world,
             0,
-            bytemuck::cast_slice(&[GRID_W, GRID_H, 0, 0]),
+            bytemuck::cast_slice(&[GRID_W, GRID_H, WIND_W, WIND_H]),
         );
 
         let blur_uniform = |label: &str, x: f32, y: f32| {
@@ -436,7 +454,7 @@ impl Renderer {
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
-                    resource: wgpu::BindingResource::Sampler(&nearest),
+                    resource: wgpu::BindingResource::Sampler(&scene),
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
@@ -614,7 +632,7 @@ impl Renderer {
         let buffer = self.spare_staging.pop().unwrap_or_else(|| {
             self.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("capture staging"),
-                size: (CAPTURE_ROW_BYTES * GRID_H) as wgpu::BufferAddress,
+                size: (CAPTURE_ROW_BYTES * CAPTURE_H) as wgpu::BufferAddress,
                 usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
                 mapped_at_creation: false,
             })
@@ -631,12 +649,12 @@ impl Renderer {
                 layout: wgpu::TexelCopyBufferLayout {
                     offset: 0,
                     bytes_per_row: Some(CAPTURE_ROW_BYTES),
-                    rows_per_image: Some(GRID_H),
+                    rows_per_image: Some(CAPTURE_H),
                 },
             },
             wgpu::Extent3d {
-                width: GRID_W,
-                height: GRID_H,
+                width: CAPTURE_W,
+                height: CAPTURE_H,
                 depth_or_array_layers: 1,
             },
         );
@@ -728,7 +746,7 @@ impl Renderer {
     }
 
     fn frame_from(data: &[u8]) -> Frame {
-        Frame::from_padded_rgba(data, GRID_W, GRID_H, CAPTURE_ROW_BYTES as usize)
+        Frame::from_padded_rgba(data, CAPTURE_W, CAPTURE_H, CAPTURE_ROW_BYTES as usize)
     }
 }
 

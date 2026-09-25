@@ -18,6 +18,7 @@ use egui::{Color32, RichText, Stroke};
 
 use crate::capture::{AnimationFormat, ImageFormat};
 use crate::materials::{EMPTY, MaterialId, Registry, SAND};
+use crate::view::{MAX_ZOOM, MIN_ZOOM, View};
 
 /// The most digits the seed box takes. Nine digits always fit a `u32`, and
 /// that is more seeds than anyone will type.
@@ -127,6 +128,9 @@ pub struct Controls {
     pub screenshot_format: ImageFormat,
     /// What a recording is saved as. Read when the recording starts.
     pub recording_format: AnimationFormat,
+    /// The zoom, and which part of the world the window shows. The wheel,
+    /// a pinch and the keys move it as the panel's slider does.
+    pub view: View,
 }
 
 impl Default for Controls {
@@ -143,6 +147,7 @@ impl Default for Controls {
             seed: random_seed().to_string(),
             screenshot_format: ImageFormat::default(),
             recording_format: AnimationFormat::default(),
+            view: View::default(),
         }
     }
 }
@@ -351,6 +356,33 @@ pub fn draw(
                 .text("Speed"),
         );
 
+        // The view: how far in, about the middle of the window, and a way
+        // back out to the whole world. The slider is logarithmic too, so
+        // doubling is the same distance wherever it starts.
+        ui.separator();
+        ui.label("View");
+        let mut zoom = c.view.zoom();
+        if ui
+            .add(
+                egui::Slider::new(&mut zoom, MIN_ZOOM..=MAX_ZOOM)
+                    .logarithmic(true)
+                    .suffix("x")
+                    .text("Zoom"),
+            )
+            .changed()
+        {
+            c.view.set_zoom(zoom);
+        }
+        if ui
+            .add_enabled(
+                !c.view.is_whole(),
+                egui::Button::new("Fit the world").min_size(button_size),
+            )
+            .clicked()
+        {
+            c.view.reset();
+        }
+
         // The world: which landscape, from which seed. Picking another
         // landscape builds it there and then, so the change can be seen
         // without a second click; so does pressing Enter in the seed box.
@@ -430,9 +462,12 @@ pub fn draw(
 
         ui.separator();
         let help = if layout.touch {
-            "Drag a finger to draw. Pick Wind and sweep to blow a gust."
+            "Drag a finger to draw. Pick Wind and sweep to blow a gust. \
+                 Pinch to zoom, and drag two fingers to look around."
         } else {
             "Hold left mouse to draw. Pick Wind and sweep to blow a gust. \
+                 Scroll or pinch to zoom, drag with the right button to look around, \
+                 F fits the world again. \
                  Space pauses, . steps a tick, - and = change the speed. \
                  G builds the world again, R from a new seed. \
                  S takes a screenshot, V starts and stops a recording."

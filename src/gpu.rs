@@ -15,6 +15,11 @@
 //! The glow buffers stay at the grid's resolution. They are small, and a halo is
 //! soft anyway, so only the surface is reconfigured when the window changes size.
 //!
+//! The composite is told which rectangle of the scene to fit to its target,
+//! which is how the window zooms (see [`crate::view`]): the scene is drawn
+//! once at the grid's resolution whatever the zoom, and the window shows a
+//! piece of it. A capture is always given the whole scene.
+//!
 //! A frame that is wanted for a screenshot or a recording gets a fifth pass:
 //! the composite drawn again, at half the grid's resolution and without the
 //! panel, into an image that is then copied out to a buffer the CPU can map. The
@@ -33,6 +38,7 @@ use winit::window::Window;
 use crate::capture::Frame;
 use crate::materials::Registry;
 use crate::sim::{Grid, Simulation};
+use crate::view::View;
 
 /// How far the glow spreads, in grid cells per blur tap. Larger is a wider halo.
 const GLOW_SPREAD: f32 = 1.5;
@@ -99,12 +105,16 @@ pub struct Renderer {
     bg_blur_v: wgpu::BindGroup,
     bg_blur_v_step: wgpu::BindGroup,
     bg_composite: wgpu::BindGroup,
+    /// The whole scene as the composite's viewport, which is what a capture
+    /// is always drawn with.
+    bg_whole: wgpu::BindGroup,
 
     /// What a composite pipeline needs, kept so [`State`] can build the one
     /// that draws onto its window in whatever format the surface turns out
-    /// to be.
+    /// to be, and the viewport it draws with.
     bloom_shader: wgpu::ShaderModule,
     composite_layout: wgpu::PipelineLayout,
+    bgl_viewport: wgpu::BindGroupLayout,
 
     scene_view: wgpu::TextureView,
     glow_a_view: wgpu::TextureView,
@@ -138,6 +148,10 @@ pub struct State {
 
     /// Scene plus glow, onto the window.
     pipeline_composite: wgpu::RenderPipeline,
+    /// The rectangle of the scene the window shows, written afresh each
+    /// frame from the [`View`] the panel and the input share.
+    viewport_buffer: wgpu::Buffer,
+    bg_viewport: wgpu::BindGroup,
 
     /// egui's wgpu backend, which turns the tessellated panel into draw calls
     /// layered over the finished scene.
@@ -160,6 +174,32 @@ fn blur_step_bytes(step_x: f32, step_y: f32) -> [u8; 16] {
     bytes[0..4].copy_from_slice(&step_x.to_le_bytes());
     bytes[4..8].copy_from_slice(&step_y.to_le_bytes());
     bytes
+}
+
+/// A viewport uniform holding what `view` looks at, and a bind group for it
+/// in `layout`, the composite's group one.
+fn viewport_binding(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    layout: &wgpu::BindGroupLayout,
+    view: &View,
+) -> (wgpu::Buffer, wgpu::BindGroup) {
+    let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("viewport"),
+        size: 16,
+        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    queue.write_buffer(&buffer, 0, bytemuck::cast_slice(&view.uniform()));
+    let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("viewport"),
+        layout,
+        entries: &[wgpu::BindGroupEntry {
+            binding: 0,
+            resource: buffer.as_entire_binding(),
+        }],
+    });
+    (buffer, bind_group)
 }
 
 /// A pipeline that draws one fullscreen triangle with `fs_entry` into a
@@ -404,6 +444,10 @@ impl Renderer {
                 sampler_entry(3),
             ],
         });
+        let bgl_viewport = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("viewport bgl"),
+            entries: &[uniform_entry(0)],
+        });
 
         // ---- Bind groups ----
         let bg_scene = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -502,7 +546,13 @@ impl Renderer {
         };
         let scene_layout = pipeline_layout("scene layout", &[Some(&bgl_scene)]);
         let blur_layout = pipeline_layout("blur layout", &[Some(&bgl_in), Some(&bgl_step)]);
-        let composite_layout = pipeline_layout("composite layout", &[Some(&bgl_composite)]);
+        let composite_layout = pipeline_layout(
+            "composite layout",
+            &[Some(&bgl_composite), Some(&bgl_viewport)],
+        );
+
+        // The viewport a capture is drawn with: the whole scene, for good.
+        let (_, bg_whole) = viewport_binding(device, queue, &bgl_viewport, &View::default());
 
         let pipeline_scene = fullscreen_pipeline(
             device,
@@ -553,8 +603,10 @@ impl Renderer {
             bg_blur_v,
             bg_blur_v_step,
             bg_composite,
+            bg_whole,
             bloom_shader,
             composite_layout,
+            bgl_viewport,
             scene_view,
             glow_a_view,
             glow_b_view,
@@ -616,13 +668,30 @@ impl Renderer {
         );
     }
 
+    /// A viewport uniform for a composite onto a window, and the bind group
+    /// that puts it in the composite's group one. It starts out as `view`,
+    /// and is rewritten with [`Renderer::set_viewport`].
+    pub fn viewport_binding(&self, view: &View) -> (wgpu::Buffer, wgpu::BindGroup) {
+        viewport_binding(&self.device, &self.queue, &self.bgl_viewport, view)
+    }
+
+    /// Point a viewport from [`Renderer::viewport_binding`] at what `view`
+    /// is looking at.
+    pub fn set_viewport(&self, buffer: &wgpu::Buffer, view: &View) {
+        self.queue
+            .write_buffer(buffer, 0, bytemuck::cast_slice(&view.uniform()));
+    }
+
     /// Scene plus glow, onto `target`, with a pipeline from
-    /// [`Renderer::window_pipeline`]. Follows [`Renderer::draw`].
+    /// [`Renderer::window_pipeline`] and the piece of the scene that
+    /// `viewport`, from [`Renderer::viewport_binding`], says to show.
+    /// Follows [`Renderer::draw`].
     pub fn composite(
         &self,
         encoder: &mut wgpu::CommandEncoder,
         pipeline: &wgpu::RenderPipeline,
         target: &wgpu::TextureView,
+        viewport: &wgpu::BindGroup,
     ) {
         fullscreen_pass(
             encoder,
@@ -630,14 +699,15 @@ impl Renderer {
             target,
             pipeline,
             &self.bg_composite,
-            None,
+            Some(viewport),
         );
     }
 
     /// The composite again into the capture image, and from there into a
     /// staging buffer, which is handed back. Follows [`Renderer::draw`]. Once
     /// the encoder is submitted the buffer goes to [`Renderer::queue_readback`]
-    /// to be collected later, or is read there and then.
+    /// to be collected later, or is read there and then. A capture is the
+    /// whole world, however far in the window is zoomed.
     pub fn capture(&mut self, encoder: &mut wgpu::CommandEncoder) -> wgpu::Buffer {
         fullscreen_pass(
             encoder,
@@ -645,7 +715,7 @@ impl Renderer {
             &self.capture_view,
             &self.pipeline_capture,
             &self.bg_composite,
-            None,
+            Some(&self.bg_whole),
         );
         let (capture_w, capture_h) = self.capture_size;
         let buffer = self.spare_staging.pop().unwrap_or_else(|| {
@@ -851,6 +921,7 @@ impl State {
         let sim = Simulation::new(&device, &queue, registry, grid);
         let renderer = Renderer::new(&device, &queue, &sim);
         let pipeline_composite = renderer.window_pipeline(config.format);
+        let (viewport_buffer, bg_viewport) = renderer.viewport_binding(&View::default());
 
         // egui paints into the surface format, in its own pass after the
         // composite. The defaults suit it: no MSAA, no depth, feathered edges.
@@ -868,6 +939,8 @@ impl State {
             queue,
             config,
             pipeline_composite,
+            viewport_buffer,
+            bg_viewport,
             egui_renderer,
             last_update: Instant::now(),
             tick_accumulator: 0.0,
@@ -931,11 +1004,15 @@ impl State {
         self.last_update = Instant::now();
     }
 
-    /// Map a cursor position in window pixels to a grid cell.
-    pub fn cursor_to_grid(&self, pos: (f64, f64)) -> (i32, i32) {
-        let gx = (pos.0 / self.config.width as f64 * self.sim.width as f64) as i32;
-        let gy = (pos.1 / self.config.height as f64 * self.sim.height as f64) as i32;
-        (gx, gy)
+    /// The size of the window, in pixels.
+    pub fn size(&self) -> (u32, u32) {
+        (self.config.width, self.config.height)
+    }
+
+    /// Map a cursor position in window pixels to a grid cell, through what
+    /// `view` has in the window.
+    pub fn cursor_to_grid(&self, pos: (f64, f64), view: &View) -> (i32, i32) {
+        view.cell(pos, self.size(), (self.sim.width, self.sim.height))
     }
 
     /// Advance the world by however much real time has gone by, scaled by
@@ -965,14 +1042,16 @@ impl State {
     ///
     /// `paint_jobs` and `textures_delta` come from egui's `run` and `tessellate`
     /// over in [`crate::app`]; `pixels_per_point` is the scale it laid out at.
-    /// With `capture` set, the scene is also copied out for
-    /// [`Renderer::take_frames`]. Returns whether that copy was made: it is not
+    /// `view` is the piece of the world the window shows. With `capture` set,
+    /// the scene is also copied out for [`Renderer::take_frames`], the whole
+    /// of it whatever the view. Returns whether that copy was made: it is not
     /// when the frame is skipped because the surface wants reconfiguring.
     pub fn render(
         &mut self,
         paint_jobs: Vec<egui::ClippedPrimitive>,
         mut textures_delta: egui::TexturesDelta,
         pixels_per_point: f32,
+        view: &View,
         capture: bool,
     ) -> bool {
         // Take egui's new and changed textures first, before anything that
@@ -1011,7 +1090,7 @@ impl State {
             }
         };
 
-        let view = frame
+        let surface_view = frame
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
 
@@ -1023,9 +1102,14 @@ impl State {
 
         // 1 to 3. The world, and its glow.
         self.renderer.draw(&mut encoder);
-        // 4. Scene plus glow, onto the window.
-        self.renderer
-            .composite(&mut encoder, &self.pipeline_composite, &view);
+        // 4. Scene plus glow, onto the window: the piece of it in view.
+        self.renderer.set_viewport(&self.viewport_buffer, view);
+        self.renderer.composite(
+            &mut encoder,
+            &self.pipeline_composite,
+            &surface_view,
+            &self.bg_viewport,
+        );
         // 4a. The same again into the capture image, if a frame is wanted,
         //     and from there into a staging buffer. The buffer is mapped
         //     after the submit below, so the copy is in the queue ahead of it.
@@ -1046,12 +1130,12 @@ impl State {
         );
         {
             // egui's renderer wants a 'static pass; `forget_lifetime` detaches it
-            // from the borrow of `view`, which outlives the pass anyway.
+            // from the borrow of `surface_view`, which outlives the pass anyway.
             let mut rp = encoder
                 .begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some("egui pass"),
                     color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                        view: &view,
+                        view: &surface_view,
                         resolve_target: None,
                         depth_slice: None,
                         ops: wgpu::Operations {

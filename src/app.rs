@@ -6,6 +6,11 @@
 //! the shortcuts. Each redraw runs egui, steps the world, and hands the
 //! tessellated panel to [`State::render`] to layer over the scene.
 //!
+//! The view (see [`crate::view`]) is moved from here too: the wheel and a
+//! trackpad pinch zoom about the cursor, a drag with the right or middle
+//! button and a two-finger scroll look around, and on a touchscreen a second
+//! finger turns a stroke into a pinch. The keys do the same in steps.
+//!
 //! A file dropped on the window is taken to be a plugin (see
 //! [`crate::plugins`]) and loaded on the spot. The plugins built into the
 //! binary, and then any in [`PLUGIN_DIR`], are loaded before the window opens,
@@ -33,7 +38,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use winit::application::ApplicationHandler;
-use winit::event::{ElementState, MouseButton, TouchPhase, WindowEvent};
+use winit::event::{ElementState, MouseButton, MouseScrollDelta, Touch, TouchPhase, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Window, WindowId};
@@ -69,6 +74,17 @@ const GUST_SCALE: i32 = 3;
 /// is set to, even a fine one moves something when it is used as a fan.
 const MIN_GUST_FRACTION: i32 = 100;
 
+/// How much one notch of the mouse wheel zooms by. Twenty notches or so
+/// from the whole world to the closest the view goes.
+const ZOOM_PER_LINE: f32 = 1.2;
+
+/// How much a press of the zoom keys zooms by.
+const ZOOM_STEP: f32 = 1.5;
+
+/// How far a press of an arrow key moves the view, as a fraction of the
+/// window.
+const PAN_STEP: f32 = 0.1;
+
 /// One frame of the wind tool: blow a gust the way the cursor has swept, from
 /// `from` to `to` since the last frame, with the brush at `radius`. A script
 /// sweeping the tool goes through the same function as the mouse.
@@ -95,6 +111,13 @@ struct Input {
     /// The step key was pressed since the last frame: advance one tick, as the
     /// panel's Step button does. Cleared once it has been spent.
     step: bool,
+    /// The right or middle button is held, dragging the view about.
+    panning: bool,
+    /// The fingers on the screen, up to two, each with where it was last
+    /// seen. The first draws; a second beside it makes a pinch, which zooms
+    /// as the two move apart and looks around as they move together. A
+    /// third is ignored.
+    touches: Vec<(u64, (f64, f64))>,
     controls: ui::Controls,
 }
 
@@ -106,6 +129,8 @@ impl Default for Input {
             finger: None,
             last_cell: None,
             step: false,
+            panning: false,
+            touches: Vec::new(),
             controls: ui::Controls::default(),
         }
     }
@@ -199,6 +224,105 @@ impl App {
         let point = egui::pos2(pos.0 as f32 / scale, pos.1 as f32 / scale);
         self.panel.is_some_and(|rect| rect.contains(point))
     }
+
+    /// The window's size in pixels, once there is a window.
+    fn window_size(&self) -> Option<(f32, f32)> {
+        self.state.as_ref().map(|state| {
+            let (w, h) = state.size();
+            (w.max(1) as f32, h.max(1) as f32)
+        })
+    }
+
+    /// Zoom the view by `factor` about a point in window pixels, so what is
+    /// under that point stays put.
+    fn zoom_at(&mut self, factor: f32, at: (f64, f64)) {
+        let Some((w, h)) = self.window_size() else {
+            return;
+        };
+        let at = (at.0 as f32 / w, at.1 as f32 / h);
+        self.input.controls.view.zoom_by(factor, at);
+    }
+
+    /// Carry the world along by a distance in window pixels, as a drag
+    /// does: the view moves the other way.
+    fn drag_view(&mut self, dx: f64, dy: f64) {
+        let Some((w, h)) = self.window_size() else {
+            return;
+        };
+        self.input.controls.view.pan(-dx as f32 / w, -dy as f32 / h);
+    }
+
+    /// A touchscreen draws as the mouse does, with the first finger down.
+    /// A second finger landing beside it ends the stroke and starts a pinch,
+    /// which zooms as the fingers move apart and looks around as they move
+    /// together; a third is ignored. The position rides on the event itself
+    /// rather than arriving separately, so the cursor is updated here too.
+    /// A finger that egui takes for a slider stops drawing, and one that
+    /// lands on the panel is left to it.
+    fn touch(&mut self, touch: Touch, consumed: bool) {
+        let at = (touch.location.x, touch.location.y);
+        match touch.phase {
+            TouchPhase::Started => {
+                if consumed || self.input.touches.len() >= 2 || self.over_panel(at) {
+                    return;
+                }
+                let input = &mut self.input;
+                input.touches.push((touch.id, at));
+                if input.touches.len() == 1 {
+                    input.finger = Some(touch.id);
+                    input.cursor = at;
+                    input.drawing = true;
+                    input.last_cell = None;
+                } else {
+                    // A pinch is not a stroke, and a stroke that was under
+                    // way is over rather than dragged about by the zoom.
+                    input.finger = None;
+                    input.drawing = false;
+                }
+            }
+            TouchPhase::Moved => {
+                let input = &mut self.input;
+                let Some(slot) = input.touches.iter().position(|(id, _)| *id == touch.id) else {
+                    return;
+                };
+                let before = [input.touches[0].1, input.touches.get(1).map_or(at, |t| t.1)];
+                input.touches[slot].1 = at;
+                if input.touches.len() == 2 {
+                    let after = [input.touches[0].1, input.touches[1].1];
+                    self.pinch(before, after);
+                } else if input.finger == Some(touch.id) {
+                    input.cursor = at;
+                    if consumed {
+                        input.drawing = false;
+                    }
+                }
+            }
+            TouchPhase::Ended | TouchPhase::Cancelled => {
+                let input = &mut self.input;
+                input.touches.retain(|(id, _)| *id != touch.id);
+                if input.finger == Some(touch.id) {
+                    input.finger = None;
+                    input.drawing = false;
+                }
+            }
+        }
+    }
+
+    /// One frame of a pinch: two fingers that were at `before` are now at
+    /// `after`. The world follows the point between them, and grows or
+    /// shrinks about it by however much they have spread or closed.
+    fn pinch(&mut self, before: [(f64, f64); 2], after: [(f64, f64); 2]) {
+        let middle = |p: [(f64, f64); 2]| ((p[0].0 + p[1].0) / 2.0, (p[0].1 + p[1].1) / 2.0);
+        let spread = |p: [(f64, f64); 2]| (p[0].0 - p[1].0).hypot(p[0].1 - p[1].1);
+        let (from, to) = (middle(before), middle(after));
+        self.drag_view(to.0 - from.0, to.1 - from.1);
+        let (was, now) = (spread(before), spread(after));
+        // Fingers on top of each other have no spread to speak of, and a
+        // ratio of two such would be noise.
+        if was >= 1.0 {
+            self.zoom_at((now / was) as f32, to);
+        }
+    }
 }
 
 impl ApplicationHandler for App {
@@ -248,6 +372,8 @@ impl ApplicationHandler for App {
         }
         self.input.drawing = false;
         self.input.finger = None;
+        self.input.touches.clear();
+        self.input.panning = false;
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
@@ -290,7 +416,13 @@ impl ApplicationHandler for App {
             }
 
             WindowEvent::CursorMoved { position, .. } => {
+                let before = self.input.cursor;
                 self.input.cursor = (position.x, position.y);
+                // Dragging with the right or middle button carries the
+                // world along with the cursor.
+                if self.input.panning {
+                    self.drag_view(position.x - before.0, position.y - before.1);
+                }
             }
 
             WindowEvent::MouseInput {
@@ -306,39 +438,39 @@ impl ApplicationHandler for App {
                 }
             }
 
+            WindowEvent::MouseInput {
+                state: button,
+                button: MouseButton::Right | MouseButton::Middle,
+                ..
+            } => {
+                self.input.panning = button == ElementState::Pressed
+                    && !consumed
+                    && !self.over_panel(self.input.cursor);
+            }
+
+            // A mouse wheel zooms about the cursor. A trackpad reports in
+            // pixels rather than notches, and a two-finger scroll on one is
+            // for looking around, since it has a pinch for zooming.
+            WindowEvent::MouseWheel { delta, .. } if !consumed => match delta {
+                MouseScrollDelta::LineDelta(_, lines) => {
+                    self.zoom_at(ZOOM_PER_LINE.powf(lines), self.input.cursor);
+                }
+                MouseScrollDelta::PixelDelta(moved) => self.drag_view(moved.x, moved.y),
+            },
+
+            // A trackpad pinch, on the platforms that report one. The delta
+            // is the change in magnification, so one and a bit is the factor.
+            WindowEvent::PinchGesture { delta, .. } if !consumed => {
+                self.zoom_at(1.0 + delta as f32, self.input.cursor);
+            }
+
             // A file dropped on the window is a plugin. While one is being
             // dragged over, say so, in place of the standing hint.
             WindowEvent::DroppedFile(path) => self.load_plugin(&path),
             WindowEvent::HoveredFile(_) => self.status = "Drop it to load the plugin.".to_string(),
             WindowEvent::HoveredFileCancelled => self.status = DROP_HINT.to_string(),
 
-            // A touchscreen draws as the mouse does, with the first finger
-            // down; others are ignored until it lifts. The position rides on
-            // the event itself rather than arriving separately, so the cursor
-            // is updated here too. A finger that wanders onto the panel, or
-            // that egui takes for a slider, stops drawing.
-            WindowEvent::Touch(touch) => match touch.phase {
-                TouchPhase::Started if self.input.finger.is_none() => {
-                    let at = (touch.location.x, touch.location.y);
-                    self.input.finger = Some(touch.id);
-                    self.input.cursor = at;
-                    self.input.drawing = !consumed && !self.over_panel(at);
-                    self.input.last_cell = None;
-                }
-                TouchPhase::Moved if self.input.finger == Some(touch.id) => {
-                    self.input.cursor = (touch.location.x, touch.location.y);
-                    if consumed {
-                        self.input.drawing = false;
-                    }
-                }
-                TouchPhase::Ended | TouchPhase::Cancelled
-                    if self.input.finger == Some(touch.id) =>
-                {
-                    self.input.finger = None;
-                    self.input.drawing = false;
-                }
-                _ => {}
-            },
+            WindowEvent::Touch(touch) => self.touch(touch, consumed),
 
             WindowEvent::KeyboardInput { event, .. } => {
                 // Skip the shortcuts while egui wants the key.
@@ -449,7 +581,7 @@ impl App {
                 .state
                 .as_ref()
                 .unwrap()
-                .cursor_to_grid(self.input.cursor);
+                .cursor_to_grid(self.input.cursor, &c.view);
             let last = self.input.last_cell;
             self.input.last_cell = Some((gx, gy));
 
@@ -554,6 +686,7 @@ impl App {
                 paint_jobs,
                 full_output.textures_delta,
                 full_output.pixels_per_point,
+                &self.input.controls.view,
                 wanted.is_some(),
             );
             if let (true, Some(wanted)) = (captured, wanted) {
@@ -668,6 +801,15 @@ impl App {
             // Capture: a still, or a recording until pressed again.
             KeyCode::KeyS => self.screenshot(),
             KeyCode::KeyV => self.toggle_recording(),
+            // The view: in and out about the cursor, back to the whole
+            // world, and a step in each direction.
+            KeyCode::KeyZ => self.zoom_at(ZOOM_STEP, self.input.cursor),
+            KeyCode::KeyX => self.zoom_at(1.0 / ZOOM_STEP, self.input.cursor),
+            KeyCode::KeyF => c.view.reset(),
+            KeyCode::ArrowLeft => c.view.pan(-PAN_STEP, 0.0),
+            KeyCode::ArrowRight => c.view.pan(PAN_STEP, 0.0),
+            KeyCode::ArrowUp => c.view.pan(0.0, -PAN_STEP),
+            KeyCode::ArrowDown => c.view.pan(0.0, PAN_STEP),
             _ => {}
         }
     }
@@ -766,7 +908,8 @@ pub fn run(script: Option<(String, String)>) {
          - ==slower/faster  \
          C=clear  G=build the world again  R=build it from a new seed  \
          S=screenshot  V=start/stop recording  \
-         (hold left mouse to draw). \
+         Z/X=zoom in/out  F=fit the world  arrows=look around  \
+         (hold left mouse to draw, scroll to zoom, drag with the right button to look around). \
          Drop a .js file on the window to load a plugin."
     );
 

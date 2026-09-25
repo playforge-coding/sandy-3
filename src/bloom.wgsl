@@ -31,6 +31,17 @@ struct Blur {
 };
 @group(1) @binding(0) var<uniform> blur: Blur;
 
+// The composite's own group one: which rectangle of the scene fills the
+// target, as its top left corner and its size in UV. The whole scene is
+// (0, 0, 1, 1), which is what a capture always gets; the window gets the
+// zoom (see `src/view.rs`). The blur passes bind the step above here instead,
+// and no entry point reaches both.
+struct Viewport {
+    corner: vec2<f32>,
+    size: vec2<f32>,
+};
+@group(1) @binding(0) var<uniform> viewport: Viewport;
+
 // How strongly the blurred glow is added back over the scene.
 const GLOW_STRENGTH: f32 = 1.4;
 // Half-width of the box blur, in taps. The whole kernel is 2 * RADIUS + 1.
@@ -80,11 +91,15 @@ fn fs_blur_v(in: VsOut) -> @location(0) vec4<f32> {
 
 // Pass three: the crisp scene, sampled nearest so a grain stays a square, plus
 // the blurred glow, sampled smoothly so the halo does not pixelate with it.
+// The target's UV is first mapped into the rectangle of the scene in view,
+// which is how zooming in is done: the scene is drawn once at the grid's
+// resolution and this picks the piece of it the window is looking at.
 //
 // Both inputs are sRGB images, so sampling them gives linear light and the two
 // can simply be added. Putting the sum on the window is where the two versions
 // differ, and which one runs is decided when the pipeline is built.
-fn composite(uv: vec2<f32>) -> vec3<f32> {
+fn composite(target_uv: vec2<f32>) -> vec3<f32> {
+    let uv = viewport.corner + target_uv * viewport.size;
     let scene = textureSample(tex0, samp0, uv).rgb;
     let glow = textureSample(tex1, samp1, uv).rgb;
     return scene + glow * GLOW_STRENGTH;

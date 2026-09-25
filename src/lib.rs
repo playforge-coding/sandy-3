@@ -11,6 +11,7 @@
 //! - `headless`  — running a control script with no window.
 //! - `cli`       — the command line.
 //! - `ui`        — the egui control panel.
+//! - `view`      — the zoom, and which part of the world the window shows.
 //! - `app`       — the window, the input and the event loop.
 //! - `mobile`    — what is different on a phone: the folders, the log, and
 //!   the Android entry point.
@@ -29,6 +30,7 @@ mod plugins;
 mod scripting;
 mod sim;
 mod ui;
+mod view;
 mod worldgen;
 
 /// The Android side hands the app in through `android_main`; see

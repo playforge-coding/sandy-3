@@ -111,6 +111,11 @@ world appears.
 | Input | Action |
 |-------|--------|
 | Hold **left mouse** | use the current tool |
+| **Mouse wheel**, or a trackpad **pinch** | zoom in and out, about the cursor |
+| Drag with the **right** or **middle** button, or a two-finger **trackpad scroll** | look around while zoomed in |
+| **Z** / **X** | zoom in / out, about the cursor |
+| **F** | fit the whole world in the window again |
+| **Arrow keys** | look around, a tenth of the window at a time |
 | **1**–**9** | a material, in picker order: Sand, Stone, Water, Lava, Soil, then the plugin ones |
 | **0** / **Backspace** | eraser |
 | **W** | wind tool |
@@ -125,8 +130,19 @@ world appears.
 | **V** | start a recording, or stop the one running |
 
 The panel drives the same state as the shortcuts, so the two stay in step.
-On a touchscreen, a finger draws as the mouse does; a second finger is
-ignored until the first lifts.
+On a touchscreen, a finger draws as the mouse does; a second finger landing
+beside it ends the stroke and starts a pinch, which zooms as the two spread
+and looks around as they move together.
+
+The window opens on the whole world and zooms in up to thirty-two times,
+about ten pixels a cell on a desktop, which is enough to watch a single
+grain tumble. Zooming happens about the cursor, so whatever is under it
+stays put, and the view never shows past the edge of the world. The panel's
+View section has the same zoom as a slider, about the middle of the window,
+and a button to fit the world again. The tools work as they do at any zoom:
+the brush lands where the cursor is over the world, and a sweep of the wind
+tool covers fewer cells when zoomed in, so a gust blown up close is a
+gentler one.
 
 The world runs at a quarter speed up to four times real time, on the panel's
 slider or by halving and doubling with the keys. Pausing stops the ticks and
@@ -144,7 +160,8 @@ The panel's Capture section, or the S and V keys, save what is on screen to a
 time they were taken. A screenshot is the next frame; a recording runs from
 one press to the next. Both are the world alone, without the panel, at half
 the grid's resolution, 1500 by 750 on a desktop with each pixel the average
-of a two-by-two block of cells, whatever size or shape the window is. The
+of a two-by-two block of cells, whatever size or shape the window is and
+however far in it is zoomed. The
 grid's own resolution would be four and a half million pixels a frame, more
 than a window shows and more than the encoders can keep up with at sixty
 frames a second. The line at the foot of the panel says where each one went.
@@ -199,7 +216,8 @@ world.
 
 The panel opens folded away to its title in the top corner, below the status
 bar; tap it to open it, and it scrolls if it is taller than the screen. Its
-buttons are taller, for a thumb. There is nothing to drop a file on, so a
+buttons are taller, for a thumb. Two fingers pinch to zoom and drag to look
+around, as on a map. There is nothing to drop a file on, so a
 plugin goes in the app's `plugins` folder and loads the next time the game
 opens, and captures land in a `captures` folder next to it. On iOS that is
 the app's Documents folder, which the Files app shows; on Android it is the
@@ -500,6 +518,7 @@ src/
 ├── headless.rs     Running a script with no window
 ├── cli.rs          The command line
 ├── ui.rs           The egui control panel
+├── view.rs         The zoom, and which part of the world the window shows
 ├── app.rs          winit window, input and the event loop
 ├── mobile.rs       What differs on a phone: the folders, the log, the Android entry
 ├── lib.rs          Module wiring
@@ -624,7 +643,10 @@ blurs them twice, adds them back over the scene and fits the result to the
 window, with nearest-neighbour sampling when the window is bigger than the
 grid so grains stay crisp, and linear when it is smaller, since dropping every
 few columns of a grid this size would make falling sand shimmer. Lava keeps
-its halo either way.
+its halo either way. Zooming is done in that last step: the scene and its
+glow are drawn once at the grid's resolution whatever the zoom, and the
+composite is told which rectangle of them to fit to the window, so a zoomed
+frame costs the same as a whole one and a grain blown up is a crisp square.
 
 A frame that a screenshot or a recording wants gets one more pass: the same
 composite drawn again into an offscreen image at the grid's resolution, which

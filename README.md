@@ -2,11 +2,12 @@
 
 A **falling-sand** world written in Rust, where the physics runs on the GPU.
 
-It runs natively on Windows, macOS and Linux. Plugins are JavaScript files:
-drop one on the window to add a material, a tool or a world. A JavaScript
-file can also drive the whole game, in the window or with no window at all,
-which is how it is tested and how anything else that wants to run it by
-remote does so (see [Scripting](#scripting)).
+It runs natively on Windows, macOS and Linux, and on a phone, Android or
+iOS, with a smaller world (see [On a phone](#on-a-phone)). Plugins are
+JavaScript files: drop one on the window to add a material, a tool or a
+world. A JavaScript file can also drive the whole game, in the window or with
+no window at all, which is how it is tested and how anything else that wants
+to run it by remote does so (see [Scripting](#scripting)).
 
 It is a companion to [Sandy 2](https://github.com/playforge-coding/sandy-2),
 which does the same job with a cellular automaton on the CPU. The difference is
@@ -72,8 +73,9 @@ The wind is a fluid, much as it is in sandspiel. A gust blows on after the
 sweep that made it, curls into eddies, goes up and over a heap and round a wall,
 and strips loose sand off whatever it blows across and carries it until it dies
 down. Moving air shows as a pale haze against the sky, so a sweep can be seen
-even over empty ground. The gust is three times the brush size, and at least thirty cells across,
-because a small one fades before it has moved anything.
+even over empty ground. The gust is three times the brush size, and at least
+a hundredth of the world across, thirty cells on a desktop, because a small
+one fades before it has moved anything.
 
 There is also a gentle prevailing breeze that swings on its own, enough to lean
 a falling stream of sand without disturbing anything that has settled.
@@ -123,6 +125,8 @@ world appears.
 | **V** | start a recording, or stop the one running |
 
 The panel drives the same state as the shortcuts, so the two stay in step.
+On a touchscreen, a finger draws as the mouse does; a second finger is
+ignored until the first lifts.
 
 The world runs at a quarter speed up to four times real time, on the panel's
 slider or by halving and doubling with the keys. Pausing stops the ticks and
@@ -139,11 +143,11 @@ The panel's Capture section, or the S and V keys, save what is on screen to a
 `captures` folder in the directory the game is run from, named after the
 time they were taken. A screenshot is the next frame; a recording runs from
 one press to the next. Both are the world alone, without the panel, at half
-the grid's resolution, 1500 by 750 with each pixel the average of a
-two-by-two block of cells, whatever size or shape the window is. The grid's
-own resolution would be four and a half million pixels a frame, more than a
-window shows and more than the encoders can keep up with at sixty frames a
-second. The line at the foot of the panel says where each one went.
+the grid's resolution, 1500 by 750 on a desktop with each pixel the average
+of a two-by-two block of cells, whatever size or shape the window is. The
+grid's own resolution would be four and a half million pixels a frame, more
+than a window shows and more than the encoders can keep up with at sixty
+frames a second. The line at the foot of the panel says where each one went.
 
 Each has a format box beside it. A screenshot is lossless WebP or PNG; a
 recording is lossless animated WebP, GIF, or animated PNG. WebP is the
@@ -177,11 +181,46 @@ written with a palette too, at a byte a pixel; the animated PNG cannot be,
 since a PNG has one palette for the whole file and a recording can pass 256
 colours as materials come into the scene.
 
+## On a phone
+
+The same program runs on Android and iOS, and it is the same program: the
+kernels, the materials, the plugins and the panel are all there. What
+changes is the size of the world and the shape of the screen.
+
+A phone's GPU has a fraction of a desktop's memory bandwidth, and the wind's
+two dozen passes a tick are paid for in exactly that, so the world is cut to
+about six hundred thousand cells, an eighth of the desktop grid. It is built
+in the shape of the screen the first time the app opens, so a phone held
+upright gets a world taller than it is wide, about 520 by 1150 cells on a
+typical one, and nothing is stretched out of shape. The app is locked
+upright for the same reason. The brush slider and the wind tool's smallest
+gust scale with the width, so the largest brush is still a twentieth of the
+world.
+
+The panel opens folded away to its title in the top corner, below the status
+bar; tap it to open it, and it scrolls if it is taller than the screen. Its
+buttons are taller, for a thumb. There is nothing to drop a file on, so a
+plugin goes in the app's `plugins` folder and loads the next time the game
+opens, and captures land in a `captures` folder next to it. On iOS that is
+the app's Documents folder, which the Files app shows; on Android it is the
+app's folder under `Android/data`, which a file manager or a USB cable
+reaches. Screenshots and recordings work as they do on a desktop, at half
+the grid's resolution, so about 260 by 575 pixels.
+
+Sending the app to the background takes the window away and coming back
+gives it another; the world is kept through it, and only the surface it is
+drawn on is made again.
+
+Building for either is under [Building](#building). Android is part of each
+release; iOS builds and runs, on the simulator or a phone, but needs a
+signing identity to go anywhere, so it is not released here.
+
 ## Plugins
 
 A plugin is one JavaScript file. Drop it on the window and it loads on the
 spot. Leave it in a `plugins` folder in the directory the game is run from
-and it loads at startup. Nine are built into the binary and always there,
+(on a phone, the app's own folder; see [On a phone](#on-a-phone)) and it
+loads at startup. Nine are built into the binary and always there,
 from [`src/plugins/`](src/plugins/): `acid.js` adds a material that eats
 through rock, `fire.js` and `steam.js` add the two gases, `wood.js` adds wood
 and leaves and the rules that make them burn, `disk.js` is the plain brush,
@@ -414,10 +453,16 @@ It needs a GPU with compute shaders, so Vulkan, Metal or D3D12. `sandy-3
 
 Each [GitHub release](https://github.com/playforge-coding/sandy-3/releases)
 also carries prebuilt binaries for Linux (x86_64), macOS (Apple silicon) and
-Windows (x86_64). The release is made by hand; the workflow in
-`.github/workflows/release.yml` sees it get published, builds each platform
-and attaches the archives. The built-in plugins are compiled in, so the
-binary on its own is the whole program.
+Windows (x86_64), and an APK for Android (arm64). The release is made by
+hand; the workflow in `.github/workflows/release.yml` sees it get published,
+builds each platform and attaches the archives. The built-in plugins are
+compiled in, so the binary on its own is the whole program.
+
+The APK is signed with the key in the repository's `ANDROID_KEYSTORE_BASE64`,
+`ANDROID_KEYSTORE_PASSWORD`, `ANDROID_KEY_ALIAS` and `ANDROID_KEY_PASSWORD`
+secrets when they are set, and with a debug key made on the runner when they
+are not. A debug key is different every time, so a phone that has one build
+on it has to uninstall it before it will take the next.
 
 ## How it works
 
@@ -456,8 +501,15 @@ src/
 ├── cli.rs          The command line
 ├── ui.rs           The egui control panel
 ├── app.rs          winit window, input and the event loop
+├── mobile.rs       What differs on a phone: the folders, the log, the Android entry
 ├── lib.rs          Module wiring
 └── main.rs         The entry point
+android/
+├── lib/            The Android side as a crate: a shared library with `android_main`
+└── app/            The Gradle project that wraps that library in an APK
+ios/
+├── Info.plist      The app bundle's manifest
+└── build.sh        Build, bundle, and install on the simulator or sign for a phone
 ```
 
 ### A material is data, not code
@@ -583,10 +635,13 @@ the sRGB bytes the composite wrote, ready for a file.
 
 ### The world is bigger
 
-The grid is 3000 by 1500, four and a half million cells and thirty-six times
-the area of Sandy 2's, which is most of the point. At sixty ticks a second,
-each one a reaction pass and three movement passes, that is over a billion
-cell updates a second.
+The grid is 3000 by 1500 on a desktop, four and a half million cells and
+thirty-six times the area of Sandy 2's, which is most of the point. At sixty
+ticks a second, each one a reaction pass and three movement passes, that is
+over a billion cell updates a second. The size is a value rather than a
+constant, chosen when the world is made: the kernels take it as a uniform,
+the renderer sizes its images from it, and a phone asks for a smaller one
+(see [On a phone](#on-a-phone)).
 
 The wind is what would make that too slow. It is a couple of dozen passes a
 tick, and at this size the buffers no longer fit in the GPU's cache, so every
@@ -726,3 +781,68 @@ it should.
 
 The tests drive real compute kernels on a real adapter, so a machine with no
 usable GPU cannot run them.
+
+### Android
+
+The app is the same crate built as a shared library, which the system's
+`NativeActivity` loads and calls `android_main` in. That entry point is the
+one thing in the small crate under `android/lib`; the Gradle project under
+`android/app` is a manifest and a build file, with no Java or Kotlin in it.
+It needs the Android SDK with an NDK, platform 36 and build tools in it,
+[cargo-ndk](https://github.com/bbqsrc/cargo-ndk), Gradle 9, a JDK, CMake
+and Ninja. `sdkmanager "ndk;30.0.16248370" "platforms;android-36"
+"build-tools;36.1.0" "platform-tools"` from the command line tools installs
+the SDK side. `ANDROID_HOME` points Gradle and cargo-ndk at the SDK, and
+`ANDROID_NDK_ROOT` points CMake, building FastNoise2, at the NDK.
+
+```sh
+rustup target add aarch64-linux-android
+cargo install cargo-ndk
+export ANDROID_HOME=~/Library/Android/sdk            # wherever it is
+export ANDROID_NDK_ROOT=$ANDROID_HOME/ndk/30.0.16248370
+
+cargo ndk -t arm64-v8a -P 28 --link-libcxx-shared \
+    -o android/app/src/main/jniLibs build --release -p sandy-3-android
+(cd android && gradle assembleRelease)
+adb install android/app/build/outputs/apk/release/app-release.apk
+```
+
+`--link-libcxx-shared` is for FastNoise2, which is C++ and whose build
+script links the C++ runtime on desktops only; cargo-ndk links the NDK's and
+copies it into the APK beside the library. QuickJS's Rust bindings are
+generated at build time for Android, which is what libclang is needed for;
+the NDK's headers want the API level on the target triple bindgen hands
+clang, so `.cargo/config.toml` gives it one, and the level there matches
+the `-P` above.
+The APK is signed with the key in the `ANDROID_KEYSTORE_FILE`,
+`ANDROID_KEYSTORE_PASSWORD`, `ANDROID_KEY_ALIAS` and `ANDROID_KEY_PASSWORD`
+variables when they are set, and with Gradle's debug key otherwise. The log
+is on logcat, under the tag `sandy`:
+
+```sh
+adb logcat -s sandy RustStdoutStderr
+```
+
+### iOS
+
+There is no Xcode project. The binary a desktop runs is built for the iOS
+target and put in a folder with `ios/Info.plist`, which is all an app bundle
+is, by `ios/build.sh`. It needs Xcode, for the SDK and the simulator.
+
+```sh
+ios/build.sh sim       # build, install on the booted simulator, launch with the log
+ios/build.sh device    # build for a phone and sign the bundle
+```
+
+The simulator needs no signing. A phone needs a development signing identity
+and a provisioning profile for `com.playforge.sandy3`, given to the script as
+`IOS_SIGNING_IDENTITY` and `IOS_PROVISIONING_PROFILE`, and the bundle then
+installs with `xcrun devicectl device install app`. The C++ runtime
+FastNoise2 needs is linked by the `rustflags` for the two iOS targets in
+`.cargo/config.toml`, for the same reason as on Android.
+
+One thing in the script is a workaround. UIKit from the iOS 27 SDK stops an
+app at launch if it has not adopted the UIScene lifecycle, and winit 0.30
+has not, whereas an app built against the 26 SDK is let through with a
+warning. What UIKit goes by is the SDK version stamped on the binary, so the
+script stamps 26 on it with `vtool`. That can go once winit does scenes.

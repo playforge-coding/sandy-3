@@ -18,9 +18,15 @@
 //! back are handed to it to save.
 //!
 //! A control script given on the command line (see [`crate::scripting`]) is
-//! started once the world is built and advanced at the top of every frame,
-//! so what it did shows in that frame, and a frame it asked to let go by is
-//! a real one.
+//! started once the window is up and the world is built and advanced at the
+//! top of every frame, so what it did shows in that frame, and a frame it
+//! asked to let go by is a real one.
+//!
+//! On a phone the window is the screen, and the world is built to its shape
+//! the first time it appears (see [`crate::sim::Grid::for_screen`]). Android
+//! and iOS take the window away when the app goes into the background and
+//! give it back when it returns, which is what `suspended` and `resumed` are
+//! for: the surface is dropped and made again, and the world is kept.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -35,17 +41,16 @@ use winit::window::{Window, WindowId};
 use crate::capture::Capture;
 use crate::gpu::State;
 use crate::materials::{EMPTY, MaterialId};
+use crate::mobile::{self, DROP_HINT};
 use crate::plugins::{Kind, PLUGIN_DIR, Plugins, Stroke};
 use crate::scripting::{Host, Script, Status};
-use crate::sim::Simulation;
+use crate::sim::{Grid, Simulation};
 use crate::ui;
 
 /// The window size the app opens at, in logical pixels. Twice as wide as it is
 /// tall, matching the grid, so nothing is stretched out of shape at the start.
+/// A phone ignores it: the window there is the screen.
 const WINDOW_SIZE: (f64, f64) = (1100.0, 620.0);
-
-/// What the foot of the panel says when there is nothing more recent to say.
-const DROP_HINT: &str = "Drop a .js file on the window to load a plugin.";
 
 /// Wind added, in cells per tick, per grid cell the cursor sweeps in a frame.
 /// One would have the air move exactly with the cursor; a little more than that
@@ -59,9 +64,10 @@ const WIND_DRAG_GAIN: f32 = 1.5;
 /// before it has moved anything.
 const GUST_SCALE: i32 = 3;
 
-/// The smallest gust the wind tool blows, whatever the brush is set to, so even
-/// a fine brush moves something when it is used as a fan.
-const MIN_GUST_RADIUS: i32 = 30;
+/// The smallest gust the wind tool blows, as a fraction of the world's width:
+/// a hundredth, which is thirty cells on the desktop grid. Whatever the brush
+/// is set to, even a fine one moves something when it is used as a fan.
+const MIN_GUST_FRACTION: i32 = 100;
 
 /// One frame of the wind tool: blow a gust the way the cursor has swept, from
 /// `from` to `to` since the last frame, with the brush at `radius`. A script
@@ -69,7 +75,8 @@ const MIN_GUST_RADIUS: i32 = 30;
 pub(crate) fn wind_tool(sim: &mut Simulation, from: (i32, i32), to: (i32, i32), radius: i32) {
     let dvx = (to.0 - from.0) as f32 * WIND_DRAG_GAIN;
     let dvy = (to.1 - from.1) as f32 * WIND_DRAG_GAIN;
-    let gust = (radius * GUST_SCALE).max(MIN_GUST_RADIUS);
+    let min_gust = (sim.width as i32 / MIN_GUST_FRACTION).max(1);
+    let gust = (radius * GUST_SCALE).max(min_gust);
     sim.add_wind_disk(to.0, to.1, gust, dvx, dvy);
 }
 
@@ -78,6 +85,9 @@ pub(crate) fn wind_tool(sim: &mut Simulation, from: (i32, i32), to: (i32, i32), 
 struct Input {
     cursor: (f64, f64),
     drawing: bool,
+    /// The finger that is drawing, on a touchscreen, so a second one landing
+    /// beside it is left alone rather than snatching the stroke.
+    finger: Option<u64>,
     /// The cell the cursor was over on the previous frame of this stroke, so a
     /// drag yields a direction for the wind tool and for plugin tools. `None`
     /// at the start of a stroke, so the first frame only notes where it began.
@@ -93,6 +103,7 @@ impl Default for Input {
         Self {
             cursor: (0.0, 0.0),
             drawing: false,
+            finger: None,
             last_cell: None,
             step: false,
             controls: ui::Controls::default(),
@@ -101,6 +112,10 @@ impl Default for Input {
 }
 
 struct App {
+    /// The window, from the moment it is made. On a desktop the world is
+    /// opened on it straight away; on a phone that waits for the first
+    /// event to say how big the screen really is (see [`App::open`]).
+    window: Option<Arc<Window>>,
     state: Option<State>,
     input: Input,
     /// The script side: the materials and tools plugins have added, and the
@@ -117,6 +132,11 @@ struct App {
     egui_ctx: egui::Context,
     /// Per-window input translation for egui, built once the window exists.
     egui_state: Option<egui_winit::State>,
+    /// Whether the panel is laid out for a mouse or a finger.
+    layout: ui::Layout,
+    /// Where the panel was drawn last frame, in points, so a press can be
+    /// told from a stroke; see [`App::over_panel`].
+    panel: Option<egui::Rect>,
     /// A control script from the command line, as its name and its text,
     /// waiting for the world to exist so it can be started.
     script_text: Option<(String, String)>,
@@ -131,6 +151,7 @@ impl App {
     /// and world are up.
     fn new(script: Option<(String, String)>) -> Self {
         Self {
+            window: None,
             state: None,
             input: Input::default(),
             plugins: Plugins::new(),
@@ -138,6 +159,8 @@ impl App {
             status: DROP_HINT.to_string(),
             egui_ctx: egui::Context::default(),
             egui_state: None,
+            layout: mobile::layout(),
+            panel: None,
             script_text: script,
             script: None,
             quit: false,
@@ -163,54 +186,91 @@ impl App {
             Some(state.max_texture_side()),
         ));
     }
+
+    /// Whether a point in window pixels is over the panel, going by where
+    /// egui drew it last frame. egui only says it wants the pointer once it
+    /// has seen it there, which a mouse arranges by hovering first and a
+    /// finger does not, so a press is checked against the panel here as
+    /// well. It is the panel's own rectangle that is checked: egui's idea of
+    /// which layer is under a point counts the whole screen as its
+    /// background layer, which would make every press the panel's.
+    fn over_panel(&self, pos: (f64, f64)) -> bool {
+        let scale = self.egui_ctx.pixels_per_point();
+        let point = egui::pos2(pos.0 as f32 / scale, pos.1 as f32 / scale);
+        self.panel.is_some_and(|rect| rect.contains(point))
+    }
 }
 
 impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        // `resumed` can fire more than once on some platforms.
-        if self.state.is_some() {
+        // On a phone this comes round again every time the app returns to
+        // the foreground, with a fresh window to draw on; the world was kept
+        // through the time away, so only the surface is made again.
+        if let Some(state) = &mut self.state {
+            state.resume();
+            return;
+        }
+        if self.window.is_some() {
             return;
         }
 
-        let attrs = Window::default_attributes()
-            .with_title("Sandy 3")
-            .with_inner_size(winit::dpi::LogicalSize::new(WINDOW_SIZE.0, WINDOW_SIZE.1));
-        let window = Arc::new(event_loop.create_window(attrs).expect("create window"));
-
-        // The plugins go first, so the world is built knowing their materials
-        // rather than having the tables swapped out a moment later. The
-        // built-in ones come before the user's, so a user's script can retune
-        // a built-in one by name.
-        self.plugins.load_builtin();
-        self.load_plugin_dir();
-        self.state = Some(pollster::block_on(State::new(
-            window,
-            &self.plugins.registry(),
-        )));
-        self.apply_commands();
-        self.ensure_egui();
-        // Open on a landscape, as long as some plugin has provided one.
-        if !self.plugins.world_names().is_empty() {
-            self.generate();
+        let mut attrs = Window::default_attributes().with_title("Sandy 3");
+        if !mobile::IS_MOBILE {
+            attrs =
+                attrs.with_inner_size(winit::dpi::LogicalSize::new(WINDOW_SIZE.0, WINDOW_SIZE.1));
         }
-        // The script goes last, so it finds the world it would see on the
-        // screen. Its first requests are answered on the first frame.
-        if let Some((name, source)) = self.script_text.take() {
-            match Script::start(&self.plugins, &name, &source) {
-                Ok(script) => {
-                    log::info!("running script {name}");
-                    self.status = format!("Running {name}.");
-                    self.script = Some(script);
-                }
-                Err(err) => {
-                    log::error!("script {name} failed: {err}");
-                    self.status = err;
-                }
-            }
+        // Upright only on an iPhone, since the world is about to be built
+        // in the shape of the screen. Android's manifest says the same.
+        #[cfg(target_os = "ios")]
+        let attrs = {
+            use winit::platform::ios::{ValidOrientations, WindowAttributesExtIOS};
+            attrs.with_valid_orientations(ValidOrientations::Portrait)
+        };
+        let window = Arc::new(event_loop.create_window(attrs).expect("create window"));
+        self.window = Some(window);
+
+        // A desktop window is the size it was asked for from the start. A
+        // phone's is the screen, but the size it reports here is not yet the
+        // whole of it: iOS leaves out the status bar and the home indicator
+        // until the first layout. So a phone waits for the first resize or
+        // frame, which comes with the true size, and opens the world then.
+        if !mobile::IS_MOBILE {
+            let size = self.window.as_ref().unwrap().inner_size();
+            self.open(size);
         }
     }
 
+    fn suspended(&mut self, _event_loop: &ActiveEventLoop) {
+        // The window is about to go: let go of the surface on it, and of any
+        // stroke in progress, and wait for `resumed`.
+        if let Some(state) = &mut self.state {
+            state.suspend();
+        }
+        self.input.drawing = false;
+        self.input.finger = None;
+    }
+
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
+        // A phone opens the world on the first event that carries the
+        // window's true size (see `resumed`). On iOS that is the resize the
+        // first layout sends, and the size on the event is the one to go by:
+        // asked at that moment, the window still gives the short one. A
+        // frame asked for before the layout is too early. On Android the
+        // window is its true size from the start and no resize need come,
+        // so the first frame will do.
+        if self.state.is_none() {
+            let size = match event {
+                WindowEvent::Resized(size) => Some(size),
+                WindowEvent::RedrawRequested if !cfg!(target_os = "ios") => {
+                    self.window.as_ref().map(|window| window.inner_size())
+                }
+                _ => None,
+            };
+            if let Some(size) = size {
+                self.open(size);
+            }
+        }
+
         // Offer the event to egui first. Consumed means it landed on the panel
         // and should not also paint or fire a shortcut.
         let consumed = match (&self.state, &mut self.egui_state) {
@@ -239,7 +299,7 @@ impl ApplicationHandler for App {
                 ..
             } => {
                 if button == ElementState::Pressed {
-                    self.input.drawing = !consumed;
+                    self.input.drawing = !consumed && !self.over_panel(self.input.cursor);
                     self.input.last_cell = None; // a fresh stroke has no direction yet
                 } else {
                     self.input.drawing = false;
@@ -252,20 +312,33 @@ impl ApplicationHandler for App {
             WindowEvent::HoveredFile(_) => self.status = "Drop it to load the plugin.".to_string(),
             WindowEvent::HoveredFileCancelled => self.status = DROP_HINT.to_string(),
 
-            // A touchscreen draws exactly as the mouse does. The position rides
-            // on the event itself rather than arriving separately, so the cursor
-            // is updated here too.
-            WindowEvent::Touch(touch) => {
-                self.input.cursor = (touch.location.x, touch.location.y);
-                match touch.phase {
-                    TouchPhase::Started => {
-                        self.input.drawing = !consumed;
-                        self.input.last_cell = None;
-                    }
-                    TouchPhase::Moved => {} // keep drawing; the cursor is updated
-                    TouchPhase::Ended | TouchPhase::Cancelled => self.input.drawing = false,
+            // A touchscreen draws as the mouse does, with the first finger
+            // down; others are ignored until it lifts. The position rides on
+            // the event itself rather than arriving separately, so the cursor
+            // is updated here too. A finger that wanders onto the panel, or
+            // that egui takes for a slider, stops drawing.
+            WindowEvent::Touch(touch) => match touch.phase {
+                TouchPhase::Started if self.input.finger.is_none() => {
+                    let at = (touch.location.x, touch.location.y);
+                    self.input.finger = Some(touch.id);
+                    self.input.cursor = at;
+                    self.input.drawing = !consumed && !self.over_panel(at);
+                    self.input.last_cell = None;
                 }
-            }
+                TouchPhase::Moved if self.input.finger == Some(touch.id) => {
+                    self.input.cursor = (touch.location.x, touch.location.y);
+                    if consumed {
+                        self.input.drawing = false;
+                    }
+                }
+                TouchPhase::Ended | TouchPhase::Cancelled
+                    if self.input.finger == Some(touch.id) =>
+                {
+                    self.input.finger = None;
+                    self.input.drawing = false;
+                }
+                _ => {}
+            },
 
             WindowEvent::KeyboardInput { event, .. } => {
                 // Skip the shortcuts while egui wants the key.
@@ -289,14 +362,75 @@ impl ApplicationHandler for App {
     }
 
     fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
-        // Keep the world moving: ask for the next frame straight away.
-        if let Some(state) = &self.state {
-            state.window().request_redraw();
+        // Keep the world moving: ask for the next frame straight away. Before
+        // the world is open, the frame is what opens it.
+        if let Some(window) = &self.window {
+            window.request_redraw();
         }
     }
 }
 
 impl App {
+    /// Open the world on the window, which is `size` pixels: load the
+    /// plugins, bring the GPU up with a world the shape of the window, or
+    /// the desktop grid, build the first landscape, and start the script if
+    /// there is one.
+    fn open(&mut self, size: winit::dpi::PhysicalSize<u32>) {
+        let Some(window) = self.window.clone() else {
+            return;
+        };
+
+        // The world: the desktop grid, or one cut to a phone's screen.
+        let grid = if mobile::IS_MOBILE {
+            log::info!(
+                "the window is {} by {} pixels at a scale of {}",
+                size.width,
+                size.height,
+                window.scale_factor()
+            );
+            Grid::for_screen(size.width, size.height)
+        } else {
+            Grid::DESKTOP
+        };
+        log::info!("the world is {} by {} cells", grid.width, grid.height);
+        self.input.controls.fit_to_width(grid.width);
+
+        // The plugins go first, so the world is built knowing their materials
+        // rather than having the tables swapped out a moment later. The
+        // built-in ones come before the user's, so a user's script can retune
+        // a built-in one by name. They are told the grid before they run, so
+        // a world script sees the size it will be painting.
+        self.plugins.set_grid(grid);
+        self.plugins.load_builtin();
+        self.load_plugin_dir();
+        self.state = Some(pollster::block_on(State::new(
+            window,
+            &self.plugins.registry(),
+            grid,
+        )));
+        self.apply_commands();
+        self.ensure_egui();
+        // Open on a landscape, as long as some plugin has provided one.
+        if !self.plugins.world_names().is_empty() {
+            self.generate();
+        }
+        // The script goes last, so it finds the world it would see on the
+        // screen. Its first requests are answered on the first frame.
+        if let Some((name, source)) = self.script_text.take() {
+            match Script::start(&self.plugins, &name, &source) {
+                Ok(script) => {
+                    log::info!("running script {name}");
+                    self.status = format!("Running {name}.");
+                    self.script = Some(script);
+                }
+                Err(err) => {
+                    log::error!("script {name} failed: {err}");
+                    self.status = err;
+                }
+            }
+        }
+    }
+
     /// One frame: use the tool under the cursor, run egui, step the world, and
     /// draw the scene with the panel on top.
     fn redraw(&mut self) {
@@ -379,6 +513,7 @@ impl App {
                 &names,
                 recording,
                 &self.status,
+                self.layout,
             );
         });
         self.egui_state
@@ -387,6 +522,7 @@ impl App {
             .handle_platform_output(&window, full_output.platform_output);
         let paint_jobs = ctx.tessellate(full_output.shapes, full_output.pixels_per_point);
 
+        self.panel = actions.panel;
         if actions.randomize {
             self.randomize();
         } else if actions.generate {
@@ -513,7 +649,7 @@ impl App {
             // The wind tool: sweep the cursor to blow a gust.
             KeyCode::KeyW => c.tool = ui::Tool::Wind,
             KeyCode::BracketLeft => c.radius = (c.radius - 1).max(ui::MIN_RADIUS),
-            KeyCode::BracketRight => c.radius = (c.radius + 1).min(ui::MAX_RADIUS),
+            KeyCode::BracketRight => c.radius = (c.radius + 1).min(c.max_radius),
             // Time: freeze the world, nudge it one tick, or run it slower or
             // faster.
             KeyCode::Space => c.paused = !c.paused,
@@ -635,6 +771,24 @@ pub fn run(script: Option<(String, String)>) {
     );
 
     let event_loop = EventLoop::new().expect("build event loop");
+    run_loop(event_loop, script);
+}
+
+/// The same on Android, where the event loop has to be built on the activity
+/// the system made, and there is no command line to have given a script.
+#[cfg(target_os = "android")]
+pub fn run_android(android_app: winit::platform::android::activity::AndroidApp) {
+    use winit::platform::android::EventLoopBuilderExtAndroid;
+
+    let event_loop = EventLoop::builder()
+        .with_android_app(android_app)
+        .build()
+        .expect("build event loop");
+    run_loop(event_loop, None);
+}
+
+/// Run `event_loop` with the app in it until the window closes.
+fn run_loop(event_loop: EventLoop<()>, script: Option<(String, String)>) {
     event_loop.set_control_flow(ControlFlow::Poll);
     let mut app = App::new(script);
     event_loop.run_app(&mut app).expect("run event loop");

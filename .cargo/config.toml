@@ -11,6 +11,26 @@ rustc-wrapper = "sccache"
 [unstable]
 codegen-backend = true
 
+# FastNoise2 is C++, and its build script links the C++ runtime on the
+# desktops it knows about and on nothing else. iOS is one of the others, so
+# the runtime is asked for here; Android's comes from cargo-ndk, which is told
+# to link it on the command line (see the README).
+[target.aarch64-apple-ios]
+rustflags = ["-l", "c++"]
+
+[target.aarch64-apple-ios-sim]
+rustflags = ["-l", "c++"]
+
+# QuickJS's Rust bindings are generated at build time for Android, and the
+# NDK's headers refuse a target triple with no API level on it, which is the
+# one bindgen passes by itself unless it is given one. This gives it one; the
+# level matches the `-P` given to cargo-ndk (see the README). cargo-ndk sets
+# this variable itself, to point bindgen at the NDK's sysroot, which is why
+# this has to force its way over it; the NDK's clang, which cargo-ndk also
+# points bindgen at, knows its own sysroot without being told.
+[env]
+BINDGEN_EXTRA_CLANG_ARGS_aarch64_linux_android = { value = "--target=aarch64-linux-android28", force = true }
+
 # Cargo.toml sets this too, to the same value, so the duplication is harmless.
 # Keep the backend settings there rather than here: Cargo.toml also names the
 # three dependencies that have to stay on LLVM, and having the whole picture in

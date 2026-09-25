@@ -9,6 +9,13 @@ description = "A falling-sand simulation whose physics run on the GPU, written w
 name = "sandy-3"
 path = "src/main.rs"
 
+# The Android app is a shared library rather than a program, so the one crate
+# under `android/lib` is that library: a cdylib with an `android_main` that
+# calls into this one. It is a workspace member so it shares this lock file
+# and target directory, and it is not built unless asked for by name.
+[workspace]
+members = ["android/lib"]
+
 [dependencies]
 
 # Reinterpreting our plain `u32`/`i32` arrays as the bytes `Queue::write_buffer`
@@ -88,6 +95,20 @@ unipute = { git = "https://github.com/playforge-coding/unipute", rev = "8d8f5708
 # `egui-wgpu` above asks for.
 wgpu = "30.0"
 winit = "0.30.13"
+
+# Android. winit has to be told which of the two Android glues to use;
+# NativeActivity is the one that needs no Java or Kotlin at all, so the app
+# under `android/` is a manifest and a Gradle file and nothing else. The log
+# has nowhere to go on Android but logcat, which `android_logger` writes to.
+# QuickJS's bindings crate ships pregenerated bindings for the desktops only,
+# so on a phone they are generated at build time, which needs libclang.
+[target.'cfg(target_os = "android")'.dependencies]
+winit = { version = "0.30.13", features = ["android-native-activity"] }
+android_logger = "0.15"
+rquickjs = { version = "0.14", features = ["classes", "macro", "bindgen"] }
+
+[target.'cfg(target_os = "ios")'.dependencies]
+rquickjs = { version = "0.14", features = ["classes", "macro", "bindgen"] }
 
 [dev-dependencies]
 # Only to read back the PNGs the tests write. The writer in

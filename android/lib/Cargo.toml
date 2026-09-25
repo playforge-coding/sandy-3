@@ -1,0 +1,16 @@
+[package]
+name = "sandy-3-android"
+version = "0.1.0"
+edition = "2024"
+license = "AGPL-3.0-only"
+publish = false
+description = "The Android side of sandy-3: the shared library the app loads, and its entry point."
+
+# An Android app written in Rust is a shared library that the system's
+# activity loads and calls `android_main` in. This crate is that library and
+# nothing more; everything it does is in the main crate.
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+sandy-3 = { path = "../.." }

@@ -49,7 +49,7 @@ impl Headless {
         let mut plugins = Plugins::new();
         plugins.load_builtin();
         plugins.load_dir();
-        let sim = Simulation::new(&device, &queue, &plugins.registry());
+        let sim = Simulation::new(&device, &queue, &plugins.registry(), plugins.grid());
         let renderer = Renderer::new(&device, &queue, &sim);
         Ok(Headless {
             plugins,

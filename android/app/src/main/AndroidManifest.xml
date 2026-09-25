@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- The whole app: the system's NativeActivity loading the library that
+     `cargo ndk` builds. There is no code of our own on the Java side, which
+     `hasCode="false"` says, so there is nothing to compile here. -->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!-- The simulation is compute shaders on Vulkan. -->
+    <uses-feature android:name="android.hardware.vulkan.version" android:version="0x401000" android:required="true" />
+    <uses-feature android:name="android.hardware.touchscreen" android:required="true" />
+
+    <application
+        android:label="Sandy 3"
+        android:hasCode="false"
+        android:allowBackup="true"
+        android:theme="@android:style/Theme.DeviceDefault.NoActionBar">
+
+        <!-- Upright only: the world is built in the shape of the screen when
+             the app opens, so turning the phone would stretch it. Every
+             configuration change is handled by the app rather than by
+             restarting the activity, which would throw the world away. -->
+        <activity
+            android:name="android.app.NativeActivity"
+            android:exported="true"
+            android:launchMode="singleTask"
+            android:screenOrientation="portrait"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboard|keyboardHidden|navigation|uiMode|density|locale|layoutDirection|fontScale">
+
+            <!-- Which library to load: libsandy_3_android.so, from the
+                 `android/lib` crate. -->
+            <meta-data android:name="android.app.lib_name" android:value="sandy_3_android" />
+
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+    </application>
+</manifest>

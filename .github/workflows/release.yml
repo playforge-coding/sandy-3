@@ -86,3 +86,86 @@ jobs:
         run: |
           gh release upload "${{ github.event.release.tag_name }}" "$ASSET" \
             --repo "${{ github.repository }}" --clobber
+
+  # The Android app: the same crate built as a shared library for arm64 with
+  # cargo-ndk, then wrapped in an APK by the Gradle project under `android/`.
+  # iOS builds too (see the README) but needs a signing identity to go
+  # anywhere, so it is not released here.
+  android:
+    name: aarch64-linux-android
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: |
+          rustup toolchain install
+          rustup target add aarch64-linux-android
+
+      - uses: mozilla-actions/sccache-action@v0.0.11
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: aarch64-linux-android
+
+      # QuickJS's Rust bindings are generated at build time for Android,
+      # which needs libclang, and the NDK's CMake toolchain wants Ninja.
+      - name: Install build tools
+        run: sudo apt-get update && sudo apt-get install -y libclang-dev ninja-build
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - uses: android-actions/setup-android@v3
+        with:
+          packages: ndk;30.0.16248370 platforms;android-36 build-tools;36.1.0
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "9.7.0"
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-ndk
+
+      # CMake, building FastNoise2, finds the NDK through ANDROID_NDK_ROOT.
+      - name: Build the library
+        run: |
+          export ANDROID_NDK_ROOT="$ANDROID_HOME/ndk/30.0.16248370"
+          cargo ndk -t arm64-v8a -P 28 --link-libcxx-shared \
+            -o android/app/src/main/jniLibs \
+            build --release --locked -p sandy-3-android
+
+      - name: sccache stats
+        run: sccache --show-stats
+
+      # Signed with the repository's key when the secrets are set, and with
+      # Gradle's debug key otherwise, so there is always an APK that
+      # installs; a debug key changes from one build to the next, so a phone
+      # with an earlier build on it has to uninstall it first.
+      - name: Build the APK
+        working-directory: android
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          if [[ -n "$ANDROID_KEYSTORE_BASE64" ]]; then
+            echo "$ANDROID_KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/release.keystore"
+            export ANDROID_KEYSTORE_FILE="$RUNNER_TEMP/release.keystore"
+          fi
+          gradle assembleRelease --no-daemon
+
+      - name: Package
+        run: cp android/app/build/outputs/apk/release/app-release.apk sandy-3-aarch64-linux-android.apk
+
+      - name: Upload to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload "${{ github.event.release.tag_name }}" sandy-3-aarch64-linux-android.apk \
+            --repo "${{ github.repository }}" --clobber

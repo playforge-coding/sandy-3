@@ -35,10 +35,37 @@ pub fn random_seed() -> u32 {
 }
 
 /// The smallest and largest brush the size slider offers, in cells. The
-/// world is three thousand cells across, so the largest is a twentieth of
-/// it: enough to pour a lake or wall off a valley in a stroke or two.
+/// desktop world is three thousand cells across, so the largest is a
+/// twentieth of it: enough to pour a lake or wall off a valley in a stroke or
+/// two. A smaller world gets a smaller largest brush; see [`max_radius`].
 pub const MIN_RADIUS: i32 = 1;
 pub const MAX_RADIUS: i32 = 150;
+
+/// The largest brush for a world `width` cells across: a twentieth of it, as
+/// [`MAX_RADIUS`] is of the desktop grid, and never less than the smallest.
+pub fn max_radius(width: u32) -> i32 {
+    (width as i32 / 20).max(MIN_RADIUS)
+}
+
+/// How the panel is laid out: for a mouse, or for a finger.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Layout {
+    /// A touchscreen: buttons tall enough to land a thumb on, a panel that
+    /// opens folded away so it does not cover a small screen and scrolls
+    /// rather than run off the bottom of one, and no talk of keys.
+    pub touch: bool,
+    /// How far below the top of the window the panel opens, in points, to
+    /// keep clear of a status bar or a notch.
+    pub top_inset: f32,
+}
+
+impl Layout {
+    /// A desktop window: a mouse, and nothing in the way at the top.
+    pub const DESKTOP: Layout = Layout {
+        touch: false,
+        top_inset: 0.0,
+    };
+}
 
 /// The slowest the world can be run, as a multiple of real time. Below a
 /// quarter speed sand falls so slowly it looks stuck, and pausing does that job
@@ -81,6 +108,9 @@ pub struct Controls {
     /// The size, in grid cells: the brush radius, or the wind tool's gust
     /// radius, or whatever a plugin makes of it.
     pub radius: i32,
+    /// The largest the size slider goes to, from [`max_radius`] for the
+    /// world's width. [`MAX_RADIUS`] until the world's size is known.
+    pub max_radius: i32,
     /// Whether the world is frozen. Painting and the wind tool still work on a
     /// paused world; only the ticks stop.
     pub paused: bool,
@@ -106,6 +136,7 @@ impl Default for Controls {
             material: SAND,
             brush: 0,
             radius: 8,
+            max_radius: MAX_RADIUS,
             paused: false,
             speed: 1.0,
             world: 0,
@@ -126,6 +157,13 @@ impl Controls {
     /// Put a seed in the box, as the Random button does.
     pub fn set_seed(&mut self, seed: u32) {
         self.seed = seed.to_string();
+    }
+
+    /// Fit the size slider to a world `width` cells across, and the size to
+    /// the slider.
+    pub fn fit_to_width(&mut self, width: u32) {
+        self.max_radius = max_radius(width);
+        self.radius = self.radius.clamp(MIN_RADIUS, self.max_radius);
     }
 
     /// The rate the world should advance at this frame, as a multiple of real
@@ -161,6 +199,10 @@ pub struct Actions {
     pub screenshot: bool,
     /// Start a recording, or stop the one running.
     pub record: bool,
+    /// Where the panel was drawn, in points: its title bar when it is
+    /// folded away, the whole of it when open. A press inside it is the
+    /// panel's, however egui feels about the pointer at that moment.
+    pub panel: Option<egui::Rect>,
 }
 
 /// The names of what the plugins have registered, in the order
@@ -175,8 +217,9 @@ pub struct Names {
 ///
 /// `registry` is where the material swatches come from, `names` the plugin
 /// brushes, tools and worlds, `recording` how long the recording has been
-/// running if one is, and `status` a line for the foot of the panel: what
-/// the last plugin drop or capture did, or a hint.
+/// running if one is, `status` a line for the foot of the panel: what the
+/// last plugin drop or capture did, or a hint, and `layout` whether it is
+/// being used with a mouse or a finger.
 pub fn draw(
     ctx: &egui::Context,
     c: &mut Controls,
@@ -184,6 +227,7 @@ pub fn draw(
     names: &Names,
     recording: Option<Duration>,
     status: &str,
+    layout: Layout,
 ) -> Actions {
     let Names {
         brushes,
@@ -191,191 +235,212 @@ pub fn draw(
         worlds,
     } = names;
     let mut actions = Actions::default();
-    let button_size = egui::vec2(130.0, 18.0);
+    let (button_size, action_size) = if layout.touch {
+        (egui::vec2(150.0, 30.0), egui::vec2(90.0, 30.0))
+    } else {
+        (egui::vec2(130.0, 18.0), egui::vec2(78.0, 18.0))
+    };
     let chosen = Stroke::new(2.0, Color32::WHITE);
 
-    egui::Window::new("Sandy")
-        .default_pos([8.0, 8.0])
-        .resizable(false)
-        .show(ctx, |ui| {
-            ui.label("Material");
-            for (id, info) in registry.materials().iter().enumerate() {
-                if !info.pickable() {
-                    continue;
-                }
-                let id = id as MaterialId;
-                // Air is the eraser, and reads better under that name than under
-                // its own.
-                let name = if id == EMPTY { "Eraser" } else { info.name };
-                let fill = to_color32(info.color);
-                let mut button = egui::Button::new(RichText::new(name).color(contrast(fill)))
-                    .fill(fill)
-                    .min_size(button_size);
-                // Only highlight the chosen material while painting is what a
-                // drag would actually do.
-                if id == c.material && c.tool == Tool::Paint {
-                    button = button.stroke(chosen);
-                }
-                if ui.add(button).clicked() {
-                    c.material = id;
-                    c.tool = Tool::Paint; // picking a material means painting
-                }
+    let mut window = egui::Window::new("Sandy")
+        .default_pos([8.0, 8.0 + layout.top_inset])
+        .resizable(false);
+    if layout.touch {
+        // A phone's screen is small, so the panel opens folded away to its
+        // title and scrolls once open, rather than covering the world or
+        // running off the bottom.
+        let room = ctx.content_rect().height() - layout.top_inset - 24.0;
+        window = window
+            .default_open(false)
+            .vscroll(true)
+            .max_height(room.max(120.0));
+    }
+    let shown = window.show(ctx, |ui| {
+        if layout.touch {
+            // Room to land a finger on: the sliders and boxes as tall as
+            // the buttons, and a little more air between rows.
+            let spacing = ui.spacing_mut();
+            spacing.interact_size.y = button_size.y;
+            spacing.item_spacing.y = 6.0;
+            spacing.slider_width = button_size.x;
+        }
+        ui.label("Material");
+        for (id, info) in registry.materials().iter().enumerate() {
+            if !info.pickable() {
+                continue;
             }
+            let id = id as MaterialId;
+            // Air is the eraser, and reads better under that name than under
+            // its own.
+            let name = if id == EMPTY { "Eraser" } else { info.name };
+            let fill = to_color32(info.color);
+            let mut button = egui::Button::new(RichText::new(name).color(contrast(fill)))
+                .fill(fill)
+                .min_size(button_size);
+            // Only highlight the chosen material while painting is what a
+            // drag would actually do.
+            if id == c.material && c.tool == Tool::Paint {
+                button = button.stroke(chosen);
+            }
+            if ui.add(button).clicked() {
+                c.material = id;
+                c.tool = Tool::Paint; // picking a material means painting
+            }
+        }
 
-            // The brushes go with the materials: one of each is chosen at a
-            // time, and picking either means painting.
-            ui.separator();
-            ui.label("Brush");
-            for (index, name) in brushes.iter().enumerate() {
-                let mut button = egui::Button::new(name).min_size(button_size);
-                if index == c.brush && c.tool == Tool::Paint {
-                    button = button.stroke(chosen);
-                }
-                if ui.add(button).clicked() {
-                    c.brush = index;
-                    c.tool = Tool::Paint;
-                }
+        // The brushes go with the materials: one of each is chosen at a
+        // time, and picking either means painting.
+        ui.separator();
+        ui.label("Brush");
+        for (index, name) in brushes.iter().enumerate() {
+            let mut button = egui::Button::new(name).min_size(button_size);
+            if index == c.brush && c.tool == Tool::Paint {
+                button = button.stroke(chosen);
             }
+            if ui.add(button).clicked() {
+                c.brush = index;
+                c.tool = Tool::Paint;
+            }
+        }
 
-            ui.separator();
-            ui.label("Tool");
-            let mut wind = egui::Button::new("Wind").min_size(button_size);
-            if c.tool == Tool::Wind {
-                wind = wind.stroke(chosen);
+        ui.separator();
+        ui.label("Tool");
+        let mut wind = egui::Button::new("Wind").min_size(button_size);
+        if c.tool == Tool::Wind {
+            wind = wind.stroke(chosen);
+        }
+        if ui.add(wind).clicked() {
+            c.tool = Tool::Wind;
+        }
+        for (index, name) in tools.iter().enumerate() {
+            let mut button = egui::Button::new(name).min_size(button_size);
+            if c.tool == Tool::Plugin(index) {
+                button = button.stroke(chosen);
             }
-            if ui.add(wind).clicked() {
-                c.tool = Tool::Wind;
+            if ui.add(button).clicked() {
+                c.tool = Tool::Plugin(index);
             }
-            for (index, name) in tools.iter().enumerate() {
-                let mut button = egui::Button::new(name).min_size(button_size);
-                if c.tool == Tool::Plugin(index) {
-                    button = button.stroke(chosen);
-                }
-                if ui.add(button).clicked() {
-                    c.tool = Tool::Plugin(index);
-                }
-            }
+        }
 
-            ui.separator();
-            let label = match c.tool {
-                Tool::Paint => "Brush size",
-                Tool::Wind => "Gust size",
-                Tool::Plugin(_) => "Size",
-            };
-            ui.add(egui::Slider::new(&mut c.radius, MIN_RADIUS..=MAX_RADIUS).text(label));
+        ui.separator();
+        let label = match c.tool {
+            Tool::Paint => "Brush size",
+            Tool::Wind => "Gust size",
+            Tool::Plugin(_) => "Size",
+        };
+        ui.add(egui::Slider::new(&mut c.radius, MIN_RADIUS..=c.max_radius).text(label));
 
-            // Time. The speed slider is logarithmic so that half speed and
-            // double speed sit the same distance either side of one.
-            ui.separator();
-            ui.label("Time");
-            let label = if c.paused { "Resume" } else { "Pause" };
-            if ui
-                .add(egui::Button::new(label).min_size(button_size))
-                .clicked()
-            {
-                c.paused = !c.paused;
-            }
-            actions.step |= ui
-                .add(egui::Button::new("Step one tick").min_size(button_size))
-                .clicked();
-            ui.add(
-                egui::Slider::new(&mut c.speed, MIN_SPEED..=MAX_SPEED)
-                    .logarithmic(true)
-                    .suffix("x")
-                    .text("Speed"),
-            );
+        // Time. The speed slider is logarithmic so that half speed and
+        // double speed sit the same distance either side of one.
+        ui.separator();
+        ui.label("Time");
+        let label = if c.paused { "Resume" } else { "Pause" };
+        if ui
+            .add(egui::Button::new(label).min_size(button_size))
+            .clicked()
+        {
+            c.paused = !c.paused;
+        }
+        actions.step |= ui
+            .add(egui::Button::new("Step one tick").min_size(button_size))
+            .clicked();
+        ui.add(
+            egui::Slider::new(&mut c.speed, MIN_SPEED..=MAX_SPEED)
+                .logarithmic(true)
+                .suffix("x")
+                .text("Speed"),
+        );
 
-            // The world: which landscape, from which seed. Picking another
-            // landscape builds it there and then, so the change can be seen
-            // without a second click; so does pressing Enter in the seed box.
-            ui.separator();
-            ui.label("World");
-            if worlds.is_empty() {
-                ui.label(RichText::new("No world plugins loaded.").small().weak());
-            } else {
-                c.world = c.world.min(worlds.len() - 1);
-                let before = c.world;
-                egui::ComboBox::from_id_salt("world")
-                    .width(button_size.x)
-                    .selected_text(&worlds[c.world])
-                    .show_ui(ui, |ui| {
-                        for (index, name) in worlds.iter().enumerate() {
-                            ui.selectable_value(&mut c.world, index, name);
-                        }
-                    });
-                actions.generate |= c.world != before;
-            }
-            ui.horizontal(|ui| {
-                ui.label("Seed");
-                let response = ui.add(
-                    egui::TextEdit::singleline(&mut c.seed)
-                        .char_limit(MAX_SEED_DIGITS)
-                        .desired_width(button_size.x - 40.0),
-                );
-                actions.generate |=
-                    response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-            });
-            // Digits only, so whatever is in the box parses as a seed.
-            c.seed.retain(|ch| ch.is_ascii_digit());
-            ui.horizontal(|ui| {
-                actions.generate |= ui.button("Generate").clicked();
-                actions.randomize |= ui.button("Random").clicked();
-                actions.clear |= ui.button("Clear").clicked();
-            });
-
-            // Capture: a screenshot of the next frame, or a recording until
-            // the button is pressed again, each in the format beside it. The
-            // recording's format is fixed once it has started, so the box
-            // is greyed out until it stops.
-            ui.separator();
-            ui.label("Capture");
-            let action_size = egui::vec2(78.0, 18.0);
-            ui.horizontal(|ui| {
-                actions.screenshot |= ui
-                    .add(egui::Button::new("Screenshot").min_size(action_size))
-                    .clicked();
-                egui::ComboBox::from_id_salt("screenshot format")
-                    .width(button_size.x - action_size.x - 8.0)
-                    .selected_text(c.screenshot_format.name())
-                    .show_ui(ui, |ui| {
-                        for format in ImageFormat::ALL {
-                            ui.selectable_value(&mut c.screenshot_format, format, format.name());
-                        }
-                    });
-            });
-            ui.horizontal(|ui| {
-                let label = match recording {
-                    Some(t) => format!("Stop {:.1} s", t.as_secs_f64()),
-                    None => "Record".to_string(),
-                };
-                actions.record |= ui
-                    .add(egui::Button::new(label).min_size(action_size))
-                    .clicked();
-                ui.add_enabled_ui(recording.is_none(), |ui| {
-                    egui::ComboBox::from_id_salt("recording format")
-                        .width(button_size.x - action_size.x - 8.0)
-                        .selected_text(c.recording_format.name())
-                        .show_ui(ui, |ui| {
-                            for format in AnimationFormat::ALL {
-                                ui.selectable_value(&mut c.recording_format, format, format.name());
-                            }
-                        });
+        // The world: which landscape, from which seed. Picking another
+        // landscape builds it there and then, so the change can be seen
+        // without a second click; so does pressing Enter in the seed box.
+        ui.separator();
+        ui.label("World");
+        if worlds.is_empty() {
+            ui.label(RichText::new("No world plugins loaded.").small().weak());
+        } else {
+            c.world = c.world.min(worlds.len() - 1);
+            let before = c.world;
+            egui::ComboBox::from_id_salt("world")
+                .width(button_size.x)
+                .selected_text(&worlds[c.world])
+                .show_ui(ui, |ui| {
+                    for (index, name) in worlds.iter().enumerate() {
+                        ui.selectable_value(&mut c.world, index, name);
+                    }
                 });
-            });
-
-            ui.separator();
-            ui.label(
-                RichText::new(
-                    "Hold left mouse to draw. Pick Wind and sweep to blow a gust. \
-                     Space pauses, . steps a tick, - and = change the speed. \
-                     G builds the world again, R from a new seed. \
-                     S takes a screenshot, V starts and stops a recording.",
-                )
-                .small()
-                .weak(),
+            actions.generate |= c.world != before;
+        }
+        ui.horizontal(|ui| {
+            ui.label("Seed");
+            let response = ui.add(
+                egui::TextEdit::singleline(&mut c.seed)
+                    .char_limit(MAX_SEED_DIGITS)
+                    .desired_width(button_size.x - 40.0),
             );
-            ui.label(RichText::new(status).small().weak());
+            actions.generate |=
+                response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
         });
+        // Digits only, so whatever is in the box parses as a seed.
+        c.seed.retain(|ch| ch.is_ascii_digit());
+        ui.horizontal(|ui| {
+            actions.generate |= ui.button("Generate").clicked();
+            actions.randomize |= ui.button("Random").clicked();
+            actions.clear |= ui.button("Clear").clicked();
+        });
+
+        // Capture: a screenshot of the next frame, or a recording until
+        // the button is pressed again, each in the format beside it. The
+        // recording's format is fixed once it has started, so the box
+        // is greyed out until it stops.
+        ui.separator();
+        ui.label("Capture");
+        ui.horizontal(|ui| {
+            actions.screenshot |= ui
+                .add(egui::Button::new("Screenshot").min_size(action_size))
+                .clicked();
+            egui::ComboBox::from_id_salt("screenshot format")
+                .width(button_size.x - action_size.x - 8.0)
+                .selected_text(c.screenshot_format.name())
+                .show_ui(ui, |ui| {
+                    for format in ImageFormat::ALL {
+                        ui.selectable_value(&mut c.screenshot_format, format, format.name());
+                    }
+                });
+        });
+        ui.horizontal(|ui| {
+            let label = match recording {
+                Some(t) => format!("Stop {:.1} s", t.as_secs_f64()),
+                None => "Record".to_string(),
+            };
+            actions.record |= ui
+                .add(egui::Button::new(label).min_size(action_size))
+                .clicked();
+            ui.add_enabled_ui(recording.is_none(), |ui| {
+                egui::ComboBox::from_id_salt("recording format")
+                    .width(button_size.x - action_size.x - 8.0)
+                    .selected_text(c.recording_format.name())
+                    .show_ui(ui, |ui| {
+                        for format in AnimationFormat::ALL {
+                            ui.selectable_value(&mut c.recording_format, format, format.name());
+                        }
+                    });
+            });
+        });
+
+        ui.separator();
+        let help = if layout.touch {
+            "Drag a finger to draw. Pick Wind and sweep to blow a gust."
+        } else {
+            "Hold left mouse to draw. Pick Wind and sweep to blow a gust. \
+                 Space pauses, . steps a tick, - and = change the speed. \
+                 G builds the world again, R from a new seed. \
+                 S takes a screenshot, V starts and stops a recording."
+        };
+        ui.label(RichText::new(help).small().weak());
+        ui.label(RichText::new(status).small().weak());
+    });
+    actions.panel = shown.map(|shown| shown.response.rect);
 
     actions
 }
@@ -443,6 +508,22 @@ mod tests {
             "twenty rolls all came up {}",
             seeds[0]
         );
+    }
+
+    #[test]
+    fn the_largest_brush_follows_the_width_of_the_world() {
+        assert_eq!(max_radius(3000), MAX_RADIUS);
+        assert_eq!(max_radius(520), 26);
+        assert_eq!(max_radius(10), MIN_RADIUS, "never below the smallest brush");
+        let mut c = Controls {
+            radius: 100,
+            ..Controls::default()
+        };
+        c.fit_to_width(520);
+        assert_eq!(c.max_radius, 26);
+        assert_eq!(c.radius, 26, "a brush too big for the world is brought in");
+        c.fit_to_width(3000);
+        assert_eq!(c.radius, 26, "and one that fits is left alone");
     }
 
     #[test]

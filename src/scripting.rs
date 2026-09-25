@@ -61,7 +61,7 @@ use crate::materials::{MaterialId, Registry};
 use crate::plugins::{
     self, Kind, Plugins, Sink, Stroke, clamp_radius, describe, fail, optional, resolve,
 };
-use crate::sim::{GRID_H, GRID_W, Simulation};
+use crate::sim::{Grid, Simulation};
 use crate::ui::{self, Controls, MAX_SPEED, MIN_SPEED, Tool};
 
 /// Where a script comes from, as the command line says it.
@@ -190,7 +190,7 @@ impl Script {
                 // watching. A control script is being run from a terminal or
                 // a test, and its output is the point.
                 plugins::install_globals(&ctx, Sink::Stdout)?;
-                install_sim(&ctx, &slot)
+                install_sim(&ctx, &slot, plugins.grid())
             })()
             .map_err(|err| describe(&ctx, err))?;
             Module::declare(ctx.clone(), name, source)
@@ -294,11 +294,11 @@ fn with_host<R>(
 }
 
 /// Put the `sim` object in the globals, every function on it going through
-/// `slot` to the host.
-fn install_sim<'js>(ctx: &Ctx<'js>, slot: &Rc<Slot>) -> rquickjs::Result<()> {
+/// `slot` to the host, and `grid` as its size.
+fn install_sim<'js>(ctx: &Ctx<'js>, slot: &Rc<Slot>, grid: Grid) -> rquickjs::Result<()> {
     let sim = Object::new(ctx.clone())?;
-    sim.set("width", GRID_W)?;
-    sim.set("height", GRID_H)?;
+    sim.set("width", grid.width)?;
+    sim.set("height", grid.height)?;
 
     /// One `sim` function: a closure over the host, with the call's
     /// arguments after it.
@@ -985,7 +985,7 @@ impl Snapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::gpu::{CAPTURE_H, CAPTURE_W};
+    use crate::gpu::capture_size;
     use crate::headless::Headless;
     use crate::sim::GRID_W;
 
@@ -1199,11 +1199,12 @@ mod tests {
         let mut buf = vec![0; reader.output_buffer_size().unwrap()];
         let info = reader.next_frame(&mut buf).unwrap();
         // A capture is half the grid each way.
-        assert_eq!((info.width, info.height), (CAPTURE_W, CAPTURE_H));
+        let (capture_w, capture_h) = capture_size(Grid::DESKTOP);
+        assert_eq!((info.width, info.height), (capture_w, capture_h));
         // The lava at rows 400 to 499 of the world is at rows 200 to 249 of
         // the picture, and lava coloured: much more red than blue.
         let px = |x: usize, y: usize| {
-            let i = (y * CAPTURE_W as usize + x) * info.color_type.samples();
+            let i = (y * capture_w as usize + x) * info.color_type.samples();
             (buf[i], buf[i + 1], buf[i + 2])
         };
         let (r, _, b) = px(250, 225);

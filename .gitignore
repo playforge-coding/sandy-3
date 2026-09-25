@@ -1,3 +1,12 @@
 /target
 # Screenshots and recordings taken while running from the checkout.
 /captures
+# The Android build: the library cargo-ndk puts in place, and Gradle's own
+# files.
+/android/app/src/main/jniLibs
+/android/.gradle
+/android/build
+/android/app/build
+/android/local.properties
+/android/.kotlin
+.DS_Store

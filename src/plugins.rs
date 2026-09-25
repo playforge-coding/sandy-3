@@ -108,7 +108,7 @@ use rquickjs::{
 };
 
 use crate::materials::{Look, MaterialId, MaterialInfo, Registry, Rule};
-use crate::sim::{GRID_H, GRID_W, Simulation};
+use crate::sim::{Grid, Simulation};
 use crate::worldgen::{Canvas, Noise};
 
 /// The widest brush a script can ask for, in cells. The paint and gust kernels
@@ -288,6 +288,9 @@ struct Shared {
     /// What `Math.random` draws from. JavaScript has no way to seed its own,
     /// and a world has to be the same for the same seed.
     rng: fastrand::Rng,
+    /// The size of the world a script sees, as `sandy.width` and
+    /// `sandy.height`, and the size of the canvas a world is painted on.
+    grid: Grid,
 }
 
 impl Shared {
@@ -435,12 +438,12 @@ impl World {
 
     #[qjs(get)]
     fn width(&self) -> u32 {
-        GRID_W
+        self.shared.borrow().grid.width
     }
 
     #[qjs(get)]
     fn height(&self) -> u32 {
-        GRID_H
+        self.shared.borrow().grid.height
     }
 
     /// Put a material in one cell.
@@ -522,7 +525,8 @@ impl Drop for Plugins {
 
 impl Plugins {
     /// An engine with the `sandy` object in it and the built-in materials in
-    /// its registry, and no scripts loaded yet.
+    /// its registry, and no scripts loaded yet. The world it describes to
+    /// scripts is the desktop one until [`Plugins::set_grid`] says otherwise.
     pub fn new() -> Self {
         Self::build().expect("build the JavaScript engine")
     }
@@ -540,12 +544,33 @@ impl Plugins {
             generation: 0,
             report: Report::default(),
             rng: fastrand::Rng::with_seed(0),
+            grid: Grid::DESKTOP,
         }));
         context.with(|ctx| {
             install_globals(&ctx, Sink::Log)?;
             install_sandy(&ctx, &shared)
         })?;
         Ok(Plugins { shared, context })
+    }
+
+    /// The size of the world scripts are told about.
+    pub fn grid(&self) -> Grid {
+        self.shared.borrow().grid
+    }
+
+    /// Tell scripts the world is `grid` cells: what `sandy.width` and
+    /// `sandy.height` say, and the size of the canvas a world paints. A
+    /// phone's grid is only known once its screen is, so this comes after
+    /// [`Plugins::new`] and before any script that might read them.
+    pub fn set_grid(&mut self, grid: Grid) {
+        self.shared.borrow_mut().grid = grid;
+        self.context
+            .with(|ctx| -> rquickjs::Result<()> {
+                let sandy: Object = ctx.globals().get("sandy")?;
+                sandy.set("width", grid.width)?;
+                sandy.set("height", grid.height)
+            })
+            .expect("the sandy object is always there");
     }
 
     /// Run every script in [`BUILTIN`]. One failing is a bug in the repo rather
@@ -754,7 +779,8 @@ impl Plugins {
             .ok_or_else(|| format!("there is no world number {index}"))?;
         let generation = {
             let mut shared = self.shared.borrow_mut();
-            shared.canvas = Some(Canvas::new(GRID_W, GRID_H));
+            let grid = shared.grid;
+            shared.canvas = Some(Canvas::new(grid.width, grid.height));
             shared.generation += 1;
             shared.rng.seed(u64::from(seed));
             shared.generation
@@ -795,8 +821,9 @@ impl Plugins {
 /// a handle to `shared`.
 fn install_sandy<'js>(ctx: &Ctx<'js>, shared: &Rc<RefCell<Shared>>) -> rquickjs::Result<()> {
     let sandy = Object::new(ctx.clone())?;
-    sandy.set("width", GRID_W)?;
-    sandy.set("height", GRID_H)?;
+    let grid = shared.borrow().grid;
+    sandy.set("width", grid.width)?;
+    sandy.set("height", grid.height)?;
 
     let s = shared.clone();
     sandy.set(
@@ -1229,6 +1256,44 @@ fn place(stack: &str) -> Option<String> {
 mod tests {
     use super::*;
     use crate::materials::{EMPTY, LAVA, SAND, SOIL, STONE, WATER};
+    use crate::sim::{GRID_H, GRID_W};
+
+    #[test]
+    fn scripts_are_told_the_size_of_the_world_and_paint_to_it() {
+        // Until told otherwise a script sees the desktop grid. A phone tells
+        // the plugins its own grid before they load, and from then on that is
+        // what `sandy.width` says and the size of the canvas a world paints.
+        let mut plugins = Plugins::new();
+        assert_eq!(plugins.grid(), Grid::DESKTOP);
+        plugins
+            .load(
+                "size.js",
+                "assert(sandy.width === 3000 && sandy.height === 1500);",
+            )
+            .unwrap();
+
+        let phone = Grid {
+            width: 520,
+            height: 1156,
+        };
+        plugins.set_grid(phone);
+        assert_eq!(plugins.grid(), phone);
+        plugins
+            .load(
+                "flat.js",
+                r#"
+                assert(sandy.width === 520 && sandy.height === 1156);
+                sandy.world({ name: "Flat", generate: (w) => {
+                    assert(w.width === 520 && w.height === 1156);
+                    w.fill(0, w.height - 1, w.width - 1, w.height - 1, "Stone");
+                } });
+                "#,
+            )
+            .unwrap();
+        let cells = plugins.generate(0, 1).unwrap();
+        assert_eq!(cells.len(), phone.cells());
+        assert_eq!(cells.iter().filter(|&&m| m == STONE).count(), 520);
+    }
 
     #[test]
     fn a_script_can_add_a_material_and_a_rule() {

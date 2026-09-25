@@ -32,24 +32,27 @@ use winit::window::Window;
 
 use crate::capture::Frame;
 use crate::materials::Registry;
-use crate::sim::{GRID_H, GRID_W, Simulation, WIND_H, WIND_W};
+use crate::sim::{Grid, Simulation};
 
 /// How far the glow spreads, in grid cells per blur tap. Larger is a wider halo.
 const GLOW_SPREAD: f32 = 1.5;
 
 /// The size of a captured frame: half the grid each way. A screenshot or a
-/// recording at the grid's own resolution would be four and a half million
-/// pixels a frame, which is more than a window shows and more than the
-/// encoders can keep up with at sixty frames a second, so the composite is
-/// drawn into a smaller image and the scene sampler averages each two-by-two
-/// block of cells into a pixel on the way.
-pub const CAPTURE_W: u32 = GRID_W.div_ceil(2);
-pub const CAPTURE_H: u32 = GRID_H.div_ceil(2);
+/// recording at the desktop grid's own resolution would be four and a half
+/// million pixels a frame, which is more than a window shows and more than
+/// the encoders can keep up with at sixty frames a second, so the composite
+/// is drawn into a smaller image and the scene sampler averages each
+/// two-by-two block of cells into a pixel on the way.
+pub fn capture_size(grid: Grid) -> (u32, u32) {
+    (grid.width.div_ceil(2), grid.height.div_ceil(2))
+}
 
-/// Bytes per row of a captured frame in its staging buffer: four per pixel,
-/// rounded up to the alignment a texture-to-buffer copy demands.
-const CAPTURE_ROW_BYTES: u32 = (CAPTURE_W * 4).div_ceil(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT)
-    * wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+/// Bytes per row of a captured frame `width` pixels across in its staging
+/// buffer: four per pixel, rounded up to the alignment a texture-to-buffer
+/// copy demands.
+fn capture_row_bytes(width: u32) -> u32 {
+    (width * 4).div_ceil(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT) * wgpu::COPY_BYTES_PER_ROW_ALIGNMENT
+}
 
 /// The format the offscreen images are drawn in. sRGB whatever the window
 /// turns out to be, so the blur adds light rather than adding byte values.
@@ -111,6 +114,9 @@ pub struct Renderer {
     /// in a plain format whose bytes are the sRGB values a file wants.
     capture_texture: wgpu::Texture,
     capture_view: wgpu::TextureView,
+    /// Its size, and the padded width of a row of it in a staging buffer.
+    capture_size: (u32, u32),
+    capture_row_bytes: u32,
     /// Captured frames the GPU is still copying out, oldest first, and the
     /// staging buffers that have been read and can be used again.
     readbacks: VecDeque<Readback>,
@@ -119,7 +125,13 @@ pub struct Renderer {
 
 pub struct State {
     window: Arc<Window>,
-    surface: wgpu::Surface<'static>,
+    /// Kept so the surface can be made again after Android takes the
+    /// window away; see [`State::suspend`].
+    instance: wgpu::Instance,
+    /// The surface, while there is a window to draw on. On a desktop that is
+    /// always; on Android the window goes away when the app is sent to the
+    /// background and comes back when it returns, and the surface with it.
+    surface: Option<wgpu::Surface<'static>>,
     device: wgpu::Device,
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
@@ -229,14 +241,17 @@ impl Renderer {
     /// The offscreen passes over `sim`'s buffers. The bind groups hold those
     /// buffers, and the simulation never replaces them, so this is built once.
     pub fn new(device: &wgpu::Device, queue: &wgpu::Queue, sim: &Simulation) -> Self {
+        let grid = sim.grid();
+        let (capture_w, capture_h) = capture_size(grid);
+
         // ---- Offscreen targets, all at the grid's own resolution ----
         let offscreen = |label: &str| {
             device
                 .create_texture(&wgpu::TextureDescriptor {
                     label: Some(label),
                     size: wgpu::Extent3d {
-                        width: GRID_W,
-                        height: GRID_H,
+                        width: grid.width,
+                        height: grid.height,
                         depth_or_array_layers: 1,
                     },
                     mip_level_count: 1,
@@ -259,8 +274,8 @@ impl Renderer {
         let capture_texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("capture"),
             size: wgpu::Extent3d {
-                width: CAPTURE_W,
-                height: CAPTURE_H,
+                width: capture_w,
+                height: capture_h,
                 depth_or_array_layers: 1,
             },
             mip_level_count: 1,
@@ -305,10 +320,11 @@ impl Renderer {
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        let (wind_w, wind_h) = grid.wind();
         queue.write_buffer(
             &scene_world,
             0,
-            bytemuck::cast_slice(&[GRID_W, GRID_H, WIND_W, WIND_H]),
+            bytemuck::cast_slice(&[grid.width, grid.height, wind_w, wind_h]),
         );
 
         let blur_uniform = |label: &str, x: f32, y: f32| {
@@ -321,8 +337,8 @@ impl Renderer {
             queue.write_buffer(&buffer, 0, &blur_step_bytes(x, y));
             buffer
         };
-        let blur_h_buf = blur_uniform("blur h step", GLOW_SPREAD / GRID_W as f32, 0.0);
-        let blur_v_buf = blur_uniform("blur v step", 0.0, GLOW_SPREAD / GRID_H as f32);
+        let blur_h_buf = blur_uniform("blur h step", GLOW_SPREAD / grid.width as f32, 0.0);
+        let blur_v_buf = blur_uniform("blur v step", 0.0, GLOW_SPREAD / grid.height as f32);
 
         // ---- Bind group layouts ----
         let storage_entry = |binding| wgpu::BindGroupLayoutEntry {
@@ -544,6 +560,8 @@ impl Renderer {
             glow_b_view,
             capture_texture,
             capture_view,
+            capture_size: (capture_w, capture_h),
+            capture_row_bytes: capture_row_bytes(capture_w),
             readbacks: VecDeque::new(),
             spare_staging: Vec::new(),
         }
@@ -629,10 +647,11 @@ impl Renderer {
             &self.bg_composite,
             None,
         );
+        let (capture_w, capture_h) = self.capture_size;
         let buffer = self.spare_staging.pop().unwrap_or_else(|| {
             self.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("capture staging"),
-                size: (CAPTURE_ROW_BYTES * CAPTURE_H) as wgpu::BufferAddress,
+                size: (self.capture_row_bytes * capture_h) as wgpu::BufferAddress,
                 usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
                 mapped_at_creation: false,
             })
@@ -648,13 +667,13 @@ impl Renderer {
                 buffer: &buffer,
                 layout: wgpu::TexelCopyBufferLayout {
                     offset: 0,
-                    bytes_per_row: Some(CAPTURE_ROW_BYTES),
-                    rows_per_image: Some(CAPTURE_H),
+                    bytes_per_row: Some(self.capture_row_bytes),
+                    rows_per_image: Some(capture_h),
                 },
             },
             wgpu::Extent3d {
-                width: CAPTURE_W,
-                height: CAPTURE_H,
+                width: capture_w,
+                height: capture_h,
                 depth_or_array_layers: 1,
             },
         );
@@ -696,7 +715,7 @@ impl Renderer {
             match result {
                 Ok(()) => {
                     match buffer.slice(..).get_mapped_range() {
-                        Ok(data) => frames.push(Self::frame_from(&data)),
+                        Ok(data) => frames.push(self.frame_from(&data)),
                         Err(err) => log::error!("could not read a captured frame back: {err}"),
                     }
                     buffer.unmap();
@@ -738,23 +757,24 @@ impl Renderer {
                 .slice(..)
                 .get_mapped_range()
                 .map_err(|err| format!("could not read the frame back: {err}"))?;
-            Self::frame_from(&data)
+            self.frame_from(&data)
         };
         buffer.unmap();
         self.spare_staging.push(buffer);
         Ok(frame)
     }
 
-    fn frame_from(data: &[u8]) -> Frame {
-        Frame::from_padded_rgba(data, CAPTURE_W, CAPTURE_H, CAPTURE_ROW_BYTES as usize)
+    fn frame_from(&self, data: &[u8]) -> Frame {
+        let (width, height) = self.capture_size;
+        Frame::from_padded_rgba(data, width, height, self.capture_row_bytes as usize)
     }
 }
 
 impl State {
-    /// Bring up the GPU and build a world that knows the materials in
-    /// `registry`. Later changes to the registry go through
+    /// Bring up the GPU and build a world of `grid` cells that knows the
+    /// materials in `registry`. Later changes to the registry go through
     /// [`Simulation::set_tables`].
-    pub async fn new(window: Arc<Window>, registry: &Registry) -> State {
+    pub async fn new(window: Arc<Window>, registry: &Registry, grid: Grid) -> State {
         let size = window.inner_size();
         let width = size.width.max(1);
         let height = size.height.max(1);
@@ -781,11 +801,19 @@ impl State {
                  Metal or D3D12",
             );
 
+        // The default limits, bar one: the iOS simulator's Metal offers
+        // fifteen inter-stage shader variables to the default's sixteen, and
+        // the shaders here use two, so asking for what the adapter has is
+        // no loss.
+        let mut limits = wgpu::Limits::default();
+        limits.max_inter_stage_shader_variables = limits
+            .max_inter_stage_shader_variables
+            .min(adapter.limits().max_inter_stage_shader_variables);
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("sandy device"),
                 required_features: wgpu::Features::empty(),
-                required_limits: wgpu::Limits::default(),
+                required_limits: limits,
                 ..Default::default()
             })
             .await
@@ -820,7 +848,7 @@ impl State {
         };
         surface.configure(&device, &config);
 
-        let sim = Simulation::new(&device, &queue, registry);
+        let sim = Simulation::new(&device, &queue, registry, grid);
         let renderer = Renderer::new(&device, &queue, &sim);
         let pipeline_composite = renderer.window_pipeline(config.format);
 
@@ -834,7 +862,8 @@ impl State {
 
         State {
             window,
-            surface,
+            instance,
+            surface: Some(surface),
             device,
             queue,
             config,
@@ -869,7 +898,37 @@ impl State {
         let max = self.device.limits().max_texture_dimension_2d;
         self.config.width = width.min(max);
         self.config.height = height.min(max);
-        self.surface.configure(&self.device, &self.config);
+        if let Some(surface) = &self.surface {
+            surface.configure(&self.device, &self.config);
+        }
+    }
+
+    /// Let go of the surface: the window is about to go away, as it does on
+    /// Android when the app is sent to the background. The world and the
+    /// device stay, so nothing is lost; there is just nothing to draw on
+    /// until [`State::resume`].
+    pub fn suspend(&mut self) {
+        self.surface = None;
+    }
+
+    /// Make a surface on the window again, once it is back. The window is
+    /// asked its size afresh, since it may have been rotated in the meantime.
+    pub fn resume(&mut self) {
+        if self.surface.is_some() {
+            return;
+        }
+        let surface = self
+            .instance
+            .create_surface(self.window.clone())
+            .expect("create surface");
+        let size = self.window.inner_size();
+        self.config.width = size.width.max(1);
+        self.config.height = size.height.max(1);
+        surface.configure(&self.device, &self.config);
+        self.surface = Some(surface);
+        // The frame clock is started again too, or the time spent away would
+        // be spent as a burst of catch-up ticks.
+        self.last_update = Instant::now();
     }
 
     /// Map a cursor position in window pixels to a grid cell.
@@ -930,12 +989,18 @@ impl State {
         }
         textures_delta.set.clear();
 
-        let frame = match self.surface.get_current_texture() {
+        // No window to draw on, while the app is in the background.
+        let Some(surface) = &self.surface else {
+            self.free_textures(&mut textures_delta);
+            return false;
+        };
+
+        let frame = match surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(f)
             | wgpu::CurrentSurfaceTexture::Suboptimal(f) => f,
             // The surface wants reconfiguring: skip this frame and fix it.
             wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
-                self.surface.configure(&self.device, &self.config);
+                surface.configure(&self.device, &self.config);
                 self.free_textures(&mut textures_delta);
                 return false;
             }

@@ -18,19 +18,65 @@ use wgpu::util::DeviceExt;
 use crate::kernels::{self, MOVE_PASSES, PRESSURE_SWEEPS};
 use crate::materials::{MaterialId, Registry};
 
-/// Simulation resolution, in cells. The renderer stretches this to fill the
-/// window, so these are logical sand grains rather than screen pixels.
+/// The simulation resolution a desktop runs at, in cells. The renderer
+/// stretches the grid to fill the window, so these are logical sand grains
+/// rather than screen pixels.
 ///
 /// This is thirty-six times the area a comparable CPU engine runs comfortably,
-/// which is most of the point of moving the tick onto the GPU.
+/// which is most of the point of moving the tick onto the GPU. A phone gets a
+/// smaller grid, shaped to its screen; see [`Grid::for_screen`].
 pub const GRID_W: u32 = 3000;
 pub const GRID_H: u32 = 1500;
 
-/// The wind grid, half the world each way: one wind cell over each two-by-two
-/// block of cells, with the last column and row covering a single cell if the
-/// world has an odd side. See [`kernels`] for why.
-pub const WIND_W: u32 = GRID_W.div_ceil(2);
-pub const WIND_H: u32 = GRID_H.div_ceil(2);
+/// How many cells a phone's grid has, near enough. A phone GPU has a fraction
+/// of a desktop's memory bandwidth, and the wind's passes over the grid are
+/// paid for in exactly that, so the world is cut to about an eighth of the
+/// desktop one. On a mid-range phone that keeps a tick well inside a frame.
+pub const MOBILE_CELLS: u32 = 600_000;
+
+/// The size of the world, in cells.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Grid {
+    pub width: u32,
+    pub height: u32,
+}
+
+impl Grid {
+    /// The grid a desktop runs: [`GRID_W`] by [`GRID_H`].
+    pub const DESKTOP: Grid = Grid {
+        width: GRID_W,
+        height: GRID_H,
+    };
+
+    /// A grid of about [`MOBILE_CELLS`] cells in the shape of a screen
+    /// `width` by `height` pixels, so a phone held upright gets a world that
+    /// is taller than it is wide and nothing is stretched out of shape. Each
+    /// side is an even number of cells, which suits the wind's two-by-two
+    /// blocks, and never fewer than two.
+    pub fn for_screen(width: u32, height: u32) -> Grid {
+        let (width, height) = (width.max(1) as f64, height.max(1) as f64);
+        let cells = MOBILE_CELLS as f64;
+        let grid_h = (cells * height / width).sqrt();
+        let grid_w = cells / grid_h;
+        let even = |side: f64| ((side / 2.0).round() as u32 * 2).max(2);
+        Grid {
+            width: even(grid_w),
+            height: even(grid_h),
+        }
+    }
+
+    /// The wind grid, half the world each way: one wind cell over each
+    /// two-by-two block of cells, with the last column and row covering a
+    /// single cell if the world has an odd side. See [`kernels`] for why.
+    pub fn wind(self) -> (u32, u32) {
+        (self.width.div_ceil(2), self.height.div_ceil(2))
+    }
+
+    /// How many cells there are.
+    pub fn cells(self) -> usize {
+        self.width as usize * self.height as usize
+    }
+}
 
 /// The pair of grid buffers has to end a tick the way it started, or the
 /// renderer would have to be told which one is live. One [`kernels::react`] pass
@@ -179,7 +225,7 @@ pub struct Simulation {
 
     pub width: u32,
     pub height: u32,
-    /// The wind grid, half the world each way: [`WIND_W`] and [`WIND_H`].
+    /// The wind grid, half the world each way; see [`Grid::wind`].
     pub wind_width: u32,
     pub wind_height: u32,
 
@@ -243,14 +289,18 @@ pub struct Simulation {
 }
 
 impl Simulation {
-    /// A fresh, empty world whose kernels read the materials and rules in
-    /// `registry`. [`Simulation::set_tables`] swaps those out later.
-    pub fn new(device: &wgpu::Device, queue: &wgpu::Queue, registry: &Registry) -> Self {
-        let width = GRID_W;
-        let height = GRID_H;
-        let wind_width = WIND_W;
-        let wind_height = WIND_H;
-        let cell_count = (width * height) as u64;
+    /// A fresh, empty world of `grid` cells whose kernels read the materials
+    /// and rules in `registry`. [`Simulation::set_tables`] swaps those out
+    /// later; the size is fixed for the life of the world.
+    pub fn new(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        registry: &Registry,
+        grid: Grid,
+    ) -> Self {
+        let Grid { width, height } = grid;
+        let (wind_width, wind_height) = grid.wind();
+        let cell_count = grid.cells() as u64;
         let wind_count = (wind_width * wind_height) as u64;
 
         let storage = |label, size| {
@@ -438,6 +488,14 @@ impl Simulation {
     /// How many ticks the world has run.
     pub fn ticks(&self) -> u32 {
         self.frame
+    }
+
+    /// The size of the world.
+    pub fn grid(&self) -> Grid {
+        Grid {
+            width: self.width,
+            height: self.height,
+        }
     }
 
     /// A fresh grain for a brush stroke or a load, so painting twice over the
@@ -852,7 +910,8 @@ mod tests {
     /// The wind over the cell at `x`, `y`, from a field read back. The wind
     /// grid is half the world each way.
     fn wind_at(field: &[[f32; 2]], x: u32, y: u32) -> [f32; 2] {
-        field[((y / 2) * WIND_W + x / 2) as usize]
+        let (wind_w, _) = Grid::DESKTOP.wind();
+        field[((y / 2) * wind_w + x / 2) as usize]
     }
 
     /// The built-in tables with the built-in plugins loaded on top, for a test
@@ -864,13 +923,50 @@ mod tests {
     }
 
     #[test]
+    fn a_phone_grid_takes_the_shape_of_its_screen() {
+        // Upright, the world is taller than it is wide, and holds about the
+        // budget of cells whatever the shape.
+        let phone = Grid::for_screen(1080, 2400);
+        assert!(phone.height > phone.width * 2, "{phone:?} is not upright");
+        let cells = phone.cells() as f64;
+        let budget = f64::from(MOBILE_CELLS);
+        assert!(
+            (cells - budget).abs() / budget < 0.02,
+            "{phone:?} holds {cells} cells against a budget of {MOBILE_CELLS}"
+        );
+        let ratio = phone.height as f64 / phone.width as f64;
+        assert!(
+            (ratio - 2400.0 / 1080.0).abs() < 0.02,
+            "{phone:?} is the wrong shape"
+        );
+        assert_eq!(phone.width % 2, 0);
+        assert_eq!(phone.height % 2, 0);
+
+        // A tablet on its side is wider than it is tall, and a nonsense
+        // screen still gives a grid the kernels can run over.
+        let tablet = Grid::for_screen(2048, 1536);
+        assert!(tablet.width > tablet.height);
+        assert_eq!(Grid::for_screen(0, 0), Grid::for_screen(1, 1));
+        assert!(Grid::for_screen(1, 100_000).width >= 2);
+        assert_eq!(Grid::DESKTOP.wind(), (1500, 750));
+        assert_eq!(
+            Grid {
+                width: 5,
+                height: 3
+            }
+            .wind(),
+            (3, 2)
+        );
+    }
+
+    #[test]
     fn fire_rises_and_burns_out() {
         // Fire is lighter than air, so it climbs on the same rule that makes
         // sand fall, and a flame with air next to it goes out after a moment.
         let registry = with_plugins();
         let fire = registry.find("Fire").unwrap();
         let (device, queue) = headless();
-        let mut sim = Simulation::new(&device, &queue, &registry);
+        let mut sim = Simulation::new(&device, &queue, &registry, Grid::DESKTOP);
         sim.paint_disk(CX, FLOOR - 96, 10, fire);
         assert!(snapshot(&sim).count(fire) > 0);
         run(&mut sim, 15);
@@ -896,7 +992,7 @@ mod tests {
         let fire = registry.find("Fire").unwrap();
         let steam = registry.find("Steam").unwrap();
         let (device, queue) = headless();
-        let mut sim = Simulation::new(&device, &queue, &registry);
+        let mut sim = Simulation::new(&device, &queue, &registry, Grid::DESKTOP);
         floor(&mut sim, STONE);
         sim.paint_disk(CX, FLOOR - 26, 14, WATER);
         run(&mut sim, 100);
@@ -950,7 +1046,7 @@ mod tests {
         let registry = with_plugins();
         let steam = registry.find("Steam").unwrap();
         let (device, queue) = headless();
-        let mut sim = Simulation::new(&device, &queue, &registry);
+        let mut sim = Simulation::new(&device, &queue, &registry, Grid::DESKTOP);
         for _ in 0..60 {
             sim.paint_disk(CX, FLOOR - 76, 15, steam);
             sim.step();
@@ -970,7 +1066,7 @@ mod tests {
     #[test]
     fn sand_falls_onto_the_ground_and_stays_there() {
         let (device, queue) = headless();
-        let mut sim = Simulation::new(&device, &queue, &Registry::builtin());
+        let mut sim = Simulation::new(&device, &queue, &Registry::builtin(), Grid::DESKTOP);
         floor(&mut sim, STONE);
         sim.paint_disk(CX, FLOOR - 436, 14, SAND);
         let painted = snapshot(&sim).count(SAND);
@@ -999,7 +1095,7 @@ mod tests {
         // across; anything near the width of the spout means the tumble is not
         // firing and the sand is piling straight up.
         let (device, queue) = headless();
-        let mut sim = Simulation::new(&device, &queue, &Registry::builtin());
+        let mut sim = Simulation::new(&device, &queue, &Registry::builtin(), Grid::DESKTOP);
         floor(&mut sim, STONE);
         for y in ((FLOOR - 476)..(FLOOR - 296)).step_by(6) {
             sim.paint_disk(CX, y, 3, SAND);
@@ -1024,7 +1120,7 @@ mod tests {
         // Water poured into one spot of a basin should end up spread far wider
         // than it was painted. Sand in the same place would not.
         let (device, queue) = headless();
-        let mut sim = Simulation::new(&device, &queue, &Registry::builtin());
+        let mut sim = Simulation::new(&device, &queue, &Registry::builtin(), Grid::DESKTOP);
         floor(&mut sim, STONE);
         sim.paint_disk(CX, FLOOR - 296, 20, WATER);
         run(&mut sim, 500);
@@ -1043,7 +1139,7 @@ mod tests {
         // Sand is denser than water, so a grain dropped into a pool ends up
         // under it rather than floating.
         let (device, queue) = headless();
-        let mut sim = Simulation::new(&device, &queue, &Registry::builtin());
+        let mut sim = Simulation::new(&device, &queue, &Registry::builtin(), Grid::DESKTOP);
         floor(&mut sim, STONE);
         sim.paint_disk(CX, FLOOR - 76, 30, WATER);
         run(&mut sim, 200);
@@ -1073,7 +1169,7 @@ mod tests {
         // so it seals the two apart and whatever is under the crust survives,
         // which is what a lava flow hit by rain actually does.
         let (device, queue) = headless();
-        let mut sim = Simulation::new(&device, &queue, &Registry::builtin());
+        let mut sim = Simulation::new(&device, &queue, &Registry::builtin(), Grid::DESKTOP);
         floor(&mut sim, STONE);
         let stone_before = snapshot(&sim).count(STONE);
         sim.paint_disk(CX, FLOOR - 66, 20, LAVA);
@@ -1105,7 +1201,7 @@ mod tests {
         // fall like the liquid it says it is, which needs the props table
         // rewritten, and eat the stone floor, which needs the new rules bound.
         let (device, queue) = headless();
-        let mut sim = Simulation::new(&device, &queue, &Registry::builtin());
+        let mut sim = Simulation::new(&device, &queue, &Registry::builtin(), Grid::DESKTOP);
         floor(&mut sim, STONE);
         let stone_before = snapshot(&sim).count(STONE);
 
@@ -1150,7 +1246,7 @@ mod tests {
         // that would fail if the movement kernel started treating every
         // material as mobile.
         let (device, queue) = headless();
-        let mut sim = Simulation::new(&device, &queue, &Registry::builtin());
+        let mut sim = Simulation::new(&device, &queue, &Registry::builtin(), Grid::DESKTOP);
         sim.paint_disk(CX, 100, 25, SOIL);
         let before = snapshot(&sim);
         run(&mut sim, 300);
@@ -1170,7 +1266,7 @@ mod tests {
         // passes, which leaves half a block hanging off each edge. Getting that
         // wrong loses cells at the borders, so fill the edges and count.
         let (device, queue) = headless();
-        let mut sim = Simulation::new(&device, &queue, &Registry::builtin());
+        let mut sim = Simulation::new(&device, &queue, &Registry::builtin(), Grid::DESKTOP);
         for y in (0..GRID_H as i32).step_by(10) {
             sim.paint_disk(2, y, 4, SAND);
             sim.paint_disk(GRID_W as i32 - 3, y, 4, SAND);
@@ -1196,12 +1292,12 @@ mod tests {
         // what is being measured is the gust rather than gravity.
         let (device, queue) = headless();
 
-        let mut still = Simulation::new(&device, &queue, &Registry::builtin());
+        let mut still = Simulation::new(&device, &queue, &Registry::builtin(), Grid::DESKTOP);
         floor(&mut still, STONE);
         still.paint_disk(CX - 200, FLOOR - 456, 10, SAND);
         run(&mut still, 400);
 
-        let mut blown = Simulation::new(&device, &queue, &Registry::builtin());
+        let mut blown = Simulation::new(&device, &queue, &Registry::builtin(), Grid::DESKTOP);
         floor(&mut blown, STONE);
         blown.paint_disk(CX - 200, FLOOR - 456, 10, SAND);
         for _ in 0..400 {
@@ -1226,7 +1322,7 @@ mod tests {
         // then a fan is held under it, and the top of the sand should end up
         // far above where it was resting.
         let (device, queue) = headless();
-        let mut sim = Simulation::new(&device, &queue, &Registry::builtin());
+        let mut sim = Simulation::new(&device, &queue, &Registry::builtin(), Grid::DESKTOP);
         floor(&mut sim, STONE);
         sim.paint_disk(CX, FLOOR - 56, 20, SAND);
         run(&mut sim, 300);
@@ -1260,7 +1356,7 @@ mod tests {
         // alone; some time later the air well beyond where the tool ever
         // reached should be moving, and moving to the right.
         let (device, queue) = headless();
-        let mut sim = Simulation::new(&device, &queue, &Registry::builtin());
+        let mut sim = Simulation::new(&device, &queue, &Registry::builtin(), Grid::DESKTOP);
         for _ in 0..20 {
             sim.add_wind_disk(300, 250, 40, 6.0, 0.0);
             sim.step();
@@ -1286,7 +1382,7 @@ mod tests {
         // blown upwind of a heap that has settled, the tool never reaches the
         // heap, and the heap should still be shifted the way the wind went.
         let (device, queue) = headless();
-        let mut sim = Simulation::new(&device, &queue, &Registry::builtin());
+        let mut sim = Simulation::new(&device, &queue, &Registry::builtin(), Grid::DESKTOP);
         floor(&mut sim, STONE);
         sim.paint_disk(CX + 20, FLOOR - 26, 12, SAND);
         run(&mut sim, 200);
@@ -1314,13 +1410,13 @@ mod tests {
         // into each afterwards should land in the same place.
         let (device, queue) = headless();
 
-        let mut still = Simulation::new(&device, &queue, &Registry::builtin());
+        let mut still = Simulation::new(&device, &queue, &Registry::builtin(), Grid::DESKTOP);
         floor(&mut still, STONE);
         run(&mut still, 1000);
         still.paint_disk(CX, FLOOR - 436, 10, SAND);
         run(&mut still, 300);
 
-        let mut blown = Simulation::new(&device, &queue, &Registry::builtin());
+        let mut blown = Simulation::new(&device, &queue, &Registry::builtin(), Grid::DESKTOP);
         floor(&mut blown, STONE);
         for _ in 0..100 {
             blown.add_wind_disk(CX, FLOOR - 246, 200, 6.0, 0.0);
@@ -1346,7 +1442,7 @@ mod tests {
         // like any painted sand, which is the whole point of loading rather
         // than drawing: the world is alive the moment it is in.
         let (device, queue) = headless();
-        let mut sim = Simulation::new(&device, &queue, &Registry::builtin());
+        let mut sim = Simulation::new(&device, &queue, &Registry::builtin(), Grid::DESKTOP);
         sim.paint_disk(CX, 250, 40, LAVA);
         run(&mut sim, 5);
 
@@ -1385,7 +1481,7 @@ mod tests {
         let wood = registry.find("Wood").unwrap();
         let leaves = registry.find("Leaves").unwrap();
         let (device, queue) = headless();
-        let mut sim = Simulation::new(&device, &queue, &registry);
+        let mut sim = Simulation::new(&device, &queue, &registry, Grid::DESKTOP);
         floor(&mut sim, STONE);
         for y in (FLOOR - 96)..(FLOOR - 36) {
             sim.paint_disk(CX, y, 1, wood);
@@ -1411,7 +1507,7 @@ mod tests {
     #[test]
     fn the_eraser_clears_what_the_brush_painted() {
         let (device, queue) = headless();
-        let mut sim = Simulation::new(&device, &queue, &Registry::builtin());
+        let mut sim = Simulation::new(&device, &queue, &Registry::builtin(), Grid::DESKTOP);
         sim.paint_disk(CX, 250, 20, STONE);
         assert!(snapshot(&sim).count(STONE) > 0);
         sim.paint_disk(CX, 250, 25, EMPTY);
@@ -1421,7 +1517,7 @@ mod tests {
     #[test]
     fn a_filled_rectangle_is_clipped_and_reads_back_cell_by_cell() {
         let (device, queue) = headless();
-        let mut sim = Simulation::new(&device, &queue, &Registry::builtin());
+        let mut sim = Simulation::new(&device, &queue, &Registry::builtin(), Grid::DESKTOP);
         // Corners in the wrong order, and hanging off the right edge.
         let right = GRID_W - 1;
         sim.fill(GRID_W as i32 + 5, 12, (right - 9) as i32, 10, STONE);
@@ -1450,7 +1546,7 @@ mod tests {
     #[test]
     fn clearing_empties_the_whole_world() {
         let (device, queue) = headless();
-        let mut sim = Simulation::new(&device, &queue, &Registry::builtin());
+        let mut sim = Simulation::new(&device, &queue, &Registry::builtin(), Grid::DESKTOP);
         floor(&mut sim, SOIL);
         sim.paint_disk(CX, 200, 30, WATER);
         run(&mut sim, 20);

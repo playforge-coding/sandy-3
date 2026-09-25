@@ -51,18 +51,35 @@ function plantTree(w, x, surface) {
     }
 }
 
+// The average of each value and the `radius` values either side of it, with
+// the ends of the list repeated to fill the window at the edges.
+function blur(values, radius) {
+    const last = values.length - 1;
+    return values.map((_, i) => {
+        let sum = 0;
+        for (let j = i - radius; j <= i + radius; j++) {
+            sum += values[Math.min(Math.max(j, 0), last)];
+        }
+        return sum / (2 * radius + 1);
+    });
+}
+
 // A generator for a rolling landscape. Heights in `p` are fractions of the
 // world's height, from the top, so `base: 0.5` puts the ground band halfway
 // down and `seaLevel: 1` leaves the world dry. `frequency` is how many hills
 // fit into one world's height of ground, so that a taller world gets hills
 // that are wider as well as higher and the landscape keeps its shape whatever
-// size the grid is.
+// size the grid is. `octaves` and `gain` (4 and 0.5 unless given) set how
+// much finer detail rides on the big hills, and `smooth`, if given, is how
+// many cells either side each column's height is averaged over, which rounds
+// off sharp peaks and sudden drops.
 function landscape(p) {
     return (w) => {
         const terrain = sandy.noise({
             seed: w.seed,
             frequency: p.frequency / w.height,
-            octaves: 4,
+            octaves: p.octaves ?? 4,
+            gain: p.gain ?? 0.5,
         });
         const base = w.height * p.base;
         const amplitude = w.height * p.amplitude;
@@ -72,11 +89,16 @@ function landscape(p) {
         const lowest = w.height - SURFACE_DEPTH - 2;
 
         // The surface height of every column, from one line of noise.
-        const surface = [];
+        let heights = [];
         for (let x = 0; x < w.width; x++) {
-            const y = Math.floor(base - terrain.at(x, 0) * amplitude);
-            surface[x] = Math.min(Math.max(y, highest), lowest);
+            heights[x] = base - terrain.at(x, 0) * amplitude;
         }
+        // Two passes of a box blur, which together weigh the middle of the
+        // window most and give rounded hilltops rather than flat ones.
+        if (p.smooth) {
+            heights = blur(blur(heights, p.smooth), p.smooth);
+        }
+        const surface = heights.map((y) => Math.min(Math.max(Math.floor(y), highest), lowest));
 
         // The ground: a cap of the surface material over the rest, and
         // water in any open air that lies below the waterline.
@@ -102,12 +124,17 @@ function landscape(p) {
 }
 
 // Rolling hills of soil over stone, water pooled in the valleys, and trees.
+// The hills are broad and low, with little fine detail and a smoothing pass
+// on top, so the slopes stay gentle.
 sandy.world({
     name: "Forest",
     generate: landscape({
         base: 0.5,
-        amplitude: 0.3,
-        frequency: 4,
+        amplitude: 0.15,
+        frequency: 2,
+        octaves: 3,
+        gain: 0.35,
+        smooth: 4,
         seaLevel: 0.55,
         surface: "Soil",
         subsurface: "Stone",

@@ -91,7 +91,7 @@ Picking another kind builds it there and then.
 
 | World | What it is |
 |-------|------------|
-| **Forest** | rolling hills of soil over stone, water pooled in the valleys, and trees |
+| **Forest** | gently rolling hills of soil over stone, water pooled in the valleys, and trees |
 | **Plains** | near-flat grassland, dry, with the odd tree |
 | **Ocean** | a deep sea over a gently rolling bed of sand |
 | **Desert** | dunes of sand over stone, bone dry |

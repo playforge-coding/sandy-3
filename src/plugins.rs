@@ -1714,6 +1714,40 @@ mod tests {
     }
 
     #[test]
+    fn the_forest_hills_have_gentle_slopes() {
+        let mut plugins = Plugins::new();
+        plugins.load_builtin();
+        let forest = plugins
+            .world_names()
+            .iter()
+            .position(|name| name == "Forest")
+            .unwrap();
+        for seed in [1, 7, 42, 99, 1337] {
+            let cells = plugins.generate(forest, seed).unwrap();
+            // The first row of soil or stone in each column.
+            let ground: Vec<u32> = (0..GRID_W)
+                .map(|x| {
+                    (0..GRID_H)
+                        .find(|&y| {
+                            let m = cells[(y * GRID_W + x) as usize];
+                            m == SOIL || m == STONE
+                        })
+                        .unwrap()
+                })
+                .collect();
+            let steepest = ground
+                .windows(2)
+                .map(|pair| pair[0].abs_diff(pair[1]))
+                .max()
+                .unwrap();
+            assert!(
+                steepest <= 3,
+                "seed {seed} has a step of {steepest} cells between columns"
+            );
+        }
+    }
+
+    #[test]
     fn every_built_in_world_builds_and_is_its_own_kind_of_place() {
         let mut plugins = Plugins::new();
         plugins.load_builtin();

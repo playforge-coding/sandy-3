@@ -115,7 +115,7 @@ world appears.
 | Drag with the **right** or **middle** button, or a two-finger **trackpad scroll** | look around while zoomed in |
 | **Z** / **X** | zoom in / out, about the cursor |
 | **F** | fit the whole world in the window again |
-| **Arrow keys** | look around, a tenth of the window at a time |
+| **Arrow keys** | look around, for as long as they are held |
 | **1**–**9** | a material, in picker order: Sand, Stone, Water, Lava, Soil, then the plugin ones |
 | **0** / **Backspace** | eraser |
 | **W** | wind tool |
@@ -137,7 +137,10 @@ and looks around as they move together.
 The window opens on the whole world and zooms in up to thirty-two times,
 about ten pixels a cell on a desktop, which is enough to watch a single
 grain tumble. Zooming happens about the cursor, so whatever is under it
-stays put, and the view never shows past the edge of the world. The panel's
+stays put, and the view never shows past the edge of the world. A notch of
+the wheel, the keys and the slider glide the view to where it is going
+rather than jumping there, while a drag or a pinch moves the picture under
+the cursor or fingers straight away. The panel's
 View section has the same zoom as a slider, about the middle of the window,
 and a button to fit the world again. The tools work as they do at any zoom:
 the brush lands where the cursor is over the world, and a sweep of the wind

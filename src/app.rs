@@ -81,9 +81,8 @@ const ZOOM_PER_LINE: f32 = 1.2;
 /// How much a press of the zoom keys zooms by.
 const ZOOM_STEP: f32 = 1.5;
 
-/// How far a press of an arrow key moves the view, as a fraction of the
-/// window.
-const PAN_STEP: f32 = 0.1;
+/// How fast a held arrow key moves the view, in windows a second.
+const PAN_SPEED: f32 = 0.8;
 
 /// One frame of the wind tool: blow a gust the way the cursor has swept, from
 /// `from` to `to` since the last frame, with the brush at `radius`. A script
@@ -113,6 +112,12 @@ struct Input {
     step: bool,
     /// The right or middle button is held, dragging the view about.
     panning: bool,
+    /// Which arrow keys are held: left, right, up and down. The view looks
+    /// that way for as long as they are.
+    looking: [bool; 4],
+    /// When the last frame was drawn, so the view eases and the arrow keys
+    /// move it at the same pace whatever the frame rate.
+    last_frame: Option<Instant>,
     /// The fingers on the screen, up to two, each with where it was last
     /// seen. The first draws; a second beside it makes a pinch, which zooms
     /// as the two move apart and looks around as they move together. A
@@ -130,6 +135,8 @@ impl Default for Input {
             last_cell: None,
             step: false,
             panning: false,
+            looking: [false; 4],
+            last_frame: None,
             touches: Vec::new(),
             controls: ui::Controls::default(),
         }
@@ -233,14 +240,27 @@ impl App {
         })
     }
 
-    /// Zoom the view by `factor` about a point in window pixels, so what is
-    /// under that point stays put.
+    /// A point in window pixels as fractions of the window's width and
+    /// height, once there is a window.
+    fn window_fraction(&self, at: (f64, f64)) -> Option<(f32, f32)> {
+        let (w, h) = self.window_size()?;
+        Some((at.0 as f32 / w, at.1 as f32 / h))
+    }
+
+    /// Glide the zoom by `factor` about a point in window pixels, so what is
+    /// under that point stays put. For a notch of the wheel or a key.
     fn zoom_at(&mut self, factor: f32, at: (f64, f64)) {
-        let Some((w, h)) = self.window_size() else {
-            return;
-        };
-        let at = (at.0 as f32 / w, at.1 as f32 / h);
-        self.input.controls.view.zoom_by(factor, at);
+        if let Some(at) = self.window_fraction(at) {
+            self.input.controls.view.zoom_by(factor, at);
+        }
+    }
+
+    /// The same, straight away, for a pinch, which the picture should follow
+    /// without trailing behind the fingers.
+    fn pinch_at(&mut self, factor: f32, at: (f64, f64)) {
+        if let Some(at) = self.window_fraction(at) {
+            self.input.controls.view.pinch_by(factor, at);
+        }
     }
 
     /// Carry the world along by a distance in window pixels, as a drag
@@ -249,7 +269,10 @@ impl App {
         let Some((w, h)) = self.window_size() else {
             return;
         };
-        self.input.controls.view.pan(-dx as f32 / w, -dy as f32 / h);
+        self.input
+            .controls
+            .view
+            .drag(-dx as f32 / w, -dy as f32 / h);
     }
 
     /// A touchscreen draws as the mouse does, with the first finger down.
@@ -320,7 +343,7 @@ impl App {
         // Fingers on top of each other have no spread to speak of, and a
         // ratio of two such would be noise.
         if was >= 1.0 {
-            self.zoom_at((now / was) as f32, to);
+            self.pinch_at((now / was) as f32, to);
         }
     }
 }
@@ -461,7 +484,7 @@ impl ApplicationHandler for App {
             // A trackpad pinch, on the platforms that report one. The delta
             // is the change in magnification, so one and a bit is the factor.
             WindowEvent::PinchGesture { delta, .. } if !consumed => {
-                self.zoom_at(1.0 + delta as f32, self.input.cursor);
+                self.pinch_at(1.0 + delta as f32, self.input.cursor);
             }
 
             // A file dropped on the window is a plugin. While one is being
@@ -473,14 +496,21 @@ impl ApplicationHandler for App {
             WindowEvent::Touch(touch) => self.touch(touch, consumed),
 
             WindowEvent::KeyboardInput { event, .. } => {
-                // Skip the shortcuts while egui wants the key.
-                if !consumed
-                    && event.state == ElementState::Pressed
-                    && let PhysicalKey::Code(code) = event.physical_key
-                {
-                    self.handle_key(code);
+                // Skip the shortcuts while egui wants the key. A key let go
+                // always counts, so an arrow held into a text box does not
+                // keep the view moving.
+                if let PhysicalKey::Code(code) = event.physical_key {
+                    if event.state == ElementState::Released {
+                        self.hold_arrow(code, false);
+                    } else if !consumed {
+                        self.handle_key(code);
+                    }
                 }
             }
+
+            // Keys let go while the window was away never arrive, so forget
+            // the arrows when it goes.
+            WindowEvent::Focused(false) => self.input.looking = [false; 4],
 
             WindowEvent::RedrawRequested => {
                 self.redraw();
@@ -573,6 +603,7 @@ impl App {
         // The script first, so whatever it does is in this frame, and a
         // frame it lets go by is the whole of one.
         self.advance_script();
+        self.move_view();
 
         if self.input.drawing {
             let c = &self.input.controls;
@@ -581,7 +612,7 @@ impl App {
                 .state
                 .as_ref()
                 .unwrap()
-                .cursor_to_grid(self.input.cursor, &c.view);
+                .cursor_to_grid(self.input.cursor, c.view.shown());
             let last = self.input.last_cell;
             self.input.last_cell = Some((gx, gy));
 
@@ -686,7 +717,7 @@ impl App {
                 paint_jobs,
                 full_output.textures_delta,
                 full_output.pixels_per_point,
-                &self.input.controls.view,
+                self.input.controls.view.shown(),
                 wanted.is_some(),
             );
             if let (true, Some(wanted)) = (captured, wanted) {
@@ -700,6 +731,39 @@ impl App {
             log::info!("{line}");
             self.status = line;
         }
+    }
+
+    /// Move the view on by the time since the last frame: along the way
+    /// the held arrow keys point, and the picture on screen further towards
+    /// where it is heading. A long stall counts as a tenth of a second, so
+    /// the view does not leap once it is over.
+    fn move_view(&mut self) {
+        let now = Instant::now();
+        let dt = self
+            .input
+            .last_frame
+            .replace(now)
+            .map_or(0.0, |last| (now - last).as_secs_f32().min(0.1));
+        let [left, right, up, down] = self.input.looking.map(f32::from);
+        let step = PAN_SPEED * dt;
+        let view = &mut self.input.controls.view;
+        if left + right + up + down > 0.0 {
+            view.pan((right - left) * step, (down - up) * step);
+        }
+        view.tick(dt);
+    }
+
+    /// Note an arrow key pressed or let go. Returns whether it was an arrow.
+    fn hold_arrow(&mut self, code: KeyCode, held: bool) -> bool {
+        let slot = match code {
+            KeyCode::ArrowLeft => 0,
+            KeyCode::ArrowRight => 1,
+            KeyCode::ArrowUp => 2,
+            KeyCode::ArrowDown => 3,
+            _ => return false,
+        };
+        self.input.looking[slot] = held;
+        true
     }
 
     /// Give the control script its turn: answer what it asks until it is done
@@ -750,6 +814,11 @@ impl App {
     }
 
     fn handle_key(&mut self, code: KeyCode) {
+        // The arrows look around for as long as they are held.
+        if self.hold_arrow(code, true) {
+            return;
+        }
+
         // The number keys pick a material by id, which is the order the picker
         // lists them in: the built-in five, then whatever the plugins added.
         // Zero is air, the eraser. Choosing a material means painting with it.
@@ -801,15 +870,11 @@ impl App {
             // Capture: a still, or a recording until pressed again.
             KeyCode::KeyS => self.screenshot(),
             KeyCode::KeyV => self.toggle_recording(),
-            // The view: in and out about the cursor, back to the whole
-            // world, and a step in each direction.
+            // The view: in and out about the cursor, and back to the whole
+            // world.
             KeyCode::KeyZ => self.zoom_at(ZOOM_STEP, self.input.cursor),
             KeyCode::KeyX => self.zoom_at(1.0 / ZOOM_STEP, self.input.cursor),
             KeyCode::KeyF => c.view.reset(),
-            KeyCode::ArrowLeft => c.view.pan(-PAN_STEP, 0.0),
-            KeyCode::ArrowRight => c.view.pan(PAN_STEP, 0.0),
-            KeyCode::ArrowUp => c.view.pan(0.0, -PAN_STEP),
-            KeyCode::ArrowDown => c.view.pan(0.0, PAN_STEP),
             _ => {}
         }
     }

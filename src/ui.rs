@@ -18,7 +18,7 @@ use egui::{Color32, RichText, Stroke};
 
 use crate::capture::{AnimationFormat, ImageFormat};
 use crate::materials::{EMPTY, MaterialId, Registry, SAND};
-use crate::view::{MAX_ZOOM, MIN_ZOOM, View};
+use crate::view::{Camera, MAX_ZOOM, MIN_ZOOM};
 
 /// The most digits the seed box takes. Nine digits always fit a `u32`, and
 /// that is more seeds than anyone will type.
@@ -130,7 +130,7 @@ pub struct Controls {
     pub recording_format: AnimationFormat,
     /// The zoom, and which part of the world the window shows. The wheel,
     /// a pinch and the keys move it as the panel's slider does.
-    pub view: View,
+    pub view: Camera,
 }
 
 impl Default for Controls {
@@ -147,7 +147,7 @@ impl Default for Controls {
             seed: random_seed().to_string(),
             screenshot_format: ImageFormat::default(),
             recording_format: AnimationFormat::default(),
-            view: View::default(),
+            view: Camera::default(),
         }
     }
 }

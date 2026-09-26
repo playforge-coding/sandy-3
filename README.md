@@ -815,10 +815,29 @@ one thing in the small crate under `android/lib`; the Gradle project under
 `android/app` is a manifest and a build file, with no Java or Kotlin in it.
 It needs the Android SDK with an NDK, platform 36 and build tools in it,
 [cargo-ndk](https://github.com/bbqsrc/cargo-ndk), Gradle 9, a JDK, CMake
-and Ninja. `sdkmanager "ndk;30.0.16248370" "platforms;android-36"
-"build-tools;36.1.0" "platform-tools"` from the command line tools installs
-the SDK side. `ANDROID_HOME` points Gradle and cargo-ndk at the SDK, and
-`ANDROID_NDK_ROOT` points CMake, building FastNoise2, at the NDK.
+and Ninja. `android sdk install ndk/30.0.16248370 platforms/android-36
+build-tools/36.1.0 platform-tools` installs the SDK side. `android` is the
+Android CLI, which can be installed on its own and also comes with the
+command line tools from version 22.0 on. Use it rather than `sdkmanager`,
+which Google has deprecated and which warns about it every time it runs.
+Note that the CLI names packages with slashes where `sdkmanager` used
+semicolons, so `ndk;30.0.16248370` becomes `ndk/30.0.16248370`. `ANDROID_HOME` points Gradle and
+cargo-ndk at the SDK, and `ANDROID_NDK_ROOT` points CMake, building
+FastNoise2, at the NDK.
+
+The release workflow is the exception for now. It sets up the SDK with
+[setup-android](https://github.com/android-actions/setup-android), which
+still calls `sdkmanager` inside, so its log has the deprecation warning in
+it. That is expected and harmless: `sdkmanager` still works, and the action
+already handles what has actually broken so far (the removal of the old
+`tools` package, which v4 skips). Moving the workflow to the Android CLI by
+hand would mean replacing the action with our own steps for installing the
+command line tools, accepting the licenses and setting up the paths, and
+the CLI still leans on `sdkmanager` for licenses in places. It also exits
+successfully when a package is not found, so a mistyped version would not
+fail the step and would only show up later in the build. So the workflow
+stays on the action until the action moves to the CLI itself, or until
+Google sets a date for removing `sdkmanager`.
 
 ```sh
 rustup target add aarch64-linux-android
